@@ -6,10 +6,9 @@ __pycache__/
 *.egg-info/
 *.egg
 .eggs/
-dist/
 build/
 wheels/
-*.whl
+dist/cbhcli
 
 # Virtual environment
 venv/
@@ -23,6 +22,7 @@ env/
 
 # Project specific
 .qoder/
+qoder/
 cbhcli.spec
 *.xlsx
 打包.txt
