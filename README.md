@@ -1,4 +1,4 @@
-# CBHCLI v4.5 - AI驱动的终端助手
+# CBHCLI v4.7.1 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -11,6 +11,8 @@
 - **知识库系统** - 为每个Agent建立专属知识库，支持语义搜索和问答
 - **会话管理** - 上下文窗口监控、自动压缩、会话重置
 - **向量检索** - 基于ChromaDB的语义搜索，支持历史对话和知识库检索
+- **Web管理界面** - 内置Web服务器，提供可视化Agent、知识库、模型、MCP管理
+- **技能系统** - 可复用的提示词+脚本技能，按需激活增强AI能力
 
 ### 14大内置工具
 | 工具 | 功能 |
@@ -33,10 +35,26 @@
 通过 MCP (Model Context Protocol) 协议连接外部工具服务器，无限扩展AI的能力。
 添加的MCP工具与内置工具使用方式完全相同。
 
+### Web 管理界面
+内置基于 Vue 3 + FastAPI 的 Web 管理界面，支持：
+- **可视化聊天** - 浏览器中与AI对话
+- **Agent管理** - 创建/切换/删除Agent
+- **模型配置** - 在线管理模型与嵌入/重排序模型
+- **知识库管理** - 文件上传、索引状态查看
+- **MCP管理** - 在线添加/管理MCP服务器
+- **会话历史** - 查看和管理历史会话
+
+启动方式：
+```bash
+# 启动Web服务
+cbhcli --web
+```
+
 ### 高级功能
 - **多步规划** - 复杂任务自动拆解为 Todo 计划列表，逐步执行并追踪进度
 - **自我反思** - 工具执行失败时自动分析原因并重试（最多3次）
 - **子Agent协作** - 将独立子任务委托给子Agent执行，拥有独立上下文
+- **技能系统** - 创建可复用的技能（提示词+脚本），按需激活增强AI能力
 - **嵌入模型支持** - 可配置专用嵌入模型API（OpenAI compatible）
 - **重排序服务** - 支持Jina、Cohere等重排序API提高检索质量
 - **自动上下文压缩** - 当接近模型限制时自动压缩上下文
@@ -62,7 +80,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.5.0-py3-none-any.whl
+pip install dist/cbhcli-4.7.1-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -140,13 +158,26 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 /ctx              # 查看上下文使用情况
 ```
 
-### 7. memory.md 长期记忆
+### 7. 技能系统
+技能是可复用的提示词+可选脚本，用于增强Agent在特定领域的能力。
+
+```
+/skills list              # 列出所有技能
+/skills add [name]        # 创建新技能
+/skills use [name]        # 激活技能（可多选）
+/skills off [name]        # 取消激活
+/skills rm <name>         # 删除技能
+```
+
+你可以直接让AI帮你创建技能，例如："帮我创建一个代码审查技能"。
+
+### 8. memory.md 长期记忆
 memory.md 用于保存用户要求记住的重要信息：
 - **不会自动写入**：只有用户明确要求"记住"、"记录"时才写入
 - **始终包含在系统提示中**：每次对话都会读取 memory.md 内容
 - 普通对话历史通过 `/history` 和 `/resume` 管理
 
-### 8. Python 工具
+### 9. Python 工具
 使用 `python` 工具执行 Python 代码，支持会话记忆：
 - **会话记忆**：同一会话中定义的变量和导入的模块会保留
 - 示例：第一次导入 pandas 并读取数据，第二次可以直接使用之前的变量
@@ -347,37 +378,89 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 ```
 cbhcli_pkg/
 ├── core/              # 核心模块
-│   ├── app.py         # 主应用
-│   ├── agent.py       # Agent管理
-│   ├── session.py     # 会话管理
+│   ├── app.py              # 主应用
+│   ├── agent.py            # Agent管理
+│   ├── session.py          # 会话管理
 │   ├── session_history.py  # 会话历史管理
-│   ├── model.py       # LLM客户端
-│   ├── ai_handler.py  # AI请求处理（Function Calling + 规划/反思）
-│   ├── tool_executor.py # 工具执行
-│   ├── subagent.py    # 子Agent调度器
+│   ├── model.py            # LLM客户端
+│   ├── ai_handler.py       # AI请求处理（Function Calling + 规划/反思）
+│   ├── tool_executor.py    # 工具执行
+│   ├── subagent.py         # 子Agent调度器
+│   ├── skill_manager.py    # 技能管理器
 │   ├── response_cleaner.py # 响应清理
 │   ├── embedding_client.py # 嵌入模型客户端
 │   ├── rerank_client.py    # 重排序客户端
-│   └── knowledge_base.py   # 知识库管理
+│   ├── knowledge_base.py   # 知识库管理
+│   ├── mcp_client.py       # MCP协议客户端
+│   ├── mcp_manager.py      # MCP服务器管理
+│   ├── mcp_tool_adapter.py # MCP工具适配器
+│   ├── constants.py        # 常量定义
+│   └── errors.py           # 异常类型
 ├── tools/             # 工具实现
-│   ├── terminal.py
-│   ├── file_read.py
-│   ├── file_write.py
-│   ├── file_edit.py
-│   ├── grep.py           # 正则搜索
-│   ├── glob_tool.py      # 文件模式搜索
-│   ├── ask_user.py       # 用户提问交互
-│   ├── todo.py           # 任务计划列表
-│   ├── python_tool.py    # Python执行（带会话记忆）
-│   ├── memory_search.py
-│   ├── knowledge_base.py
+│   ├── terminal.py     # 终端命令执行
+│   ├── file_read.py    # 文件读取
+│   ├── file_write.py   # 文件写入
+│   ├── file_edit.py    # 精确字符串替换
+│   ├── grep.py         # 正则搜索
+│   ├── glob_tool.py    # 文件模式搜索
+│   ├── ask_user.py     # 用户提问交互
+│   ├── todo.py         # 任务计划列表
+│   ├── python_tool.py  # Python执行（带会话记忆）
+│   ├── memory_search.py # 记忆搜索
+│   ├── knowledge_base.py # 知识库查询
 │   ├── delegate_task.py  # 子Agent任务委托
-│   └── skills_create.py
+│   ├── skills_create.py  # 技能创建
+│   ├── base.py          # 工具基类
+│   └── registry.py      # 工具注册中心
+├── commands/          # 斜杠命令
+│   ├── parser.py       # 命令解析器
+│   ├── agent_cmd.py    # Agent管理命令
+│   ├── model_cmd.py    # 模型管理命令
+│   ├── session_cmd.py  # 会话管理命令
+│   ├── kb_cmd.py       # 知识库命令
+│   ├── embedding_cmd.py # 向量索引命令
+│   ├── mcp_cmd.py      # MCP管理命令
+│   └── skills_cmd.py   # 技能管理命令
+├── web/               # Web管理界面
+│   ├── server.py       # FastAPI Web服务器
+│   └── static/         # Vue前端静态文件
 ├── config/            # 配置管理
+│   └── global_config.py # 全局配置
 ├── context/           # 上下文管理
-├── vector/            # 向量数据库
-└── commands/          # 斜杠命令
-```
+│   ├── compressor.py   # 上下文压缩器
+│   └── token_counter.py # Token计数器
+└── vector/            # 向量数据库
+    ├── store.py        # ChromaDB封装
+    └── indexer.py      # 记忆索引器
+
+web-frontend/          # Vue 3 前端源码
+├── src/
+│   ├── App.vue        # 根组件
+│   ├── api.js         # API接口
+│   ├── router.js      # 路由配置
+│   ├── style.css      # 全局样式
+│   └── views/         # 页面组件
+│       ├── ChatView.vue       # 聊天页面
+│       ├── AgentsView.vue     # Agent管理
+│       ├── ModelsView.vue     # 模型管理
+│       ├── KnowledgeView.vue  # 知识库管理
+│       ├── MCPView.vue        # MCP管理
+│       ├── HistoryView.vue    # 历史会话
+│       ├── SkillsView.vue     # 技能管理
+│       └── SettingsView.vue   # 设置
+├── vite.config.js     # Vite构建配置
+├── package.json
+└── index.html
+
+docs/                 # 项目文档
+├── API参考/           # API开发文档
+├── Agent管理/         # Agent管理指南
+├── 会话管理/          # 会话管理文档
+├── 工具系统详解/       # 工具开发文档
+├── 命令参考手册/       # 命令参考
+├── 开发者指南/         # 开发文档
+├── 快速开始.md
+└── ...
 
 ## 开发
 
