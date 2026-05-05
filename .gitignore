@@ -21,8 +21,6 @@ env/
 .ipynb_checkpoints/
 
 # Project specific
-.qoder/
-qoder/
 docs/
 cbhcli.spec
 *.xlsx
