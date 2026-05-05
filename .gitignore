@@ -23,6 +23,7 @@ env/
 # Project specific
 .qoder/
 qoder/
+docs/
 cbhcli.spec
 *.xlsx
 打包.txt
