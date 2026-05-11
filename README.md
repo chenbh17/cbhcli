@@ -1,4 +1,4 @@
-# CBHCLI v4.7.1 - AI驱动的终端助手
+# CBHCLI v4.7.3 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -14,7 +14,7 @@
 - **Web管理界面** - 内置Web服务器，提供可视化Agent、知识库、模型、MCP管理
 - **技能系统** - 可复用的提示词+脚本技能，按需激活增强AI能力
 
-### 14大内置工具
+### 13大内置工具
 | 工具 | 功能 |
 |------|------|
 | `terminal` | 执行终端命令 |
@@ -47,7 +47,10 @@
 启动方式：
 ```bash
 # 启动Web服务
-cbhcli --web
+cbhcli web
+
+# 指定端口
+cbhcli web -p 18888
 ```
 
 ### 高级功能
@@ -80,7 +83,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.7.1-py3-none-any.whl
+pip install dist/cbhcli-4.7.3-py3-none-any.whl
 ```
 
 ### 可选依赖

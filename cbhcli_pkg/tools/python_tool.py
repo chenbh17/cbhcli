@@ -4,6 +4,7 @@ import os
 import io
 import shutil
 import subprocess
+import traceback
 from cbhcli_pkg.tools.registry import BaseTool, ToolResult
 
 
@@ -131,7 +132,7 @@ class PythonSession:
             timeout: 超时时间（秒）- 暂未实现
 
         Returns:
-            (success, output, error)
+            (success, output, error, traceback_str)
         """
         # 捕获 stdout 和 stderr
         old_stdout = sys.stdout
@@ -153,12 +154,16 @@ class PythonSession:
             error = stderr_capture.getvalue()
 
             success = not error
-            return (success, output, error)
+            return (success, output, error, "")
 
         except Exception as e:
             error = stderr_capture.getvalue()
-            error += f"\n异常: {type(e).__name__}: {str(e)}"
-            return (False, stdout_capture.getvalue(), error)
+            # 获取完整的 traceback 信息（包含行号）
+            tb_str = traceback.format_exc()
+            # 如果 stderr 有内容，添加到错误信息
+            if error:
+                tb_str = error + "\n" + tb_str
+            return (False, stdout_capture.getvalue(), str(e), tb_str)
 
         finally:
             # 恢复 stdout 和 stderr
@@ -247,20 +252,40 @@ class PythonTool(BaseTool):
             # 获取会话
             session = get_python_session(self._session_id)
 
+            # ANSI 颜色代码
+            C_CYAN = "\033[36m"        # 青色
+            C_RED = "\033[31m"         # 红色
+            C_RED_BG = "\033[41m"      # 红色背景
+            C_RESET = "\033[0m"        # 重置
+            C_BOLD = "\033[1m"         # 加粗
+            C_WHITE = "\033[97m"       # 亮白色
+            C_DIM = "\033[2m"          # 暗淡
+
             # 执行代码
-            success, output, error = session.execute(code, timeout)
+            success, output, error, tb_str = session.execute(code, timeout)
 
             # 构建输出
-            result_output = ""
-            if output:
-                result_output += output
-            if not result_output:
-                result_output = "代码执行成功，无输出"
+            output_parts = []
+
+            if success:
+                if output:
+                    output_parts.append(f"{C_CYAN}📤 输出:{C_RESET}")
+                    output_parts.append(output.rstrip())
+                else:
+                    output_parts.append(f"{C_CYAN}✅ 代码执行成功，无输出{C_RESET}")
+            else:
+                # 显示错误标题
+                output_parts.append(f"{C_RED_BG}{C_WHITE}{C_BOLD} ❌ 执行出错 {C_RESET}")
+                # 显示完整 traceback（包含行号）
+                if tb_str:
+                    output_parts.append(tb_str.rstrip())
+                elif error:
+                    output_parts.append(f"{C_RED}{error}{C_RESET}")
 
             return ToolResult(
                 success=success,
-                output=result_output,
-                error=error if error else None
+                output="\n".join(output_parts),
+                error=error if not success else None
             )
 
         except Exception as e:

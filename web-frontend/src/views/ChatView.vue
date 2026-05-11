@@ -259,6 +259,9 @@ async function doStream(userMessage) {
             if (tb) {
               tb.status = data.success ? 'confirmed' : 'failed'
               tb.result_preview = data.preview || ''
+              if (data.preview_data) {
+                tb.preview_data = data.preview_data
+              }
             }
             scrollBottom()
           } else if (data.type === 'ask_user') {
@@ -539,6 +542,37 @@ function onKeydown(e) {
                   </div>
                   <div v-if="block._expanded" class="tc-subagent-body" v-html="renderMd(block.result_preview)"></div>
                 </div>
+                <!-- Edit tool: left-right diff view -->
+                <div v-else-if="block.preview_data && block.preview_data.type === 'edit'" class="tc-edit-preview">
+                  <div class="tc-edit-header">
+                    <span class="tc-edit-col-header tc-red">--- 原内容 ---</span>
+                    <span class="tc-edit-separator">│</span>
+                    <span class="tc-edit-col-header tc-green">+++ 新内容 +++</span>
+                  </div>
+                  <div class="tc-edit-body">
+                    <div class="tc-edit-col tc-red">
+                      <pre>{{ block.preview_data.old_str }}</pre>
+                    </div>
+                    <span class="tc-edit-separator">│</span>
+                    <div class="tc-edit-col tc-green">
+                      <pre>{{ block.preview_data.new_str }}</pre>
+                    </div>
+                  </div>
+                </div>
+                <!-- Write tool: content preview -->
+                <div v-else-if="block.preview_data && block.preview_data.type === 'write'" class="tc-write-preview">
+                  <div class="tc-write-header">--- 写入内容 ---</div>
+                  <pre class="tc-write-content">{{ block.preview_data.content }}</pre>
+                </div>
+                <!-- Python tool: code + output -->
+                <div v-else-if="block.preview_data && block.preview_data.type === 'python'" class="tc-python-preview">
+                  <div class="tc-python-code-header">--- 执行代码 ---</div>
+                  <pre class="tc-python-code">{{ block.preview_data.code }}</pre>
+                  <div v-if="block.preview_data.success" class="tc-python-output-header tc-green">📤 输出</div>
+                  <div v-else class="tc-python-output-header tc-red">❌ 执行出错</div>
+                  <pre class="tc-python-output" :class="{ 'tc-error': !block.preview_data.success }">{{ block.result_preview }}</pre>
+                </div>
+                <!-- Default: plain text preview -->
                 <div v-else-if="block.result_preview" class="tc-result-preview">{{ block.result_preview }}</div>
               </div>
 

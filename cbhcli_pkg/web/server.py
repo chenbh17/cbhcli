@@ -50,7 +50,7 @@ from cbhcli_pkg.context.token_counter import get_token_counter
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.7.1")
+app = FastAPI(title="CBHCLI Web", version="4.7.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1117,14 +1117,41 @@ async def chat(req: ChatRequest):
                     result = ToolResult(success=False, output="", error=str(e))
 
                 # Send result preview to frontend
-                preview = tool_output[:1500] if len(tool_output) > 1500 else tool_output
-                yield _sse({
+                preview = tool_output[:7500] if len(tool_output) > 7500 else tool_output
+                
+                # Build structured preview for special tools
+                preview_data = None
+                if resolved_name == "edit" and result.success:
+                    preview_data = {
+                        "type": "edit",
+                        "file_path": tool_args.get("file_path", ""),
+                        "old_str": tool_args.get("old_str", ""),
+                        "new_str": tool_args.get("new_str", ""),
+                    }
+                elif resolved_name == "write" and result.success:
+                    preview_data = {
+                        "type": "write",
+                        "file_path": tool_args.get("file_path", ""),
+                        "content": tool_args.get("content", ""),
+                    }
+                elif resolved_name == "python":
+                    preview_data = {
+                        "type": "python",
+                        "code": tool_args.get("code", ""),
+                        "output": preview,
+                        "success": result.success if hasattr(result, 'success') else True,
+                    }
+                
+                sse_data = {
                     "type": "tool_result",
                     "tool_name": resolved_name,
                     "tool_id": tool_id,
                     "success": result.success if hasattr(result, 'success') else True,
                     "preview": preview,
-                })
+                }
+                if preview_data:
+                    sse_data["preview_data"] = preview_data
+                yield _sse(sse_data)
 
                 # Add tool result to session for next LLM round
                 session.add_message("tool", tool_output, tool_call_id=tool_id)

@@ -471,7 +471,15 @@ class AIHandler:
                 tc["id"]
             )
 
-            output = result.output[:MAX_TOOL_OUTPUT_LENGTH] if result.success else f"错误: {result.error}"
+            if result.success:
+                output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
+            else:
+                # 失败时：优先使用 output（包含完整 traceback），其次用 error
+                if result.output:
+                    output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
+                else:
+                    output = f"错误: {result.error}"
+
             tool_msg = Message(
                 role="tool",
                 content=output,
@@ -485,10 +493,12 @@ class AIHandler:
                 fail_key = tc["tool"]
                 self._failure_counts[fail_key] = self._failure_counts.get(fail_key, 0) + 1
                 if self._failure_counts[fail_key] <= MAX_REFLECTION_RETRIES:
+                    # 反思时传递完整错误信息（包含 traceback）
+                    full_error = result.output if result.output else (result.error or "未知错误")
                     self._inject_reflection(
                         tc["tool"],
                         tc["arguments"],
-                        result.error or "未知错误"
+                        full_error
                     )
             else:
                 self._failure_counts.pop(tc["tool"], None)

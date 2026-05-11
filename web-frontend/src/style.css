@@ -581,3 +581,152 @@ textarea { resize: vertical; font-family: inherit; }
 .tc-subagent-body p { margin: 4px 0; }
 .tc-subagent-body code { font-family: 'Fira Code', 'Consolas', monospace; font-size: 12px; }
 .tc-subagent-body pre { background: var(--bg-secondary); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 6px 0; }
+
+/* ===== Edit Tool Preview (Left-Right Diff) ===== */
+.tc-edit-preview {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.tc-edit-header {
+  display: flex;
+  align-items: center;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  font-weight: 700;
+}
+.tc-edit-col-header {
+  flex: 1;
+  text-align: center;
+  padding: 4px 8px;
+}
+.tc-edit-header .tc-edit-separator {
+  width: 1px;
+  color: var(--text-dim);
+  font-weight: 400;
+  text-align: center;
+}
+.tc-edit-body {
+  display: flex;
+}
+.tc-edit-col {
+  flex: 1;
+  max-height: 250px;
+  overflow-y: auto;
+}
+.tc-edit-col pre {
+  margin: 0;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.tc-edit-col.tc-red {
+  background: rgba(231, 76, 60, 0.15);
+  border-right: 1px solid var(--border);
+}
+.tc-edit-col.tc-red pre { color: #ff8a80; }
+.tc-edit-col.tc-green {
+  background: rgba(0, 184, 148, 0.15);
+}
+.tc-edit-col.tc-green pre { color: #69f0ae; }
+.tc-edit-body .tc-edit-separator {
+  width: 1px;
+  background: var(--border);
+}
+
+/* ===== Write Tool Preview ===== */
+.tc-write-preview {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.tc-write-header {
+  padding: 4px 8px;
+  background: rgba(0, 184, 148, 0.2);
+  font-weight: 700;
+  color: #69f0ae;
+  border-bottom: 1px solid var(--border);
+}
+.tc-write-content {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 250px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  background: rgba(0, 184, 148, 0.08);
+  color: #69f0ae;
+}
+
+/* ===== Python Tool Preview ===== */
+.tc-python-preview {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.tc-python-code-header {
+  padding: 4px 8px;
+  background: rgba(0, 184, 148, 0.2);
+  font-weight: 700;
+  color: #69f0ae;
+  border-bottom: 1px solid var(--border);
+}
+.tc-python-code {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  background: rgba(0, 184, 148, 0.08);
+  color: #69f0ae;
+}
+.tc-python-output-header {
+  padding: 4px 8px;
+  font-weight: 700;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.tc-python-output-header.tc-green {
+  background: rgba(0, 184, 148, 0.15);
+  color: #69f0ae;
+}
+.tc-python-output-header.tc-red {
+  background: rgba(231, 76, 60, 0.15);
+  color: #ff8a80;
+}
+.tc-python-output {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 250px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--bg);
+}
+.tc-python-output.tc-error {
+  background: rgba(231, 76, 60, 0.08);
+  color: #ff8a80;
+}
+
+/* Color utilities */
+.tc-red { color: #e74c3c; }
+.tc-green { color: #00b894; }
