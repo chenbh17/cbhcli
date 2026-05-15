@@ -1,4 +1,4 @@
-# CBHCLI v4.7.3 - AI驱动的终端助手
+# CBHCLI v4.7.7 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -30,6 +30,31 @@
 | `knowledge_base` | 查询知识库内容 |
 | `skills_create` | 创建新技能 |
 | `delegate_task` | 将子任务委托给子Agent执行 |
+
+### cbhpacks 数据科学工具（13个，默认关闭）
+基于 [cbhpacks](https://github.com/chenbh17/cbhpacks) 数据科学工具包封装，覆盖完整的机器学习建模流水线。默认不开启，通过 `/tools on` 手动开启。
+
+| 工具 | 功能 | 方法 |
+|------|------|------|
+| `cbhpacks_bins_model` | 分箱WOE/IV/PSI计算 | comp_woe_iv, bins_rpt, data_to_woe, get_psi, psi_mth_avg, plot_col_rpt, plot_cols_rpt |
+| `cbhpacks_binary_model` | 二分类模型训练评估 | lr_fit, xgb_fit, lgbm_fit, mlp_fit, svm_fit, rdf_fit, para_adj_gs, para_adj_bs, report |
+| `cbhpacks_uns_model` | 无监督学习PCA/聚类 | pca, get_keams_cluster, kmeans |
+| `cbhpacks_linear_model` | 线性回归/工具变量 | ols, IV |
+| `cbhpacks_cols_select` | 特征筛选(10种方法) | null_select, enumerate_select, iv_select, psi_select, corr_select, chi2_select, logistic_select, ml_select, boostrap_select, vif_select |
+| `cbhpacks_cols_select_js` | 递归特征筛选 | recursion_select |
+| `cbhpacks_cols_encode` | 特征编码(7种方法) | data_to_sigmoid, data_to_sc, data_to_minmax, data_to_softmax, bins_to_num, str_to_num, data_to_woe |
+| `cbhpacks_cols_operate` | 列操作(炸裂/转置/分词) | col_explode, col_to_T, col_to_cols, date_col_trans, date_mth_year, jieba_trans |
+| `cbhpacks_desc_df` | 数据集描述统计 | get_rpt |
+| `cbhpacks_desc_col` | 单变量分析/异常值检测 | desc_, relative_, supervised_, easy_od, feat_card |
+| `cbhpacks_con_sql` | 数据库连接SQL执行 | chrun, chdf, con_mysql, con_hive, get_create_table, to_hive, rfms_sql |
+| `cbhpacks_con_linux` | Linux SSH连接命令 | con_linux, data_trans_linux, jps, hadoop, start_hive |
+| `cbhpacks_get_random_data` | 生成随机测试数据 | (直接生成) |
+
+**典型建模流水线**：
+```
+cbhpacks_get_random_data → cbhpacks_desc_df → cbhpacks_cols_encode → cbhpacks_bins_model
+→ cbhpacks_cols_select → cbhpacks_binary_model → report
+```
 
 ### MCP 扩展工具
 通过 MCP (Model Context Protocol) 协议连接外部工具服务器，无限扩展AI的能力。
@@ -83,7 +108,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.7.3-py3-none-any.whl
+pip install dist/cbhcli-4.7.7-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -174,13 +199,34 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 
 你可以直接让AI帮你创建技能，例如："帮我创建一个代码审查技能"。
 
-### 8. memory.md 长期记忆
+### 8. 工具管理
+每个Agent可以独立控制26个内置工具（13个通用+13个数据科学）的开关状态，关闭的工具AI将无法调用。
+通用工具默认开启，cbhpacks数据科学工具默认关闭。
+
+```
+/tools list          # 查看当前Agent的工具开关状态（✅启用/❌禁用）
+/tools on            # 开启已禁用的工具（交互式多选，逗号分隔编号）
+/tools off           # 关闭已启用的工具（交互式多选，逗号分隔编号）
+```
+
+```
+/tools list          # 查看当前Agent的工具开关状态（✅启用/❌禁用）
+/tools on            # 开启已禁用的工具（交互式多选，逗号分隔编号）
+/tools off           # 关闭已启用的工具（交互式多选，逗号分隔编号）
+```
+
+- 工具开关是 **per-agent 隔离** 的，每个Agent有独立的配置
+- 关闭工具后，AI的 Function Calling 和系统提示中将不再包含该工具
+- 关闭工具会自动更新该Agent工作空间的 `tools.md` 和 `usage.md`
+- 使用 `/tools list` 可随时查看当前状态
+
+### 9. memory.md 长期记忆
 memory.md 用于保存用户要求记住的重要信息：
 - **不会自动写入**：只有用户明确要求"记住"、"记录"时才写入
 - **始终包含在系统提示中**：每次对话都会读取 memory.md 内容
 - 普通对话历史通过 `/history` 和 `/resume` 管理
 
-### 9. Python 工具
+### 10. Python 工具
 使用 `python` 工具执行 Python 代码，支持会话记忆：
 - **会话记忆**：同一会话中定义的变量和导入的模块会保留
 - 示例：第一次导入 pandas 并读取数据，第二次可以直接使用之前的变量
@@ -341,6 +387,9 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/model use [name]` | 使用指定模型 |
 | `/model rm [name]` | 删除模型 |
 | `/model info` | 查看当前模型 |
+| `/model config` | 修改模型参数 |
+| `/model embedding` | 配置嵌入模型 |
+| `/model rerank` | 配置重排序模型 |
 | `/reset` 或 `/new` | 创建新会话（自动保存当前会话） |
 | `/resume [编号]` | 列出或恢复历史会话 |
 | `/history` | 查看历史会话列表 |
@@ -367,6 +416,9 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/skills use [name]` | 激活技能 |
 | `/skills off [name]` | 取消激活技能 |
 | `/skills rm [name]` | 删除技能 |
+| `/tools list` | 查看当前Agent的工具开关状态 |
+| `/tools on` | 开启工具（交互式多选） |
+| `/tools off` | 关闭工具（交互式多选） |
 | `/help [command]` | 显示帮助 |
 | `quit` | 退出程序 |
 
@@ -423,7 +475,8 @@ cbhcli_pkg/
 │   ├── kb_cmd.py       # 知识库命令
 │   ├── embedding_cmd.py # 向量索引命令
 │   ├── mcp_cmd.py      # MCP管理命令
-│   └── skills_cmd.py   # 技能管理命令
+│   ├── skills_cmd.py   # 技能管理命令
+│   └── tools_cmd.py    # 工具开关管理命令
 ├── web/               # Web管理界面
 │   ├── server.py       # FastAPI Web服务器
 │   └── static/         # Vue前端静态文件

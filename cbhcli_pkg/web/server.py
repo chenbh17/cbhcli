@@ -50,7 +50,7 @@ from cbhcli_pkg.context.token_counter import get_token_counter
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.7.3")
+app = FastAPI(title="CBHCLI Web", version="4.7.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -177,6 +177,36 @@ def _get_tool_registry(agent_name: str = "", app_proxy: '_WebAgentContext' = Non
         registry.register(DelegateTaskTool(ctx))
         registry.register(SkillsCreateTool(ctx))
 
+    # Register cbhpacks tools
+    from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
+    from cbhcli_pkg.tools.cbhpacks_training import BinaryModelTool, UnsModelTool, LinearModelTool
+    from cbhcli_pkg.tools.cbhpacks_select import ColsSelectTool, ColsSelectJsTool
+    from cbhcli_pkg.tools.cbhpacks_encode import ColsEncodeTool
+    from cbhcli_pkg.tools.cbhpacks_preprocess import ColsOperateTool, DescDfTool, DescColTool
+    from cbhcli_pkg.tools.cbhpacks_sql import ConSqlTool
+    from cbhcli_pkg.tools.cbhpacks_linux import ConLinuxTool
+    from cbhcli_pkg.tools.cbhpacks_data import GetRandomDataTool
+
+    registry.register(BinsModelTool())
+    registry.register(BinaryModelTool())
+    registry.register(UnsModelTool())
+    registry.register(LinearModelTool())
+    registry.register(ColsSelectTool())
+    registry.register(ColsSelectJsTool())
+    registry.register(ColsEncodeTool())
+    registry.register(ColsOperateTool())
+    registry.register(DescDfTool())
+    registry.register(DescColTool())
+    registry.register(ConSqlTool())
+    registry.register(ConLinuxTool())
+    registry.register(GetRandomDataTool())
+
+    # Apply disabled tools from agent config
+    if agent_name:
+        config = get_agent_manager().load_agent(agent_name)
+        if config and config.disabled_tools:
+            registry.set_disabled_tools(config.disabled_tools)
+
     return registry
 
 
@@ -189,6 +219,18 @@ def _get_agent_workspace(agent_name: str) -> Path:
     return config.workspace_path
 
 
+def _get_agent_config(agent_name: str):
+    """Get agent config, return None if not found."""
+    manager = get_agent_manager()
+    return manager.load_agent(agent_name)
+
+
+def _save_agent_config(config):
+    """Save agent config."""
+    manager = get_agent_manager()
+    manager._save_config(config)
+
+
 # ===================================================================
 #  Pydantic Models
 # ===================================================================
@@ -199,6 +241,7 @@ class ModelConfig(BaseModel):
     url: str
     model: str
     context_limit: int = 128000
+    vision: bool = False
 
 
 class EmbeddingModelConfig(BaseModel):
@@ -234,6 +277,7 @@ class ChatRequest(BaseModel):
     message: str
     agent_name: str
     model_name: str
+    images: list[str] = []
 
 
 class ChatRespondRequest(BaseModel):
@@ -648,6 +692,55 @@ def toggle_mcp_tool(agent_name: str, server_name: str, tool_name: str, body: MCP
 
 
 # ===================================================================
+#  API: Tools Management
+# ===================================================================
+
+class ToolToggle(BaseModel):
+    enable: bool
+
+
+@app.get("/api/agents/{agent_name}/tools")
+def list_tools(agent_name: str):
+    """列出所有工具及其启用/禁用状态"""
+    from cbhcli_pkg.commands.tools_cmd import BUILTIN_TOOLS
+    config = _get_agent_config(agent_name)
+    disabled = config.disabled_tools or [] if config else []
+
+    tools = []
+    for name, desc, category in BUILTIN_TOOLS:
+        tools.append({
+            "name": name,
+            "description": desc,
+            "category": category,
+            "enabled": name not in disabled,
+        })
+    return {"tools": tools, "disabled": disabled}
+
+
+@app.put("/api/agents/{agent_name}/tools/{tool_name}")
+def toggle_tool(agent_name: str, tool_name: str, body: ToolToggle):
+    """启用/禁用指定工具"""
+    config = _get_agent_config(agent_name)
+    if not config:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+    disabled = list(config.disabled_tools or [])
+
+    if body.enable:
+        if tool_name in disabled:
+            disabled.remove(tool_name)
+    else:
+        if tool_name not in disabled:
+            disabled.append(tool_name)
+
+    config.disabled_tools = disabled
+    _save_agent_config(config)
+
+    action = "enabled" if body.enable else "disabled"
+    return {"message": f"Tool '{tool_name}' {action}", "disabled": disabled}
+
+
+# ===================================================================
 #  API: Knowledge Base Management
 # ===================================================================
 
@@ -846,6 +939,7 @@ async def chat(req: ChatRequest):
             model_name=req.model_name,
             active_skills_prompt=active_skills_prompt,
             cwd=os.getcwd(),
+            supports_vision=llm_client.supports_vision,
         )
         session.add_message("system", system_prompt)
 
@@ -863,7 +957,7 @@ async def chat(req: ChatRequest):
     llm_client = chat_data["llm_client"]
     tool_registry = chat_data["tool_registry"]
 
-    session.add_message("user", req.message)
+    session.add_message("user", req.message, images=req.images if req.images else None)
     # Reset abort flag
     chat_data["abort"] = False
 
@@ -1035,7 +1129,8 @@ async def chat(req: ChatRequest):
                     except asyncio.TimeoutError:
                         user_answer = "用户未回答"
                     tool_output = f"用户回答: {user_answer}"
-                    session.add_message("tool", tool_output, tool_call_id=tool_id)
+                    session.add_message("tool", tool_output, tool_call_id=tool_id,
+                                        metadata={"tool_name": resolved_name})
                     yield _sse({
                         "type": "tool_result",
                         "tool_name": resolved_name,
@@ -1096,7 +1191,8 @@ async def chat(req: ChatRequest):
                         "tool_id": tool_id,
                     })
                     tool_output = "用户取消了执行"
-                    session.add_message("tool", tool_output, tool_call_id=tool_id)
+                    session.add_message("tool", tool_output, tool_call_id=tool_id,
+                                        metadata={"tool_name": resolved_name})
                     continue
 
                 # Execute tool
@@ -1154,7 +1250,8 @@ async def chat(req: ChatRequest):
                 yield _sse(sse_data)
 
                 # Add tool result to session for next LLM round
-                session.add_message("tool", tool_output, tool_call_id=tool_id)
+                session.add_message("tool", tool_output, tool_call_id=tool_id,
+                                    metadata={"tool_name": resolved_name})
 
             # Continue the ReAct loop - next round will call LLM with tool results
 
@@ -1358,12 +1455,17 @@ async def chat_load(req: Request):
             # Rebuild system prompt with current tools/skills instead of old one
             persona = manager.load_agent_persona(agent_name)
             tool_descriptions = tool_registry.get_tool_descriptions()
+            # Try to get vision support from existing session
+            supports_vision = False
+            if session_key in _chat_sessions:
+                supports_vision = _chat_sessions[session_key].get("llm_client", {}).supports_vision
             system_prompt = persona.build_system_prompt(
                 tool_descriptions,
                 agent_name=agent_name,
                 model_name=model_name,
                 active_skills_prompt=active_skills_prompt,
                 cwd=os.getcwd(),
+                supports_vision=supports_vision,
             )
             session.add_message("system", system_prompt)
         else:

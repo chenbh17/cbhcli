@@ -8,6 +8,7 @@ from typing import Optional, Callable, TYPE_CHECKING
 from cbhcli_pkg.core.session import Session, Message
 from cbhcli_pkg.core.model import LLMClient
 from cbhcli_pkg.core.tool_executor import ToolExecutor
+from cbhcli_pkg.tools.registry import ToolResult
 from cbhcli_pkg.core.constants import (
     MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE,
     MAX_REFLECTION_RETRIES, PLANNING_MIN_LENGTH,
@@ -119,7 +120,7 @@ class AIHandler:
     #  主流程
     # ==================================================================
 
-    def process_request(self, user_input: str) -> str:
+    def process_request(self, user_input: str, images: list[str] = None) -> str:
         """处理用户请求
 
         流程:
@@ -130,6 +131,7 @@ class AIHandler:
 
         Args:
             user_input: 用户输入
+            images: 图片列表（base64编码的图片数据）
 
         Returns:
             最终的AI响应
@@ -138,7 +140,8 @@ class AIHandler:
         user_msg = Message(
             role="user",
             content=user_input,
-            token_count=self.token_counter.count_tokens(user_input)
+            token_count=self.token_counter.count_tokens(user_input),
+            images=images if images else None
         )
         self.session.messages.append(user_msg)
 
@@ -463,22 +466,32 @@ class AIHandler:
         )
         self.session.messages.append(assistant_msg)
 
-        # 逐个执行
+        # 逐个执行（每个 tool_call 必须产生对应的 tool 消息，否则 API 会报错）
+        # 重要：反思注入必须延迟到所有 tool 消息之后，否则会打断
+        #       assistant(tool_calls) → tool → tool → ... 的消息序列，
+        #       导致 DeepSeek 等严格 API 报错：
+        #       "insufficient tool messages following tool_calls message"
+        pending_reflections: list[dict] = []
         for tc in valid_calls:
-            result = self.tool_executor.execute_with_display(
-                tc["tool"],
-                tc["arguments"],
-                tc["id"]
-            )
+            try:
+                result = self.tool_executor.execute_with_display(
+                    tc["tool"],
+                    tc["arguments"],
+                    tc["id"]
+                )
 
-            if result.success:
-                output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
-            else:
-                # 失败时：优先使用 output（包含完整 traceback），其次用 error
-                if result.output:
+                if result.success:
                     output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
                 else:
-                    output = f"错误: {result.error}"
+                    # 失败时：优先使用 output（包含完整 traceback），其次用 error
+                    if result.output:
+                        output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
+                    else:
+                        output = f"错误: {result.error}"
+            except Exception as e:
+                # 兜底：确保即使 execute_with_display 异常也能产生 tool 消息
+                output = f"工具执行异常: {str(e)}"
+                result = ToolResult(success=False, output=output, error=str(e))
 
             tool_msg = Message(
                 role="tool",
@@ -486,22 +499,30 @@ class AIHandler:
                 token_count=self.token_counter.count_tokens(output),
                 tool_call_id=tc["id"]
             )
-            tool_msg.metadata = {"tool_name": tc["tool"], "success": result.success}
+            tool_msg.metadata = {"tool_name": tc["tool"], "success": getattr(result, 'success', False)}
             self.session.messages.append(tool_msg)
 
             if not result.success:
                 fail_key = tc["tool"]
                 self._failure_counts[fail_key] = self._failure_counts.get(fail_key, 0) + 1
                 if self._failure_counts[fail_key] <= MAX_REFLECTION_RETRIES:
-                    # 反思时传递完整错误信息（包含 traceback）
+                    # 收集失败信息，延迟到循环结束后统一注入反思
                     full_error = result.output if result.output else (result.error or "未知错误")
-                    self._inject_reflection(
-                        tc["tool"],
-                        tc["arguments"],
-                        full_error
-                    )
+                    pending_reflections.append({
+                        "tool_name": tc["tool"],
+                        "arguments": tc["arguments"],
+                        "error": full_error
+                    })
             else:
                 self._failure_counts.pop(tc["tool"], None)
+
+        # 在所有 tool 消息之后统一注入反思（保证消息序列完整性）
+        for ref in pending_reflections:
+            self._inject_reflection(
+                ref["tool_name"],
+                ref["arguments"],
+                ref["error"]
+            )
 
     def _resolve_tool_name(self, name: str) -> Optional[str]:
         """模糊匹配工具名，返回注册名或 None"""

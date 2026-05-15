@@ -103,6 +103,13 @@ export default {
       method: 'PUT', body: JSON.stringify({ enable }),
     }),
 
+  // 工具管理
+  getTools: (agentName) => request(`/agents/${encodeURIComponent(agentName)}/tools`),
+  toggleTool: (agentName, toolName, enable) =>
+    request(`/agents/${encodeURIComponent(agentName)}/tools/${encodeURIComponent(toolName)}`, {
+      method: 'PUT', body: JSON.stringify({ enable }),
+    }),
+
   // 知识库
   getKnowledge: (agentName) => request(`/agents/${encodeURIComponent(agentName)}/knowledge`),
   addKnowledgeFile: (agentName, filePath) =>

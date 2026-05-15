@@ -1,7 +1,9 @@
 """主应用 - CBHCLIApp"""
 import sys
 import os
+import re
 import json
+import base64
 import datetime
 from pathlib import Path
 from typing import Optional
@@ -42,6 +44,16 @@ from cbhcli_pkg.tools.glob_tool import GlobTool
 from cbhcli_pkg.tools.ask_user import AskUserQuestionTool
 from cbhcli_pkg.tools.todo import TodoTool
 
+# cbhpacks 数据科学工具
+from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
+from cbhcli_pkg.tools.cbhpacks_training import BinaryModelTool, UnsModelTool, LinearModelTool
+from cbhcli_pkg.tools.cbhpacks_select import ColsSelectTool, ColsSelectJsTool
+from cbhcli_pkg.tools.cbhpacks_encode import ColsEncodeTool
+from cbhcli_pkg.tools.cbhpacks_preprocess import ColsOperateTool, DescDfTool, DescColTool
+from cbhcli_pkg.tools.cbhpacks_sql import ConSqlTool
+from cbhcli_pkg.tools.cbhpacks_linux import ConLinuxTool
+from cbhcli_pkg.tools.cbhpacks_data import GetRandomDataTool
+
 from cbhcli_pkg.context.token_counter import get_token_counter
 from cbhcli_pkg.context.compressor import ContextCompressor
 
@@ -60,6 +72,7 @@ from cbhcli_pkg.commands.kb_cmd import register_kb_commands
 from cbhcli_pkg.commands.embedding_cmd import register_embedding_commands
 from cbhcli_pkg.commands.mcp_cmd import register_mcp_commands
 from cbhcli_pkg.commands.skills_cmd import register_skills_commands
+from cbhcli_pkg.commands.tools_cmd import register_tools_commands
 
 
 class SlashCommandHelper:
@@ -81,6 +94,7 @@ class SlashCommandHelper:
             ('use', '使用指定模型'),
             ('rm', '删除模型'),
             ('info', '查看当前模型信息'),
+            ('config', '修改模型参数'),
             ('embedding', '配置嵌入模型'),
             ('rerank', '配置重排序模型'),
         ],
@@ -122,6 +136,11 @@ class SlashCommandHelper:
             ('use', '选择激活技能'),
             ('off', '取消激活技能'),
             ('rm', '删除技能'),
+        ],
+        'tools': [
+            ('list', '查看所有工具状态'),
+            ('on', '开启工具（交互式多选）'),
+            ('off', '关闭工具（交互式多选）'),
         ],
     }
     
@@ -247,6 +266,21 @@ class CBHCLIApp:
         self.tool_registry.register(AskUserQuestionTool())
         self.todo_tool = TodoTool()
         self.tool_registry.register(self.todo_tool)
+
+        # cbhpacks 数据科学工具（默认关闭，用户可通过 /tools on 开启）
+        self.tool_registry.register(BinsModelTool())
+        self.tool_registry.register(BinaryModelTool())
+        self.tool_registry.register(UnsModelTool())
+        self.tool_registry.register(LinearModelTool())
+        self.tool_registry.register(ColsSelectTool())
+        self.tool_registry.register(ColsSelectJsTool())
+        self.tool_registry.register(ColsEncodeTool())
+        self.tool_registry.register(ColsOperateTool())
+        self.tool_registry.register(DescDfTool())
+        self.tool_registry.register(DescColTool())
+        self.tool_registry.register(ConSqlTool())
+        self.tool_registry.register(ConLinuxTool())
+        self.tool_registry.register(GetRandomDataTool())
         
         # 工具执行器（延迟初始化vector_store后添加memory_search）
         self.tool_executor = ToolExecutor(self.tool_registry)
@@ -316,6 +350,7 @@ class CBHCLIApp:
         register_embedding_commands(self.command_parser, self)
         register_mcp_commands(self.command_parser, self)
         register_skills_commands(self.command_parser, self)
+        register_tools_commands(self.command_parser, self)
         
         # 注册help命令
         def help_handler(args):
@@ -494,6 +529,9 @@ class CBHCLIApp:
         
         # 初始化技能管理器（每个 Agent 独立）
         self.skill_manager = SkillManager(config.workspace_path)
+
+        # 应用 Agent 工具开关设置
+        self.tool_registry.set_disabled_tools(config.disabled_tools or [])
         
         # 索引 Agent 工作空间（如果向量数据库可用，且尚未索引）
         if do_index and not self._agent_indexed and self.memory_indexer and config.workspace_path.exists():
@@ -548,13 +586,15 @@ class CBHCLIApp:
         if self.skill_manager:
             active_skills_prompt = self.skill_manager.build_skills_prompt()
         
+        supports_vision = self.llm_client.supports_vision if self.llm_client else False
         system_prompt = self.current_persona.build_system_prompt(
             tool_descriptions,
             agent_name=self.current_agent_name or "",
             model_name=model_name,
             memory_content=memory_content,
             active_skills_prompt=active_skills_prompt,
-            cwd=os.getcwd()
+            cwd=os.getcwd(),
+            supports_vision=supports_vision
         )
         system_token_count = self.token_counter.count_tokens(system_prompt)
         self.session.add_message("system", system_prompt, token_count=system_token_count)
@@ -601,13 +641,15 @@ class CBHCLIApp:
         if self.skill_manager:
             active_skills_prompt = self.skill_manager.build_skills_prompt()
         
+        supports_vision = self.llm_client.supports_vision if self.llm_client else False
         system_prompt = self.current_persona.build_system_prompt(
             tool_descriptions,
             agent_name=self.current_agent_name or "",
             model_name=model_name,
             memory_content=memory_content,
             active_skills_prompt=active_skills_prompt,
-            cwd=os.getcwd()
+            cwd=os.getcwd(),
+            supports_vision=supports_vision
         )
         
         # 原地替换 system 消息
@@ -723,7 +765,15 @@ class CBHCLIApp:
                 
                 # 处理AI请求
                 if self.llm_client and self.session:
-                    self._handle_ai_request(user_input)
+                    # 检测图片路径
+                    images = []
+                    if self.llm_client.supports_vision:
+                        image_paths = self._extract_image_paths(user_input)
+                        if image_paths:
+                            images = self._load_images_as_base64(image_paths)
+                            if images:
+                                print(f"\n{C_DIM}📷 检测到 {len(images)} 张图片{C_RESET}")
+                    self._handle_ai_request(user_input, images)
                 else:
                     print(f"\n{C_DIM}当前Agent未配置模型。请使用 /model 命令配置模型。{C_RESET}")
                 
@@ -734,7 +784,164 @@ class CBHCLIApp:
                 print(f"\n错误: {str(e)}{C_RESET}")
                 continue
     
-    def _handle_ai_request(self, user_input: str):
+    def _extract_image_paths(self, text: str) -> list[str]:
+        """从用户输入中提取图片路径
+
+        触发条件（必须同时满足）：
+        1. 用户有明确的图片识别意图（包含动作词：查看/识别/看看/分析图片等）
+        2. 输入中包含显式图片路径 或 从上下文可找到图片
+
+        Args:
+            text: 用户输入文本
+
+        Returns:
+            图片路径列表
+        """
+        # 意图检测：必须同时包含动作词和对象词（允许中间有路径等文字）
+        # 例如: "识别/path/to/image.png图片" -> 动作词"识别" + 对象词"图片"
+        action_words = ['识别', '查看', '看看', '分析', '读取', '看一下', '这是什么']
+        object_words = ['图片', '图像', '截图', '照片', '图表']
+        has_action = any(w in text for w in action_words)
+        has_object = any(w in text for w in object_words)
+        has_vision_intent = has_action and has_object
+
+        if not has_vision_intent:
+            return []
+
+        # 模式1: 匹配显式图片路径
+        image_paths = []
+        path_patterns = [
+            r'(/[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
+            r'(~/[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
+            r'(\./[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
+        ]
+
+        for pattern in path_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                expanded = os.path.expanduser(match.strip())
+                if os.path.exists(expanded):
+                    image_paths.append(expanded)
+
+        if image_paths:
+            return image_paths
+
+        # 模式2: 从上下文搜索图片
+        return self._search_images_in_context(text)
+
+    def _search_images_in_context(self, text: str) -> list[str]:
+        """从对话上下文中搜索图片
+
+        当用户要求查看图片但没有显式指定路径时，从会话历史中找到图片目录并搜索
+        """
+        IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+
+        # 支持"当前路径/当前目录"
+        current_dir_keywords = ['当前路径', '当前目录', '当前文件夹', '这个目录']
+        use_cwd = any(kw in text for kw in current_dir_keywords)
+
+        # 支持"这些/所有"
+        all_keywords = ['这些', '所有', '全部', '上面', '刚才']
+        want_all = any(kw in text for kw in all_keywords)
+
+        # 从会话历史中收集图片路径
+        recent_images_from_history = []
+        recent_image_dir = None
+
+        if self.session:
+            for msg in reversed(self.session.messages):
+                content = msg.content if isinstance(msg.content, str) else ''
+                for ext in IMAGE_EXTENSIONS:
+                    pattern = r'(/[\w\u4e00-\u9fff./\ -]+' + re.escape(ext) + r')'
+                    matches = re.findall(pattern, content, re.IGNORECASE)
+                    for match in matches:
+                        match = match.strip()
+                        if os.path.exists(match) and match not in recent_images_from_history:
+                            recent_images_from_history.append(match)
+                            if not recent_image_dir:
+                                recent_image_dir = os.path.dirname(match)
+
+        # "这些/所有" 直接返回历史中的图片
+        if want_all and len(recent_images_from_history) > 1:
+            return recent_images_from_history
+
+        # 确定搜索目录
+        search_dir = None
+        if use_cwd:
+            search_dir = os.getcwd()
+        elif recent_image_dir and os.path.isdir(recent_image_dir):
+            search_dir = recent_image_dir
+
+        if not search_dir:
+            return []
+
+        # 搜索目录中的图片
+        all_images = []
+        try:
+            for f in os.listdir(search_dir):
+                if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
+                    all_images.append(os.path.join(search_dir, f))
+        except PermissionError:
+            return []
+
+        if not all_images:
+            return []
+
+        if want_all:
+            return all_images
+
+        # 关键词匹配
+        matched = []
+        for img_path in all_images:
+            filename = os.path.splitext(os.path.basename(img_path))[0]
+            if filename in text:
+                matched.append(img_path)
+            else:
+                for i in range(len(filename) - 1):
+                    substr = filename[i:i+2]
+                    if '\u4e00' <= substr[0] <= '\u9fff' and '\u4e00' <= substr[1] <= '\u9fff':
+                        if substr in text:
+                            matched.append(img_path)
+                            break
+
+        if matched:
+            return matched
+
+        # 无匹配返回全部
+        return all_images
+
+    def _load_images_as_base64(self, image_paths: list[str]) -> list[str]:
+        """将图片文件加载为base64编码
+
+        Args:
+            image_paths: 图片文件路径列表
+
+        Returns:
+            base64编码的图片数据列表
+        """
+        import mimetypes
+        
+        base64_images = []
+        for path in image_paths:
+            try:
+                # 检测图片类型
+                mime_type, _ = mimetypes.guess_type(path)
+                if not mime_type or not mime_type.startswith('image/'):
+                    print(f"\n{C_DIM}⚠️  跳过非图片文件: {path}{C_RESET}")
+                    continue
+                
+                # 读取并编码图片
+                with open(path, 'rb') as f:
+                    image_data = f.read()
+                    base64_data = base64.b64encode(image_data).decode('utf-8')
+                    base64_images.append(base64_data)
+                    
+            except Exception as e:
+                print(f"\n{C_DIM}⚠️  加载图片失败 {path}: {str(e)}{C_RESET}")
+        
+        return base64_images
+
+    def _handle_ai_request(self, user_input: str, images: list[str] = None):
         """处理AI请求 - 委托给AIHandler"""
         # 检查上下文压缩
         self._check_and_compress_context()
@@ -755,7 +962,7 @@ class CBHCLIApp:
         handler.on_memory_update(self._update_memory)
         
         # 处理请求
-        handler.process_request(user_input)
+        handler.process_request(user_input, images=images if images else None)
     
     def _update_memory(self, user_input: str, ai_response: str):
         """更新记忆回调 - 仅用于保存会话历史

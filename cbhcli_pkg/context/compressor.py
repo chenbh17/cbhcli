@@ -4,92 +4,86 @@ from cbhcli_pkg.core.model import LLMClient
 from cbhcli_pkg.context.token_counter import TokenCounter
 
 
+def _split_at_boundary(messages: list, split_idx: int) -> tuple:
+    """在安全边界处分割消息列表，确保不拆散 assistant(tool_calls) + tool 消息对。
+
+    如果 split_idx 落在 tool 消息上，向前调整到该 tool 对应的 assistant 消息之前。
+    如果 split_idx 落在带 tool_calls 的 assistant 消息上，向后调整到其所有 tool 消息之后。
+    """
+    if split_idx <= 0 or split_idx >= len(messages):
+        return messages, []
+
+    # 如果切分点是 tool 消息，向前找到对应的 assistant
+    if messages[split_idx].role == "tool":
+        # 找到这个 tool 对应的 assistant（向前搜索）
+        i = split_idx - 1
+        while i >= 0 and messages[i].role == "tool":
+            i -= 1
+        # i 现在指向非 tool 消息
+        if i >= 0 and messages[i].role == "assistant" and messages[i].tool_calls:
+            split_idx = i  # 从这个 assistant 之前切分
+
+    # 如果切分点是带 tool_calls 的 assistant，向后跳过所有对应的 tool
+    if (0 <= split_idx < len(messages) and
+        messages[split_idx].role == "assistant" and
+        messages[split_idx].tool_calls):
+        # 收集这个 assistant 的 tool_call_ids
+        tc_ids = {tc.get("id") for tc in messages[split_idx].tool_calls if tc.get("id")}
+        j = split_idx + 1
+        while j < len(messages) and messages[j].role == "tool" and messages[j].tool_call_id in tc_ids:
+            j += 1
+        split_idx = j  # 从 tool 消息之后切分
+
+    return messages[:split_idx], messages[split_idx:]
+
+
 class ContextCompressor:
     """上下文压缩器"""
-    
+
     def __init__(self, llm_client: LLMClient, token_counter: TokenCounter):
-        """
-        初始化上下文压缩器
-        
-        Args:
-            llm_client: LLM客户端
-            token_counter: Token计数器
-        """
         self.llm_client = llm_client
         self.token_counter = token_counter
-    
+
     def compress(self, session: Session, target_tokens: int) -> bool:
-        """
-        压缩会话上下文到目标token数
-        
-        Args:
-            session: 会话对象
-            target_tokens: 目标token数
-            
-        Returns:
-            是否成功压缩
-        """
-        # 提取system消息(保留)
+        """压缩会话上下文到目标token数"""
         system_messages = [msg for msg in session.messages if msg.role == "system"]
-        
-        # 提取user和assistant消息
-        conversation_messages = [msg for msg in session.messages 
+        conversation_messages = [msg for msg in session.messages
                                 if msg.role in ["user", "assistant", "tool"]]
-        
+
         if len(conversation_messages) <= 6:
-            # 消息太少,不需要压缩
             return False
-        
-        # 保留最早的2轮和最近的3轮
-        early_messages = conversation_messages[:4]  # 最早2轮(user+assistant)
-        recent_messages = conversation_messages[-6:]  # 最近3轮
-        
-        # 中间部分需要压缩
-        middle_messages = conversation_messages[4:-6]
-        
+
+        # 在安全边界处分割：保留最早2轮，最近3轮
+        early_messages, rest = _split_at_boundary(conversation_messages, 4)
+        middle_messages, recent_messages = _split_at_boundary(rest, len(rest) - 6)
+
         if not middle_messages:
             return False
-        
+
         # 生成中间部分的摘要
         middle_text = "\n".join([
-            f"{msg.role}: {msg.content}" 
+            f"{msg.role}: {msg.content}"
             for msg in middle_messages
+            if msg.content  # 跳过空内容的 assistant（tool_calls 消息 content 可能为空）
         ])
-        
+
         summary = self._generate_summary(middle_text)
-        
+
         # 构建新的消息列表
         new_messages = system_messages.copy()
-        
-        # 添加最早的消息
         new_messages.extend(early_messages)
-        
-        # 添加摘要
         summary_msg = Message(
             role="system",
             content=f"[历史对话摘要]\n{summary}",
             token_count=self.token_counter.count_tokens(summary) + 20
         )
         new_messages.append(summary_msg)
-        
-        # 添加最近的消息
         new_messages.extend(recent_messages)
-        
-        # 替换会话消息
+
         session.replace_messages(new_messages)
-        
         return True
-    
+
     def _generate_summary(self, text: str) -> str:
-        """
-        生成对话摘要
-        
-        Args:
-            text: 对话文本
-            
-        Returns:
-            摘要文本
-        """
         system_prompt = """你是一个对话摘要专家。请总结以下对话的关键信息:
 - 用户的需求和目标
 - 执行的重要操作
@@ -103,7 +97,7 @@ class ContextCompressor:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"请总结以下对话:\n\n{text}"}
         ]
-        
+
         try:
             summary = self.llm_client.chat(messages, temperature=0.3)
             return summary

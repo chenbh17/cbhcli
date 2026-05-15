@@ -101,7 +101,8 @@ class ReadTool(BaseTool):
             
             # 添加行号
             for i, line in enumerate(selected_lines, start=start_idx + 1):
-                output_lines.append(f"{i:4d} | {line.rstrip()}")
+                # 保留尾部空格，只去除换行符（因为行号格式化会自动换行）
+                output_lines.append(f"{i:4d} | {line.rstrip(chr(10)).rstrip(chr(13))}")
             
             output_lines.append("--- 结束 ---")
             

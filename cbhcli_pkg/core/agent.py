@@ -193,6 +193,7 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /model add - 添加模型（交互式）
 - /model use - 切换模型（交互式选择）
 - /model rm - 删除模型
+- /model config - 修改模型参数（上下文长度、温度等）
 - /model embedding - 配置嵌入模型子命令（配合 add/info/rm 使用）
 - /model rerank - 配置重排序模型子命令（配合 add/info/rm 使用）
 - /new 或 /reset - 创建新会话（自动保存当前会话到history文件夹）
@@ -214,6 +215,9 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /skills use - 选择激活技能（支持多选）
 - /skills off - 取消激活技能
 - /skills rm <name> - 删除技能
+- /tools list - 查看当前Agent的工具开关状态
+- /tools on - 开启工具（交互式多选）
+- /tools off - 关闭工具（交互式多选）
 - quit - 退出程序
 
 **重要提醒**：
@@ -548,7 +552,18 @@ class AgentConfig:
     context_limit_ratio: float = 0.8
     auto_compress: bool = True
     max_tool_calls: int = 100
+    disabled_tools: list = field(default_factory=list)  # 被禁用的工具名称列表
+    config_version: str = ""  # 配置版本号，用于迁移判断
     created_at: datetime = field(default_factory=datetime.now)
+
+    # 4.7.5 新增：cbhpacks数据科学工具默认关闭列表
+    DEFAULT_DISABLED_CBHPACKS = [
+        "cbhpacks_bins_model", "cbhpacks_binary_model", "cbhpacks_uns_model",
+        "cbhpacks_linear_model", "cbhpacks_cols_select", "cbhpacks_cols_select_js",
+        "cbhpacks_cols_encode", "cbhpacks_cols_operate", "cbhpacks_desc_df",
+        "cbhpacks_desc_col", "cbhpacks_con_sql", "cbhpacks_con_linux",
+        "cbhpacks_get_random_data",
+    ]
 
     def to_dict(self) -> dict:
         """转换为字典"""
@@ -559,12 +574,21 @@ class AgentConfig:
             "context_limit_ratio": self.context_limit_ratio,
             "auto_compress": self.auto_compress,
             "max_tool_calls": self.max_tool_calls,
+            "disabled_tools": self.disabled_tools,
+            "config_version": self.config_version,
             "created_at": self.created_at.isoformat()
         }
 
     @classmethod
     def from_dict(cls, data: dict, workspace_path: Path) -> 'AgentConfig':
-        """从字典创建"""
+        """从字典创建，含自动迁移逻辑"""
+        disabled = data.get("disabled_tools", [])
+        config_version = data.get("config_version", "")
+
+        # 迁移：旧版Agent（无config_version）且disabled_tools为空 → 自动关闭cbhpacks工具
+        if not config_version and not disabled:
+            disabled = list(cls.DEFAULT_DISABLED_CBHPACKS)
+
         return cls(
             name=data["name"],
             workspace_path=workspace_path,
@@ -573,6 +597,8 @@ class AgentConfig:
             context_limit_ratio=data.get("context_limit_ratio", 0.8),
             auto_compress=data.get("auto_compress", True),
             max_tool_calls=data.get("max_tool_calls", 100),
+            disabled_tools=disabled,
+            config_version=config_version or "4.7.5",
             created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now()
         )
 
@@ -589,7 +615,8 @@ class AgentPersona:
                             agent_name: str = "", model_name: str = "",
                             memory_content: str = "",
                             active_skills_prompt: str = "",
-                            cwd: str = "") -> str:
+                            cwd: str = "",
+                            supports_vision: bool = False) -> str:
         """
         构建系统提示
 
@@ -615,6 +642,10 @@ class AgentPersona:
         if cwd:
             parts.append(f"- 用户当前工作目录: {cwd}")
             parts.append(f"- 重要：用户的所有任务默认在此目录下进行，文件操作请使用此目录作为基准路径")
+        if supports_vision:
+            parts.append(f"- 视觉能力: ✅ 你是一个支持视觉的多模态模型，可以识别和分析图片内容")
+            parts.append(f"- 图片识别方式: 当用户明确要求识别图片时，用户输入中的图片路径会自动加载并发送给你。你可以直接分析图片内容并回答用户")
+            parts.append(f"- 重要: 只有用户在消息中直接提到图片路径时才会自动识别，你无需主动搜索或加载图片")
         parts.append("")
 
         # 长期记忆（来自 memory.md）- 始终包含
@@ -685,7 +716,9 @@ class AgentManager:
             name=name,
             workspace_path=workspace_path,
             primary_model=primary_model,
-            description=description
+            description=description,
+            disabled_tools=list(AgentConfig.DEFAULT_DISABLED_CBHPACKS),
+            config_version="4.7.5"
         )
         
         self._save_config(config)

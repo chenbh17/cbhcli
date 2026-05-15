@@ -179,13 +179,19 @@ async function send() {
 
   messages.value.push({ role: 'user', content: userContent, attachments: [...attachedFiles.value] })
   input.value = ''
+  
+  // Collect image base64 data before clearing
+  const imageBase64List = attachedFiles.value
+    .filter(f => f.is_image && f.base64)
+    .map(f => f.base64.replace(/^data:image\/[^;]+;base64,/, ''))
+  
   attachedFiles.value = []
   scrollBottom()
 
-  await doStream(userContent)
+  await doStream(userContent, imageBase64List)
 }
 
-async function doStream(userMessage) {
+async function doStream(userMessage, images = []) {
   loading.value = true
   const assistantMsg = reactive({ role: 'assistant', blocks: [] })
   messages.value.push(assistantMsg)
@@ -198,7 +204,7 @@ async function doStream(userMessage) {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: userMessage, agent_name: selectedAgent.value, model_name: selectedModel.value }),
+      body: JSON.stringify({ message: userMessage, agent_name: selectedAgent.value, model_name: selectedModel.value, images: images }),
       signal: abortCtrl.signal,
     })
     const reader = res.body.getReader()

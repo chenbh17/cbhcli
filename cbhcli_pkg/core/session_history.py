@@ -42,20 +42,42 @@ class SessionHistoryManager:
         filename = f"{timestamp}_{session_id}.json"
         filepath = self.history_dir / filename
         
-        # 提取用户输入作为会话标题
+        # 提取用户输入作为会话标题（处理多模态content格式）
         first_user_msg = ""
         for msg in messages:
             if msg.get("role") == "user":
-                first_user_msg = msg.get("content", "")[:50]
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # 多模态格式: [{"type": "text", "text": "..."}, {"type": "image_url", ...}]
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            first_user_msg = part.get("text", "")[:50]
+                            break
+                elif isinstance(content, str):
+                    first_user_msg = content[:50]
                 break
+        
+        # 清理消息中的base64图片数据（保存时去除，减小文件体积）
+        cleaned_messages = []
+        for msg in messages:
+            cleaned = dict(msg)
+            content = cleaned.get("content", "")
+            if isinstance(content, list):
+                # 多模态格式：只保留文本部分
+                text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                if text_parts:
+                    cleaned["content"] = text_parts[0].get("text", "")
+                else:
+                    cleaned["content"] = ""
+            cleaned_messages.append(cleaned)
         
         # 保存会话数据
         session_data = {
             "id": session_id,
             "created_at": datetime.now().isoformat(),
             "title": first_user_msg or "空会话",
-            "message_count": len(messages),
-            "messages": messages
+            "message_count": len(cleaned_messages),
+            "messages": cleaned_messages
         }
         
         with open(filepath, 'w', encoding='utf-8') as f:

@@ -10,7 +10,7 @@ const showAdd = ref(false)
 const showEdit = ref(false)
 const showEmbedding = ref(false)
 const showRerank = ref(false)
-const form = ref({ name: '', apiKey: '', url: '', model: '', context_limit: 128000 })
+const form = ref({ name: '', apiKey: '', url: '', model: '', context_limit: 128000, vision: false })
 const editName = ref('')
 const embForm = ref({ name: '', apiKey: '', url: '', model: '' })
 const rerankForm = ref({ name: '', apiKey: '', url: '', model: '', top_n: 5 })
@@ -28,7 +28,7 @@ async function load() {
 }
 
 function openAdd() {
-  form.value = { name: '', apiKey: '', url: '', model: '', context_limit: 128000 }
+  form.value = { name: '', apiKey: '', url: '', model: '', context_limit: 128000, vision: false }
   showAdd.value = true
 }
 
@@ -115,7 +115,7 @@ function maskKey(key) {
       <div class="card-header">
         <div>
           <h3>{{ m.name }} <span v-if="m.name === lastSelected" class="badge badge-active">Active</span></h3>
-          <div class="text-sm text-dim">{{ m.model }} | {{ (m.context_limit || 128000).toLocaleString() }} tokens</div>
+          <div class="text-sm text-dim">{{ m.model }} | {{ (m.context_limit || 128000).toLocaleString() }} tokens <span v-if="m.vision" class="badge" style="background:#10b981;">Vision</span></div>
         </div>
         <div class="flex items-center" style="gap: 8px;">
           <button class="btn btn-secondary btn-sm" @click="openEdit(m)">Edit</button>
@@ -180,6 +180,13 @@ function maskKey(key) {
       <div class="form-group">
         <label>Context Limit (tokens)</label>
         <input v-model.number="form.context_limit" type="number" />
+      </div>
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" v-model="form.vision" />
+          <span>Support Vision (image input)</span>
+        </label>
+        <div class="text-sm text-dim">Enable if the model supports image/video understanding</div>
       </div>
       <div class="modal-actions">
         <button class="btn btn-secondary" @click="showAdd = false; showEdit = false">Cancel</button>

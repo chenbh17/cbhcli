@@ -17,6 +17,7 @@ def register_model_commands(parser, app):
                 "  /model use [name]   - 使用指定模型\n"
                 "  /model rm <name>    - 删除模型\n"
                 "  /model info         - 查看当前模型信息\n"
+                "  /model config       - 修改模型参数\n"
                 "  /model embedding    - 配置嵌入模型\n"
                 "  /model rerank       - 配置重排序模型"
             )
@@ -44,6 +45,9 @@ def register_model_commands(parser, app):
         elif action == "info":
             return _model_info(app)
 
+        elif action == "config":
+            return _config_model(app, param)
+
         elif action == "embedding":
             return _embedding_model_menu(app, param)
 
@@ -56,7 +60,7 @@ def register_model_commands(parser, app):
     parser.register(SlashCommand(
         name="model",
         description="管理模型配置",
-        usage="add|list|use|rm|info|embedding|rerank [name]",
+        usage="add|list|use|rm|info|config|embedding|rerank [name]",
         handler=model_handler
     ))
 
@@ -92,16 +96,35 @@ def _add_model(app):
         except ValueError:
             return "❌ 上下文长度必须是数字"
 
+    temperature_str = input("温度参数 (默认使用全局值0.1，留空跳过): ").strip()
+    temperature = None
+    if temperature_str:
+        try:
+            temperature = float(temperature_str)
+            if not 0 <= temperature <= 2:
+                return "❌ 温度参数范围: 0-2"
+        except ValueError:
+            return "❌ 温度参数必须是数字"
+
+
+    vision_str = input("是否支持视觉/图片输入 (y/n, 默认 n): ").strip().lower()
+    supports_vision = vision_str == 'y'
+
     model_config = {
         "name": name,
         "apiKey": api_key,
         "url": base_url,
         "model": model_id,
-        "context_limit": context_limit
+        "context_limit": context_limit,
+        "vision": supports_vision
     }
+    if temperature is not None:
+        model_config["temperature"] = temperature
 
     app.global_config.add_model(model_config)
-    return f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens"
+    temp_info = f"   温度: {temperature}" if temperature is not None else "   温度: 使用全局值(0.1)"
+    vision_info = "✅ 支持" if supports_vision else "❌ 不支持"
+    return f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens\n{temp_info}\n   视觉: {vision_info}"
 
 
 def _list_models(app):
@@ -122,6 +145,13 @@ def _list_models(app):
         lines.append(f"    API: {m['url']}")
         ctx = m.get('context_limit', 128000)
         lines.append(f"    上下文限制: {ctx:,} tokens")
+        temp = m.get('temperature')
+        if temp is not None:
+            lines.append(f"    温度: {temp}")
+        else:
+            lines.append(f"    温度: 使用全局值(0.1)")
+        vision = m.get('vision', False)
+        lines.append(f"    视觉: {'✅ 支持' if vision else '❌ 不支持'}")
         lines.append("")
 
     return "\n".join(lines)
@@ -245,12 +275,130 @@ def _model_info(app):
     lines.append(f"  模型ID: {app.llm_client.model_name}")
     lines.append(f"  API Base: {app.llm_client.base_url}")
     lines.append(f"  上下文限制: {app.llm_client.context_limit:,} tokens")
+    temp = app.llm_client.model_temperature
+    if temp is not None:
+        lines.append(f"  温度: {temp}")
+    else:
+        lines.append(f"  温度: 使用全局值(0.1)")
+    vision = "✅ 支持" if app.llm_client.supports_vision else "❌ 不支持"
+    lines.append(f"  视觉: {vision}")
 
     if app.context_window:
         total = app.session.get_total_tokens() if app.session else 0
         pct = (total / app.context_window.model_limit * 100) if app.context_window.model_limit > 0 else 0
         lines.append(f"  当前上下文使用: {total:,} / {app.context_window.model_limit:,} ({pct:.1f}%)")
 
+    return "\n".join(lines)
+
+
+# =============================================================================
+# 模型参数配置
+# =============================================================================
+
+def _config_model(app, param):
+    """修改模型参数"""
+    param = param.strip()
+    
+    # 如果没有指定模型名称，显示选择菜单
+    if not param:
+        models = app.global_config.get_models()
+        if not models:
+            return "📭 暂无模型。使用 /model add 添加模型。"
+        
+        lines = ["📋 选择要配置的模型 (输入编号或名称):\n"]
+        for i, m in enumerate(models, 1):
+            lines.append(f"  {i}. {m['name']} ({m['model']})")
+        
+        lines.append(f"\n  0. 取消")
+        print("\n" + "\n".join(lines))
+        choice = input("请选择 [编号/名称]: ").strip()
+        
+        if not choice or choice == '0':
+            return "已取消"
+        
+        if choice.isdigit():
+            idx = int(choice)
+            if idx == 0:
+                return "已取消"
+            if 1 <= idx <= len(models):
+                model_name = models[idx - 1]['name']
+            else:
+                return f"❌ 无效编号 (1-{len(models)})"
+        else:
+            model_name = choice
+            # 验证模型存在
+            if not app.global_config.get_model(model_name):
+                return f"❌ 未找到模型: {choice}"
+    else:
+        model_name = param
+        if not app.global_config.get_model(model_name):
+            return f"❌ 未找到模型: {model_name}"
+    
+    # 获取当前配置
+    model_config = app.global_config.get_model(model_name)
+    
+    print(f"\n--- 配置模型: {model_name} ---")
+    print("（直接回车跳过，保持当前值）\n")
+    
+    # 上下文长度
+    current_ctx = model_config.get('context_limit', 128000)
+    ctx_str = input(f"上下文长度限制 (当前: {current_ctx}): ").strip()
+    if ctx_str:
+        try:
+            new_ctx = int(ctx_str)
+            model_config['context_limit'] = new_ctx
+        except ValueError:
+            return "❌ 上下文长度必须是数字"
+    
+    # 温度参数
+    current_temp = model_config.get('temperature')
+    temp_display = str(current_temp) if current_temp is not None else "使用全局值(0.1)"
+    temp_str = input(f"温度参数 (当前: {temp_display}): ").strip()
+    if temp_str:
+        if temp_str.lower() == 'none' or temp_str == '-':
+            # 清除模型专属温度，恢复使用全局值
+            model_config.pop('temperature', None)
+            print("  → 已清除，将使用全局值(0.1)")
+        else:
+            try:
+                new_temp = float(temp_str)
+                if not 0 <= new_temp <= 2:
+                    return "❌ 温度参数范围: 0-2"
+                model_config['temperature'] = new_temp
+            except ValueError:
+                return "❌ 温度参数必须是数字（输入 none 或 - 可清除）"
+    
+    # 视觉参数
+    current_vision = model_config.get('vision', False)
+    vision_display = "y" if current_vision else "n"
+    vision_str = input(f"是否支持视觉/图片输入 (当前: {vision_display}): ").strip().lower()
+    if vision_str:
+        model_config['vision'] = vision_str == 'y'
+
+    # 保存配置
+    # global_config 中 models 是列表，需要找到并替换
+    models = app.global_config.get_models()
+    for i, m in enumerate(models):
+        if m.get('name') == model_name:
+            models[i] = model_config
+            break
+    app.global_config.save()
+    
+    # 构建结果信息
+    lines = [f"✅ 模型 '{model_name}' 配置已更新:"]
+    lines.append(f"   上下文限制: {model_config.get('context_limit', 128000):,} tokens")
+    temp = model_config.get('temperature')
+    if temp is not None:
+        lines.append(f"   温度: {temp}")
+    else:
+        lines.append(f"   温度: 使用全局值(0.1)")
+    vision = "✅ 支持" if model_config.get('vision', False) else "❌ 不支持"
+    lines.append(f"   视觉: {vision}")
+    
+    # 如果当前正在使用这个模型，提示需要重新加载
+    if app.llm_client and app.llm_client.model_name == model_config.get('model'):
+        lines.append("\n💡 提示: 当前正在使用此模型，重启 cbhcli 后配置生效")
+    
     return "\n".join(lines)
 
 

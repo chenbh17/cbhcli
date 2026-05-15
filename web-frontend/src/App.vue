@@ -11,6 +11,7 @@ const navItems = [
   { path: '/chat', icon: '>', label: 'Chat' },
   { path: '/agents', icon: '@', label: 'Agents' },
   { path: '/models', icon: '#', label: 'Models' },
+  { path: '/tools', icon: '!', label: 'Tools' },
   { path: '/skills', icon: '*', label: 'Skills' },
   { path: '/mcp', icon: '~', label: 'MCP' },
   { path: '/knowledge', icon: '&', label: 'Knowledge' },

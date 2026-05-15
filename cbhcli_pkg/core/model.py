@@ -20,6 +20,11 @@ class LLMClient:
         self.api_key = model_config["apiKey"]
         self.model_name = model_config["model"]
         self.context_limit = model_config.get("context_limit", 128000)
+        # 模型专属温度配置（可选，未设置则使用调用时传入的值或默认值）
+        self.model_temperature = model_config.get("temperature")
+        
+        # 是否支持视觉（图片输入）
+        self.supports_vision = model_config.get("vision", False)
         
         # 是否支持思考模式（动态检测：一旦模型返回 reasoning_content 就自动标记）
         self.supports_reasoning = False
@@ -61,6 +66,12 @@ class LLMClient:
             cleaned.append(msg)
         return cleaned
     
+    def _get_temperature(self, temperature: float) -> float:
+        """获取温度参数：优先使用模型配置，否则使用传入值"""
+        if self.model_temperature is not None:
+            return self.model_temperature
+        return temperature
+
     def chat(self, messages: list[dict], temperature: float = 0.1, **kwargs) -> str:
         """
         非流式聊天完成
@@ -121,7 +132,7 @@ class LLMClient:
         payload = {
             "model": self.model_name,
             "messages": self._clean_messages(messages),
-            "temperature": temperature,
+            "temperature": self._get_temperature(temperature),
             "stream": True,
             **kwargs
         }

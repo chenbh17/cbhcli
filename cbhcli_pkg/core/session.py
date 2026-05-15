@@ -16,6 +16,7 @@ class Message:
     tool_call_id: Optional[str] = None  # tool 消息关联的 tool_call ID
     tool_calls: Optional[list] = None  # assistant 消息的工具调用信息
     reasoning_content: Optional[str] = None  # DeepSeek 等思考模型的推理内容
+    images: Optional[list] = None  # 图片列表（base64编码）
 
     def to_dict(self) -> dict:
         """转换为API消息格式"""
@@ -25,6 +26,15 @@ class Message:
             # assistant 使用工具调用时，需要 tool_calls 字段
             msg["tool_calls"] = self.tool_calls
             msg["content"] = self.content if self.content else None
+        elif self.role == "user" and self.images:
+            # 用户消息包含图片时，使用多模态格式
+            content_parts = [{"type": "text", "text": self.content}]
+            for img_data in self.images:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_data}"}
+                })
+            msg["content"] = content_parts
         else:
             msg["content"] = self.content
 
@@ -60,7 +70,8 @@ class Session:
                     metadata: Optional[dict] = None, 
                     tool_call_id: Optional[str] = None,
                     tool_calls: Optional[list] = None,
-                    reasoning_content: Optional[str] = None) -> Message:
+                    reasoning_content: Optional[str] = None,
+                    images: Optional[list] = None) -> Message:
         """
         添加消息到会话
         
@@ -83,7 +94,8 @@ class Session:
             metadata=metadata,
             tool_call_id=tool_call_id,
             tool_calls=tool_calls,
-            reasoning_content=reasoning_content
+            reasoning_content=reasoning_content,
+            images=images
         )
         self.messages.append(msg)
         return msg
