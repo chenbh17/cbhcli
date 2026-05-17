@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Optional
 import json
 
+from cbhcli_pkg import __version__
+
 
 # 性格模板
 SOUL_TEMPLATE = """# 性格
@@ -598,7 +600,7 @@ class AgentConfig:
             auto_compress=data.get("auto_compress", True),
             max_tool_calls=data.get("max_tool_calls", 100),
             disabled_tools=disabled,
-            config_version=config_version or "4.7.5",
+            config_version=config_version or __version__,
             created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now()
         )
 
@@ -718,7 +720,7 @@ class AgentManager:
             primary_model=primary_model,
             description=description,
             disabled_tools=list(AgentConfig.DEFAULT_DISABLED_CBHPACKS),
-            config_version="4.7.5"
+            config_version=__version__
         )
         
         self._save_config(config)
