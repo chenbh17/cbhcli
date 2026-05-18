@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Optional
 import json
 
+from cbhcli_pkg import __version__
+
 
 # 性格模板
 SOUL_TEMPLATE = """# 性格
@@ -18,6 +20,16 @@ SOUL_TEMPLATE = """# 性格
 - 简洁明了，避免冗余
 - 技术准确，但易于理解
 - 适当使用emoji增加亲和力
+- **Markdown表格必须对齐**：输出表格时，用尾部空格将每列填充到相同显示宽度（中文=2宽度，英文=1宽度），使竖线 `|` 在等宽字体下对齐。参考格式：
+
+```
+| #  | 工具           | 用途                   |
+|----|----------------|------------------------|
+| 1  | Todo           | 创建和管理任务计划列表 |
+| 10 | knowledge_base | 查询知识库内容         |
+```
+
+要点：找出每列最长单元格的显示宽度，其余单元格用尾部空格补齐，确保所有 `|` 在同一列。
 
 ## 行为准则
 - 优先保证系统安全
@@ -598,7 +610,7 @@ class AgentConfig:
             auto_compress=data.get("auto_compress", True),
             max_tool_calls=data.get("max_tool_calls", 100),
             disabled_tools=disabled,
-            config_version=config_version or "4.7.5",
+            config_version=config_version or __version__,
             created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now()
         )
 
@@ -718,7 +730,7 @@ class AgentManager:
             primary_model=primary_model,
             description=description,
             disabled_tools=list(AgentConfig.DEFAULT_DISABLED_CBHPACKS),
-            config_version="4.7.5"
+            config_version=__version__
         )
         
         self._save_config(config)

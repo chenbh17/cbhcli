@@ -297,6 +297,16 @@ class ToolExecutor:
             return arguments.get("pattern", "")
         elif tool_name == "ask_user":
             return arguments.get("question", "")[:60]
+        elif tool_name.startswith("cbhpacks_"):
+            # cbhpacks 系列工具 - 显示所有参数
+            preview_parts = []
+            for key, value in arguments.items():
+                # 将值转换为字符串，并截断过长的内容
+                value_str = str(value)
+                if len(value_str) > 50:
+                    value_str = value_str[:50] + "..."
+                preview_parts.append(f"{key}={value_str}")
+            return ", ".join(preview_parts) if preview_parts else ""
         return ""
 
     def _confirm_execution(self, tool_name: str) -> bool:

@@ -9,9 +9,11 @@ from cbhcli_pkg.core.session import Session, Message
 from cbhcli_pkg.core.model import LLMClient
 from cbhcli_pkg.core.tool_executor import ToolExecutor
 from cbhcli_pkg.tools.registry import ToolResult
+from cbhcli_pkg.core.thinking_display import ThinkingDisplay
+from cbhcli_pkg.core.response_cleaner import MarkdownTableBuffer
 from cbhcli_pkg.core.constants import (
     MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE,
-    MAX_REFLECTION_RETRIES, PLANNING_MIN_LENGTH,
+    MAX_REFLECTION_RETRIES, PLANNING_MIN_LENGTH, THINKING_MAX_LINES,
     C_AI_HINT, C_AI_TEXT, C_ERROR, C_RESET, C_DIM,
     C_SUBAGENT_HINT, C_SUBAGENT_TEXT, C_SUBAGENT_DIM
 )
@@ -115,6 +117,9 @@ class AIHandler:
             self._c_text = C_AI_TEXT
             self._c_dim = C_DIM
             self._label = ""
+            
+        # 思考内容滚动显示管理器
+        self.thinking_display = ThinkingDisplay(max_lines=THINKING_MAX_LINES, label=self._label)
 
     # ==================================================================
     #  主流程
@@ -328,6 +333,7 @@ class AIHandler:
         is_reasoning = False
         reasoning_buffer = ""
         tc_buffer = {}  # index -> {id, name, arguments_str}
+        table_buffer = MarkdownTableBuffer()  # Markdown 表格对齐缓冲
 
         try:
             openai_tools = self.tool_executor.tool_registry.get_openai_tools()
@@ -340,10 +346,11 @@ class AIHandler:
                 if chunk_type == "reasoning":
                     if not is_reasoning:
                         is_reasoning = True
-                        print(f"\n{self._c_dim}思考中...{C_RESET}")
+                        # 启动思考内容滚动显示
+                        self.thinking_display.start_thinking()
                     reasoning_buffer += content
-                    sys.stdout.write(f"{self._c_dim}{content}{C_RESET}")
-                    sys.stdout.flush()
+                    # 将思考内容添加到滚动显示区域
+                    self.thinking_display.add_content(content)
 
                 elif chunk_type == "tool_calls":
                     # 收集 Function Calling 增量数据
@@ -366,13 +373,19 @@ class AIHandler:
                 elif chunk_type == "content":
                     if is_reasoning:
                         is_reasoning = False
-                        print(f"\n{self._c_dim}思考完毕{C_RESET}")
+                        # 完成思考内容滚动显示
+                        self.thinking_display.finish_thinking()
 
-                    ai_response += content
-                    sys.stdout.write(content)
-                    sys.stdout.flush()
+                    # 通过表格缓冲器处理内容，实现表格自动对齐
+                    aligned_content = table_buffer.feed(content)
+                    ai_response += aligned_content
 
-            # 流式结束 — 构造结构化 tool_calls
+            # 流式结束 — 输出表格缓冲器中的剩余内容
+            remaining = table_buffer.flush()
+            if remaining:
+                ai_response += remaining
+
+            # 构造结构化 tool_calls
             tool_calls = []
             if tc_buffer:
                 for idx in sorted(tc_buffer.keys()):
@@ -390,9 +403,21 @@ class AIHandler:
                         })
                         print(f"\n{self._c_dim}🔧 {tc['name']}({tc['arguments'][:100]}){C_RESET}")
 
+            # 确保在流式结束时关闭思考显示（如果仍在思考中）
+            if is_reasoning and self.thinking_display.is_thinking:
+                self.thinking_display.finish_thinking()
+
             print()
 
+        except KeyboardInterrupt:
+            # Ctrl+C 中断：强制清理思考显示，恢复终端状态
+            self.thinking_display.cleanup()
+            raise
+
         except Exception as e:
+            # 确保在异常情况下也能关闭思考显示
+            if is_reasoning and self.thinking_display.is_thinking:
+                self.thinking_display.finish_thinking()
             print(f"\n{C_ERROR}AI调用失败: {str(e)}{C_RESET}")
             raise
 

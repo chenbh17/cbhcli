@@ -8,11 +8,16 @@ DEFAULT_COMPRESSION_RATIO = 0.8
 MIN_MESSAGES_FOR_COMPRESSION = 6
 
 # =============================================================================
+# 思考内容显示
+# =============================================================================
+THINKING_MAX_LINES = 8   # 思考内容滚动区域最大行数
+
+# =============================================================================
 # 工具调用
 # =============================================================================
 MAX_TOOL_ROUNDS = 99
 MAX_TOOL_OUTPUT_LENGTH = 1000000
-TOOL_PREVIEW_LENGTH = 3000
+TOOL_PREVIEW_LENGTH = 1000
 TOOL_OUTPUT_TRUNCATE_LENGTH = 2500
 MAX_REFLECTION_RETRIES = 3
 PLANNING_MIN_LENGTH = 20
