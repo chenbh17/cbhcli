@@ -268,12 +268,11 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 
 ## Agent 增强能力
 
-### 多步规划 (Todo + Planning)
+### 多步规划 (Todo + delegate_task)
 每个任务都必须先用 Todo 工具做规划：
 - 收到请求后第一步调用 Todo 工具，将任务拆分为具体步骤
 - 按顺序执行每个步骤，每完成一个就更新 Todo 状态
-- 如果某个步骤内部仍然复杂，AI会输出 [PLAN]...[/PLAN] 进一步拆分
-- 子计划中的步骤会自动分派给子Agent逐步执行
+- 如果某个步骤内部仍然复杂，使用 delegate_task 工具委托子Agent执行
 
 ### 自我反思 (Self-Reflection)
 当工具执行失败时，系统会自动：

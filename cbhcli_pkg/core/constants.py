@@ -20,7 +20,6 @@ MAX_TOOL_OUTPUT_LENGTH = 1000000
 TOOL_PREVIEW_LENGTH = 1000
 TOOL_OUTPUT_TRUNCATE_LENGTH = 2500
 MAX_REFLECTION_RETRIES = 3
-PLANNING_MIN_LENGTH = 20
 
 # =============================================================================
 # API配置
