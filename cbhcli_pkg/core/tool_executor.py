@@ -279,8 +279,8 @@ class ToolExecutor:
             cmd = arguments.get("command", "")
             if not cmd:
                 cmd = arguments.get("cmd", "") or arguments.get("shell", "")
-            if len(cmd) > 80 and not self.verbose:
-                return cmd[:80] + "..."
+            if len(cmd) > 400 and not self.verbose:
+                return cmd[:400] + "..."
             return cmd
         elif tool_name in ("read", "write", "edit"):
             path = arguments.get("path", arguments.get("file_path", ""))

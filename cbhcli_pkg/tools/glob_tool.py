@@ -1,8 +1,35 @@
 """Glob工具 - 按模式匹配搜索文件"""
 import os
 import fnmatch
+import re
 from pathlib import Path
 from cbhcli_pkg.tools.registry import BaseTool, ToolResult
+
+
+def _expand_braces(pattern: str) -> list:
+    """递归展开 brace expansion，如 {py,json} → ['py', 'json']
+
+    支持嵌套：a{b,c{d,e}}f → ['abf', 'acdf', 'acef']
+    不含花括号时返回单元素列表。
+    """
+    # 匹配最内层花括号（不含嵌套花括号）
+    match = re.search(r'\{([^{}]+)\}', pattern)
+    if not match:
+        return [pattern]
+
+    options = match.group(1).split(',')
+    prefix = pattern[:match.start()]
+    suffix = pattern[match.end():]
+
+    results = []
+    seen = set()
+    for opt in options:
+        new_pattern = prefix + opt.strip() + suffix
+        for r in _expand_braces(new_pattern):
+            if r not in seen:
+                seen.add(r)
+                results.append(r)
+    return results
 
 
 class GlobTool(BaseTool):
@@ -73,21 +100,29 @@ class GlobTool(BaseTool):
                 '.egg-info', '.eggs'
             }
 
+            # 展开 brace expansion（如 **/*.{py,json} → **/*.py, **/*.json）
+            patterns = _expand_braces(pattern)
+
             # 使用 Path.glob (支持 **)
             matched = []
-            try:
-                for p in base.glob(pattern):
-                    if p.is_file():
-                        # 跳过在排除目录中的文件
-                        parts = p.relative_to(base).parts
-                        if any(part in skip_dirs for part in parts):
-                            continue
-                        matched.append(p)
-            except Exception as e:
-                return ToolResult(
-                    success=False, output="",
-                    error=f"Glob 模式错误: {e}"
-                )
+            seen = set()  # 去重（多个展开模式可能匹配同一文件）
+            for pat in patterns:
+                try:
+                    for p in base.glob(pat):
+                        if p.is_file():
+                            # 跳过在排除目录中的文件
+                            parts = p.relative_to(base).parts
+                            if any(part in skip_dirs for part in parts):
+                                continue
+                            resolved = p.resolve()
+                            if resolved not in seen:
+                                seen.add(resolved)
+                                matched.append(p)
+                except Exception as e:
+                    return ToolResult(
+                        success=False, output="",
+                        error=f"Glob 模式错误 ({pat}): {e}"
+                    )
 
             if not matched:
                 return ToolResult(
