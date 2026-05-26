@@ -569,7 +569,6 @@ class CBHCLIApp:
         remove_python_session("default")
         
         self.session = Session(agent_name=self.current_agent_name)
-        tool_descriptions = self.tool_registry.get_tool_descriptions()
         
         # 获取模型名称
         model_name = ""
@@ -588,7 +587,6 @@ class CBHCLIApp:
         
         supports_vision = self.llm_client.supports_vision if self.llm_client else False
         system_prompt = self.current_persona.build_system_prompt(
-            tool_descriptions,
             agent_name=self.current_agent_name or "",
             model_name=model_name,
             memory_content=memory_content,
@@ -626,8 +624,6 @@ class CBHCLIApp:
         if not self.session or not self.current_persona or not self.current_agent_config:
             return
         
-        tool_descriptions = self.tool_registry.get_tool_descriptions()
-        
         # 获取模型名称
         model_name = ""
         if self.llm_client and hasattr(self.llm_client, 'model_name'):
@@ -643,7 +639,6 @@ class CBHCLIApp:
         
         supports_vision = self.llm_client.supports_vision if self.llm_client else False
         system_prompt = self.current_persona.build_system_prompt(
-            tool_descriptions,
             agent_name=self.current_agent_name or "",
             model_name=model_name,
             memory_content=memory_content,

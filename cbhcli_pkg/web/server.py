@@ -50,7 +50,7 @@ from cbhcli_pkg.context.token_counter import get_token_counter
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.8.0")
+app = FastAPI(title="CBHCLI Web", version="4.8.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -931,10 +931,8 @@ async def chat(req: ChatRequest):
             pass
         app_proxy.skill_manager = skill_manager
 
-        # Build system prompt with tool descriptions and skills
-        tool_descriptions = tool_registry.get_tool_descriptions()
+        # Build system prompt with skills
         system_prompt = persona.build_system_prompt(
-            tool_descriptions,
             agent_name=req.agent_name,
             model_name=req.model_name,
             active_skills_prompt=active_skills_prompt,
@@ -1452,15 +1450,13 @@ async def chat_load(req: Request):
         reasoning_content = msg.get("reasoning_content")
 
         if role == "system":
-            # Rebuild system prompt with current tools/skills instead of old one
+            # Rebuild system prompt with current skills instead of old one
             persona = manager.load_agent_persona(agent_name)
-            tool_descriptions = tool_registry.get_tool_descriptions()
             # Try to get vision support from existing session
             supports_vision = False
             if session_key in _chat_sessions:
                 supports_vision = _chat_sessions[session_key].get("llm_client", {}).supports_vision
             system_prompt = persona.build_system_prompt(
-                tool_descriptions,
                 agent_name=agent_name,
                 model_name=model_name,
                 active_skills_prompt=active_skills_prompt,
