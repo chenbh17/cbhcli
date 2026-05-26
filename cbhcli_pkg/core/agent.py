@@ -125,6 +125,8 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /mcp [add|list|rm|refresh|tools|on|off] - MCP服务器管理
 - quit - 退出程序
 
+
+## 工作空间
 ## 工作空间
 位于: ~/.cbhcli/agents/<agent_name>/
 - config.json: Agent配置 | soul.md: 性格 | tools.md: 工具规则
