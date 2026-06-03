@@ -88,7 +88,7 @@ class ReadTool(BaseTool):
             selected_lines = lines[start_idx:end_idx]
             content = ''.join(selected_lines)
             
-            # 构建输出
+            # 构建完整输出（返回给AI）
             output_lines = []
             output_lines.append(f"📄 文件: {file_path}")
             output_lines.append(f"📊 总行数: {total_lines}")
@@ -106,9 +106,17 @@ class ReadTool(BaseTool):
             
             output_lines.append("--- 结束 ---")
             
+            # 构建终端显示（只显示元信息）
+            display_lines = []
+            display_lines.append(f"📄 文件: {file_path}")
+            display_lines.append(f"📊 总行数: {total_lines}")
+            if start_line or end_line:
+                display_lines.append(f"📍 显示范围: 第{start_idx+1}-{end_idx}行")
+            
             return ToolResult(
                 success=True,
-                output="\n".join(output_lines)
+                output="\n".join(output_lines),
+                display_output="\n".join(display_lines)
             )
             
         except UnicodeDecodeError:

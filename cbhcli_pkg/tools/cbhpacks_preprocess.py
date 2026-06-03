@@ -30,7 +30,10 @@ class ColsOperateTool(BaseTool):
 
     @property
     def description(self):
-        return "cbhpacks 列操作工具 - 炸裂/转置/分割/日期转换/分词。每次执行自动保存可复现源码。"
+        return ("cbhpacks 列操作工具 - 炸裂/转置/分割/日期转换/分词。每次执行自动保存可复现源码。\n\n"
+                "【⚠️ 注意事项】\n"
+                "- date_col_trans: 日期列必须是完整yyyymmdd格式(如20240601)，只有年月(如202406)会报错。"
+                "解决方案：先拼接补全日期(str(mth)+'01')再调用。")
 
     @property
     def parameters(self):

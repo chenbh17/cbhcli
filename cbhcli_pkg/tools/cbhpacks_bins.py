@@ -37,7 +37,12 @@ class BinsModelTool(BaseTool):
             "cbhpacks 分箱模型工具 - 分箱、WOE转换、IV计算、PSI稳定性检验。\n"
             "同一数据集多次调用共享状态。不同分箱类型自动分目录。\n"
             "每次执行自动保存可复现的Python源码脚本到输出目录。\n\n"
-            "【method】comp_woe_iv/bins_rpt/data_to_woe/get_psi/psi_mth_avg/plot_col_rpt/plot_cols_rpt"
+            "【method】comp_woe_iv/bins_rpt/data_to_woe/get_psi/psi_mth_avg/plot_col_rpt/plot_cols_rpt\n\n"
+            "【⚠️ 注意事项】\n"
+            "1. WOE转换必须使用本工具的data_to_woe，禁止使用cbhpacks_cols_encode.data_to_woe，"
+            "因为本工具与comp_woe_iv共享分箱状态，确保一致性。\n"
+            "2. data_to_woe不会自动继承comp_woe_iv的参数(group/bins_type/adj_bin等)，"
+            "调用时必须手动传入与comp_woe_iv完全一致的参数，否则会用默认参数重新分箱。"
         )
 
     @property

@@ -11,6 +11,7 @@ class ToolResult:
     output: str
     error: Optional[str] = None
     metadata: Optional[dict] = None
+    display_output: Optional[str] = None  # 终端显示内容（None则显示output）
 
 
 class BaseTool(ABC):

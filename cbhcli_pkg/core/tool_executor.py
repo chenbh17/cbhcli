@@ -337,7 +337,9 @@ class ToolExecutor:
     def _display_result(self, result: ToolResult):
         """显示执行结果"""
         if result.success:
-            output = result.output[:MAX_TOOL_OUTPUT_LENGTH] if result.output else ""
+            # 优先使用 display_output，否则使用 output
+            display = result.display_output if result.display_output is not None else result.output
+            output = display[:MAX_TOOL_OUTPUT_LENGTH] if display else ""
 
             if self.verbose:
                 output_preview = output

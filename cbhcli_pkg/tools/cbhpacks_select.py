@@ -36,7 +36,11 @@ class ColsSelectTool(BaseTool):
             "cbhpacks 通用特征筛选工具 - 10种筛选方法逐步筛选特征。\n"
             "同一数据集多次调用共享状态，self.cols_s 会逐步缩减。\n"
             "每次执行自动保存可复现的Python源码脚本到输出目录。\n\n"
-            "【method】null_select/enumerate_select/iv_select/psi_select/corr_select/chi2_select/logistic_select/ml_select/boostrap_select/vif_select"
+            "【method】null_select/enumerate_select/iv_select/psi_select/corr_select/chi2_select/logistic_select/ml_select/boostrap_select/vif_select\n\n"
+            "【⚠️ 依赖数据说明】\n"
+            "- iv_data_csv: iv_select和corr_select必须传入，来自cbhpacks_bins_model.comp_woe_iv产出的iv_data_xxx.csv\n"
+            "- psi_data_csv: psi_select必须传入，来自cbhpacks_bins_model.get_psi产出的psi_data_xxx.csv\n"
+            "若不传入这些参数，对应筛选方法会报错。"
         )
 
     @property

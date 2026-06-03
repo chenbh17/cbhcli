@@ -55,7 +55,12 @@ class BinaryModelTool(BaseTool):
     def description(self):
         return ("cbhpacks 二分类模型训练工具 - 训练/调参/评估报告。支持LR/XGB/LGBM/MLP/SVM/RDF。\n"
                 "每次执行自动保存可复现源码。调参/报告方法自动从pkl加载已有模型。\n\n"
-                "【method】lr_fit/xgb_fit/lgbm_fit/mlp_fit/svm_fit/rdf_fit/para_adj_gs/para_adj_bs/report")
+                "【method】lr_fit/xgb_fit/lgbm_fit/mlp_fit/svm_fit/rdf_fit/para_adj_gs/para_adj_bs/report\n\n"
+                "【⚠️ 注意事项】\n"
+                "1. para_adj_gs/para_adj_bs: 必须先调用fit方法(lr_fit/xgb_fit/lgbm_fit等)，否则报错'no attribute clf'。"
+                "调参超参数必须与当前模型类型匹配(如lgbm用colsample_bytree，rdf不支持)。\n"
+                "2. report的cols_bins_rpt_csv参数: 传入分箱报告Excel文件路径(如bins_rpt_adj_num_eq_cnt.xlsx)，"
+                "来自cbhpacks_bins_model.comp_woe_iv产出。若有连续型+离散型两份报告，需先用pd.concat()合并为一个文件再传入路径。")
 
     @property
     def parameters(self):
@@ -72,7 +77,8 @@ class BinaryModelTool(BaseTool):
             "paras": {"type": "string", "description": "JSON格式"},
             "score_type": {"type": "string", "default": "roc_auc"}, "cv": {"type": "integer", "default": 2},
             "epochs": {"type": "integer", "default": 5}, "batch_size": {"type": "integer", "default": 100},
-            "validation_split": {"type": "number", "default": 0.5}
+            "validation_split": {"type": "number", "default": 0.5},
+            "cols_bins_rpt_csv": {"type": "string", "description": "分箱报告Excel路径，来自comp_woe_iv产出的bins_rpt_xxx.xlsx，若有连续+离散两份需先合并"}
         }, "required": ["method"]}
 
     def execute(self, **kwargs):
@@ -96,6 +102,7 @@ class BinaryModelTool(BaseTool):
             epochs = kwargs.get("epochs", 5)
             batch_size = kwargs.get("batch_size", 100)
             validation_split = kwargs.get("validation_split", 0.5)
+            cols_bins_rpt_csv = kwargs.get("cols_bins_rpt_csv")
 
             from cbhpacks.model_training import binary_model
 
@@ -172,12 +179,22 @@ class BinaryModelTool(BaseTool):
                     clf, mt, cw = _load_saved_model(model_path)
                     if not clf: return ToolResult(success=False, output="", error=f"未找到已训练模型，请先执行fit方法")
                     bm.clf, bm.model_type, bm.adj, bm.cols_weight = clf, mt, "noadj", cw
-                bins_rpt_all, confusion_matrix, fea_bins_report, fea_report = bm.report(
-                    group=group, mth_col=mth_col, base_mth=base_mth, bins_type=bins_type)
+                
+                # 读取分箱报告
+                cols_bins_rpt = None
+                if cols_bins_rpt_csv and os.path.exists(cols_bins_rpt_csv):
+                    cols_bins_rpt = pd.read_excel(cols_bins_rpt_csv)
+                
+                report_kwargs = dict(group=group, mth_col=mth_col, base_mth=base_mth, bins_type=bins_type)
+                if cols_bins_rpt is not None:
+                    report_kwargs['cols_bins_rpt'] = cols_bins_rpt
+                
+                bins_rpt_all, confusion_matrix, fea_bins_report, fea_report = bm.report(**report_kwargs)
                 output_files += [f"  ✅ confusion_matrix_*.xlsx", f"  ✅ *_full_report.xlsx (含KS/ROC/LIFT图)",
                                  f"  ✅ {train_data_path}/xtest_pred.csv", f"  ✅ bins_rpt_*.xlsx"]
                 result_text = f"报告生成完成\n混淆矩阵:\n{confusion_matrix.to_string() if hasattr(confusion_matrix,'to_string') else str(confusion_matrix)}"
-                script_body = f"bm.report(group={group}, mth_col='{mth_col}', base_mth={base_mth}, bins_type='{bins_type}')"
+                cols_bins_rpt_code = f", cols_bins_rpt=pd.read_excel('{cols_bins_rpt_csv}')" if cols_bins_rpt_csv else ""
+                script_body = f"bm.report(group={group}, mth_col='{mth_col}', base_mth={base_mth}, bins_type='{bins_type}'{cols_bins_rpt_code})"
             else:
                 return ToolResult(success=False, output="", error=f"未知方法: {method}")
 
