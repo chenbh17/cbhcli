@@ -50,7 +50,7 @@ from cbhcli_pkg.context.token_counter import get_token_counter
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.8.3")
+app = FastAPI(title="CBHCLI Web", version="4.8.4")
 
 app.add_middleware(
     CORSMiddleware,

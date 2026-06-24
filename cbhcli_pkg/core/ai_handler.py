@@ -9,7 +9,7 @@ from cbhcli_pkg.core.model import LLMClient
 from cbhcli_pkg.core.tool_executor import ToolExecutor
 from cbhcli_pkg.tools.registry import ToolResult
 from cbhcli_pkg.core.thinking_display import ThinkingDisplay
-from cbhcli_pkg.core.response_cleaner import MarkdownTableBuffer
+from cbhcli_pkg.core.markdown_renderer import MarkdownStreamRenderer
 from cbhcli_pkg.core.constants import (
     MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE,
     MAX_REFLECTION_RETRIES, THINKING_MAX_LINES,
@@ -141,13 +141,13 @@ class AIHandler:
         if round_idx == 0:
             print(f"\n{self._c_hint}{self._label}AI正在分析您的请求...{C_RESET}")
 
-        print(f"\n{self._c_text}{self._label}AI: {C_RESET}", end='', flush=True)
-
         ai_response = ""
         is_reasoning = False
         reasoning_buffer = ""
         tc_buffer = {}  # index -> {id, name, arguments_str}
-        table_buffer = MarkdownTableBuffer()  # Markdown 表格对齐缓冲
+        md_renderer = MarkdownStreamRenderer()  # Markdown 流式渲染器
+        # 设置前缀（含 ANSI 颜色码），feed() 首次调用时输出
+        md_renderer.set_prefix(f"\n{self._c_text}{self._label}AI: {C_RESET}")
 
         try:
             openai_tools = self.tool_executor.tool_registry.get_openai_tools()
@@ -190,14 +190,12 @@ class AIHandler:
                         # 完成思考内容滚动显示
                         self.thinking_display.finish_thinking()
 
-                    # 通过表格缓冲器处理内容，实现表格自动对齐
-                    aligned_content = table_buffer.feed(content)
-                    ai_response += aligned_content
+                    # 通过 Markdown 流式渲染器处理内容
+                    raw_content = md_renderer.feed(content)
+                    ai_response += raw_content
 
-            # 流式结束 — 输出表格缓冲器中的剩余内容
-            remaining = table_buffer.flush()
-            if remaining:
-                ai_response += remaining
+            # 流式结束 — 完成 Markdown 渲染（清除纯文本+前缀，重新渲染）
+            md_renderer.flush()
 
             # 构造结构化 tool_calls
             tool_calls = []
@@ -224,12 +222,15 @@ class AIHandler:
             print()
 
         except KeyboardInterrupt:
-            # Ctrl+C 中断：强制清理思考显示，恢复终端状态
+            # Ctrl+C 中断：强制清理渲染器和思考显示，恢复终端状态
+            md_renderer.cleanup()
             self.thinking_display.cleanup()
             raise
 
         except Exception as e:
-            # 确保在异常情况下也能关闭思考显示
+            # 确保在异常情况下也能关闭渲染器和思考显示
+            if md_renderer.started:
+                md_renderer.cleanup()
             if is_reasoning and self.thinking_display.is_thinking:
                 self.thinking_display.finish_thinking()
             print(f"\n{C_ERROR}AI调用失败: {str(e)}{C_RESET}")
