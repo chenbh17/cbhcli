@@ -77,6 +77,7 @@ MCP 扩展工具名称格式为 `mcp_服务器名_工具名`，使用方式与�
 - 在需求不明确时使用 ask_user 向用户确认，而不是猜测
 - 重要操作前提醒用户
 - 出错时提供解决方案
+- **需要识别图片时使用 image 工具**，传入图片路径和识别需求，工具会自动调用视觉模型识别图片内容
 """
 
 
@@ -122,6 +123,7 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /kb [add|list|rm|reindex|status] - 知识库管理
 - /skills [list|add|use|off|rm] - 技能管理
 - /tools [list|on|off] - 工具开关管理
+- /fallback [add|list|rm|reorder|clear] - 备用模型管理
 - /mcp [add|list|rm|refresh|tools|on|off] - MCP服务器管理
 - quit - 退出程序
 
@@ -171,6 +173,15 @@ MCP (Model Context Protocol) 允许连接外部工具服务器，扩展工具能
 - /mcp on|off <服务器> <工具名> - 启用/禁用工具
 
 添加后工具自动注册，名称格式为 mcp_服务器名_工具名。
+
+## 备用模型管理
+当主模型断网或异常时，自动切换到备用模型继续任务。视觉模型同理。
+- /fallback list - 查看备用模型配置
+- /fallback add [main|vision] <模型名> - 添加备用模型
+- /fallback rm [main|vision] <模型名> - 移除备用模型
+- /fallback reorder [main|vision] - 重新排序备用模型
+- /fallback clear [main|vision] - 清空备用模型列表
+main=主模型备用, vision=视觉模型备用(image工具使用)。
 
 ## 记录信息
 当用户要求记录信息时：

@@ -19,6 +19,7 @@ BUILTIN_TOOLS = [
     ("knowledge_base",  "查询知识库内容",               "知识检索"),
     ("skills_create",   "创建新技能",                   "技能系统"),
     ("delegate_task",   "委托子任务给子Agent",          "任务管理"),
+    ("image",           "使用视觉模型识别图片内容",      "图片识别"),
     # cbhpacks 数据科学工具（默认关闭）
     ("cbhpacks_bins_model",       "分箱WOE/IV/PSI计算",      "数据科学"),
     ("cbhpacks_binary_model",     "二分类模型训练评估",        "数据科学"),
@@ -320,6 +321,7 @@ def _write_tools_md(workspace: Path, disabled: list) -> None:
     lines.append("- 在需求不明确时使用 ask_user 向用户确认，而不是猜测")
     lines.append("- 重要操作前提醒用户")
     lines.append("- 出错时提供解决方案")
+    lines.append("- **需要识别图片时使用 image 工具**，传入图片路径和识别需求，工具会自动调用视觉模型识别图片内容")
 
     tools_md = "\n".join(lines)
     tools_path = workspace / "tools.md"

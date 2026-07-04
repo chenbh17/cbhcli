@@ -49,6 +49,7 @@ class AIHandler:
         self._failure_counts: dict[str, int] = {}
         self.subagent_scheduler = None  # 由 app.py 注入
         self.agent_name: str = "main"   # 由 app.py 注入
+        self.fallback_models: list[str] = []  # 备用主模型名称列表，由 app.py 注入
 
         # 根据是否为子agent选择颜色
         if is_subagent:
@@ -134,9 +135,65 @@ class AIHandler:
     ) -> tuple[str, int, str, list[dict]]:
         """流式获取AI响应，同时收集 Function Calling 工具调用
 
+        当主模型异常时，自动切换到备用模型重试。
+
         Returns:
             (AI文本内容, 思考token数, 思考原文, 工具调用列表)
             工具调用列表格式: [{"id": "...", "name": "...", "arguments": {...}}]
+        """
+        # 尝试主模型 + 备用模型
+        try:
+            return self._stream_with_model(self.llm_client, messages, round_idx)
+        except KeyboardInterrupt:
+            raise
+        except Exception as primary_error:
+            # 主模型失败，尝试备用模型
+            if not self.fallback_models:
+                raise
+
+            print(f"\n{C_ERROR}⚠️  主模型调用失败: {primary_error}{C_RESET}")
+            return self._try_fallback_models(messages, round_idx, primary_error)
+
+    def _try_fallback_models(
+        self, messages: list, round_idx: int, primary_error: Exception
+    ) -> tuple[str, int, str, list[dict]]:
+        """尝试备用模型列表，依次重试直到成功或全部失败"""
+        from cbhcli_pkg.config.global_config import GlobalConfig
+        config = GlobalConfig()
+
+        for i, model_name in enumerate(self.fallback_models):
+            model_config = config.get_model(model_name)
+            if not model_config:
+                print(f"\n{C_DIM}🔄 备用模型 '{model_name}' 未找到配置，跳过{C_RESET}")
+                continue
+
+            print(f"\n{C_DIM}🔄 切换到备用模型 '{model_name}' (第{i+1}/{len(self.fallback_models)}个)...{C_RESET}")
+            try:
+                fallback_client = LLMClient(model_config)
+                return self._stream_with_model(fallback_client, messages, round_idx)
+            except KeyboardInterrupt:
+                raise
+            except Exception as fallback_error:
+                print(f"\n{C_ERROR}⚠️  备用模型 '{model_name}' 也失败: {fallback_error}{C_RESET}")
+                continue
+
+        # 所有备用模型都失败
+        raise Exception(
+            f"主模型和所有备用模型均失败。主模型错误: {primary_error}"
+        )
+
+    def _stream_with_model(
+        self, client: LLMClient, messages: list, round_idx: int
+    ) -> tuple[str, int, str, list[dict]]:
+        """使用指定模型客户端进行流式请求
+
+        Args:
+            client: LLM 客户端实例
+            messages: 消息列表
+            round_idx: 当前 ReAct 轮次
+
+        Returns:
+            (AI文本内容, 思考token数, 思考原文, 工具调用列表)
         """
         if round_idx == 0:
             print(f"\n{self._c_hint}{self._label}AI正在分析您的请求...{C_RESET}")
@@ -156,7 +213,7 @@ class AIHandler:
                 stream_kwargs["tools"] = openai_tools
                 stream_kwargs["tool_choice"] = "auto"
 
-            for chunk_type, content in self.llm_client.chat_stream(messages, **stream_kwargs):
+            for chunk_type, content in client.chat_stream(messages, **stream_kwargs):
                 if chunk_type == "reasoning":
                     if not is_reasoning:
                         is_reasoning = True
@@ -233,7 +290,6 @@ class AIHandler:
                 md_renderer.cleanup()
             if is_reasoning and self.thinking_display.is_thinking:
                 self.thinking_display.finish_thinking()
-            print(f"\n{C_ERROR}AI调用失败: {str(e)}{C_RESET}")
             raise
 
         reasoning_tokens = self.token_counter.count_tokens(reasoning_buffer) if reasoning_buffer else 0

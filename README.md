@@ -1,4 +1,4 @@
-# CBHCLI v4.8.4 - AI驱动的终端助手
+# CBHCLI v4.8.6 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -16,7 +16,7 @@
 - **Markdown渲染** - CLI界面支持Markdown格式渲染，代码高亮、表格、列表等美观显示
 - **LaTeX公式渲染** - 支持LaTeX数学公式渲染，行内公式与块级公式均可正常显示
 
-### 13大内置工具
+### 14大内置工具
 | 工具 | 功能 |
 |------|------|
 | `terminal` | 执行终端命令 |
@@ -32,6 +32,7 @@
 | `knowledge_base` | 查询知识库内容 |
 | `skills_create` | 创建新技能 |
 | `delegate_task` | 将子任务委托给子Agent执行 |
+| `image` | 使用视觉模型识别图片内容 |
 
 ### cbhpacks 数据科学工具（13个，默认关闭）
 基于 [cbhpacks](https://github.com/chenbh17/cbhpacks) 数据科学工具包封装，覆盖完整的机器学习建模流水线。默认不开启，通过 `/tools on` 手动开启。
@@ -89,6 +90,7 @@ cbhcli web -p 18888
 - **重排序服务** - 支持Jina、Cohere等重排序API提高检索质量
 - **自动上下文压缩** - 当接近模型限制时自动压缩上下文
 - **多模型支持** - 配置多个OpenAI兼容的AI模型，随时切换
+- **备用模型自动切换** - 主模型断网/异常时自动切换到备用模型继续任务，视觉模型同理
 
 ## 安装
 
@@ -110,7 +112,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.8.4-py3-none-any.whl
+pip install dist/cbhcli-4.8.6-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -202,7 +204,7 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 你可以直接让AI帮你创建技能，例如："帮我创建一个代码审查技能"。
 
 ### 8. 工具管理
-每个Agent可以独立控制26个内置工具（13个通用+13个数据科学）的开关状态，关闭的工具AI将无法调用。
+每个Agent可以独立控制27个内置工具（14个通用+13个数据科学）的开关状态，关闭的工具AI将无法调用。
 通用工具默认开启，cbhpacks数据科学工具默认关闭。
 
 ```
@@ -222,13 +224,30 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 - 关闭工具会自动更新该Agent工作空间的 `tools.md` 和 `usage.md`
 - 使用 `/tools list` 可随时查看当前状态
 
-### 9. memory.md 长期记忆
+### 9. 备用模型管理
+当主模型断网或出现异常时，自动切换到备用模型继续任务。视觉模型（image工具）同理。
+
+```
+/fallback list                          # 查看备用模型配置
+/fallback add main gpt-4o               # 添加主模型备用
+/fallback add vision qwen-vl            # 添加视觉模型备用
+/fallback rm main gpt-4o               # 移除主模型备用
+/fallback reorder main                  # 重新排序主模型备用
+/fallback clear vision                  # 清空视觉模型备用列表
+```
+
+- **main** - 主模型备用：主模型调用失败时按顺序自动切换
+- **vision** - 视觉模型备用：image工具的视觉模型不可用时按顺序自动切换
+- 备用模型必须已通过 `/model add` 配置
+- 视觉备用模型必须支持视觉功能（添加时选择 vision=y）
+
+### 10. memory.md 长期记忆
 memory.md 用于保存用户要求记住的重要信息：
 - **不会自动写入**：只有用户明确要求"记住"、"记录"时才写入
 - **始终包含在系统提示中**：每次对话都会读取 memory.md 内容
 - 普通对话历史通过 `/history` 和 `/resume` 管理
 
-### 10. Python 工具
+### 11. Python 工具
 使用 `python` 工具执行 Python 代码，支持会话记忆：
 - **会话记忆**：同一会话中定义的变量和导入的模块会保留
 - 示例：第一次导入 pandas 并读取数据，第二次可以直接使用之前的变量
@@ -421,6 +440,11 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/tools list` | 查看当前Agent的工具开关状态 |
 | `/tools on` | 开启工具（交互式多选） |
 | `/tools off` | 关闭工具（交互式多选） |
+| `/fallback list` | 查看备用模型配置 |
+| `/fallback add [main\|vision] <模型名>` | 添加备用模型 |
+| `/fallback rm [main\|vision] <模型名>` | 移除备用模型 |
+| `/fallback reorder [main\|vision]` | 重新排序备用模型 |
+| `/fallback clear [main\|vision]` | 清空备用模型列表 |
 | `/help [command]` | 显示帮助 |
 | `quit` | 退出程序 |
 
@@ -466,6 +490,7 @@ cbhcli_pkg/
 │   ├── memory_search.py # 记忆搜索
 │   ├── knowledge_base.py # 知识库查询
 │   ├── delegate_task.py  # 子Agent任务委托
+│   ├── image.py         # 图片识别（调用视觉模型）
 │   ├── skills_create.py  # 技能创建
 │   ├── base.py          # 工具基类
 │   └── registry.py      # 工具注册中心
@@ -478,7 +503,8 @@ cbhcli_pkg/
 │   ├── embedding_cmd.py # 向量索引命令
 │   ├── mcp_cmd.py      # MCP管理命令
 │   ├── skills_cmd.py   # 技能管理命令
-│   └── tools_cmd.py    # 工具开关管理命令
+│   ├── tools_cmd.py    # 工具开关管理命令
+│   └── fallback_cmd.py # 备用模型管理命令
 ├── web/               # Web管理界面
 │   ├── server.py       # FastAPI Web服务器
 │   └── static/         # Vue前端静态文件

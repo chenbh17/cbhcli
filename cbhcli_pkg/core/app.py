@@ -43,6 +43,7 @@ from cbhcli_pkg.tools.grep import GrepTool
 from cbhcli_pkg.tools.glob_tool import GlobTool
 from cbhcli_pkg.tools.ask_user import AskUserQuestionTool
 from cbhcli_pkg.tools.todo import TodoTool
+from cbhcli_pkg.tools.image import ImageTool
 
 # cbhpacks 数据科学工具
 from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
@@ -73,6 +74,7 @@ from cbhcli_pkg.commands.embedding_cmd import register_embedding_commands
 from cbhcli_pkg.commands.mcp_cmd import register_mcp_commands
 from cbhcli_pkg.commands.skills_cmd import register_skills_commands
 from cbhcli_pkg.commands.tools_cmd import register_tools_commands
+from cbhcli_pkg.commands.fallback_cmd import register_fallback_commands
 
 
 class SlashCommandHelper:
@@ -141,6 +143,29 @@ class SlashCommandHelper:
             ('list', '查看所有工具状态'),
             ('on', '开启工具（交互式多选）'),
             ('off', '关闭工具（交互式多选）'),
+        ],
+        'fallback': [
+            ('add', '添加备用模型'),
+            ('list', '查看备用模型配置'),
+            ('rm', '移除备用模型'),
+            ('reorder', '重新排序备用模型'),
+            ('clear', '清空备用模型列表'),
+        ],
+        'fallback add': [
+            ('main', '添加主模型备用'),
+            ('vision', '添加视觉模型备用'),
+        ],
+        'fallback rm': [
+            ('main', '移除主模型备用'),
+            ('vision', '移除视觉模型备用'),
+        ],
+        'fallback reorder': [
+            ('main', '重排主模型备用'),
+            ('vision', '重排视觉模型备用'),
+        ],
+        'fallback clear': [
+            ('main', '清空主模型备用'),
+            ('vision', '清空视觉模型备用'),
         ],
     }
     
@@ -264,6 +289,7 @@ class CBHCLIApp:
         self.tool_registry.register(GrepTool())
         self.tool_registry.register(GlobTool())
         self.tool_registry.register(AskUserQuestionTool())
+        self.tool_registry.register(ImageTool(self))
         self.todo_tool = TodoTool()
         self.tool_registry.register(self.todo_tool)
 
@@ -351,6 +377,7 @@ class CBHCLIApp:
         register_mcp_commands(self.command_parser, self)
         register_skills_commands(self.command_parser, self)
         register_tools_commands(self.command_parser, self)
+        register_fallback_commands(self.command_parser, self)
         
         # 注册help命令
         def help_handler(args):
@@ -952,6 +979,11 @@ class CBHCLIApp:
         # 注入子Agent调度器
         handler.subagent_scheduler = self.subagent_scheduler
         handler.agent_name = self.current_agent_name or "main"
+        
+        # 注入备用主模型列表
+        from cbhcli_pkg.config.global_config import GlobalConfig
+        gc = GlobalConfig()
+        handler.fallback_models = gc.get_fallback_models()
         
         # 设置记忆更新回调
         handler.on_memory_update(self._update_memory)

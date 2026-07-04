@@ -273,6 +273,22 @@ class ToolExecutor:
                     print(f"  {C_DIM_TEXT}... 还有 {len(lines) - max_display} 行 ...{C_RESET}")
                 print()
 
+        elif tool_name == "image":
+            image_paths = arguments.get("image_paths", [])
+            prompt = arguments.get("prompt", "")
+
+            if image_paths:
+                print()
+                print(f"  {C_GREEN_BG}{C_WHITE}{C_BOLD}--- 图片识别请求 ---{C_RESET}")
+                print(f"  {C_DIM_TEXT}图片数量: {len(image_paths)}{C_RESET}")
+                for i, path in enumerate(image_paths, 1):
+                    display_path = _truncate_to_width(path, 200)
+                    print(f"  {C_YELLOW}{i:4d}{C_RESET} {display_path}")
+                if prompt:
+                    prompt_display = _truncate_to_width(prompt, 200)
+                    print(f"  {C_DIM_TEXT}识别需求: {prompt_display}{C_RESET}")
+                print()
+
     def _get_tool_preview(self, tool_name: str, arguments: dict) -> str:
         """获取工具调用的预览字符串"""
         if tool_name == "terminal":
@@ -297,6 +313,17 @@ class ToolExecutor:
             return arguments.get("pattern", "")
         elif tool_name == "ask_user":
             return arguments.get("question", "")[:60]
+        elif tool_name == "image":
+            image_paths = arguments.get("image_paths", [])
+            prompt = arguments.get("prompt", "")
+            count = len(image_paths)
+            paths_str = ", ".join(image_paths[:3])
+            if len(image_paths) > 3:
+                paths_str += f" ...等{count}张"
+            preview = f"[{count}张] {paths_str}"
+            if prompt:
+                preview += f" | {prompt[:200]}"
+            return preview
         elif tool_name.startswith("cbhpacks_"):
             # cbhpacks 系列工具 - 显示所有参数
             preview_parts = []

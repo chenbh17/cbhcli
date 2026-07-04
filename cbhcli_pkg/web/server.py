@@ -34,6 +34,7 @@ from cbhcli_pkg.tools.knowledge_base import KnowledgeBaseTool
 from cbhcli_pkg.tools.delegate_task import DelegateTaskTool
 from cbhcli_pkg.tools.python_tool import PythonTool
 from cbhcli_pkg.tools.skills_create import SkillsCreateTool
+from cbhcli_pkg.tools.image import ImageTool
 from cbhcli_pkg.core.mcp_manager import MCPManager
 from cbhcli_pkg.core.skill_manager import SkillManager
 from cbhcli_pkg.core.constants import MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE
@@ -50,7 +51,7 @@ from cbhcli_pkg.context.token_counter import get_token_counter
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.8.4")
+app = FastAPI(title="CBHCLI Web", version="4.8.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -176,6 +177,7 @@ def _get_tool_registry(agent_name: str = "", app_proxy: '_WebAgentContext' = Non
     if ctx:
         registry.register(DelegateTaskTool(ctx))
         registry.register(SkillsCreateTool(ctx))
+        registry.register(ImageTool(ctx))
 
     # Register cbhpacks tools
     from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
@@ -972,6 +974,11 @@ async def chat(req: ChatRequest):
 
         loop = asyncio.get_event_loop()
 
+        # 加载备用主模型列表
+        from cbhcli_pkg.config.global_config import GlobalConfig
+        _gc = GlobalConfig()
+        fallback_model_names = _gc.get_fallback_models()
+
         for round_idx in range(MAX_TOOL_ROUNDS):
             if chat_data.get("abort"):
                 yield _sse({"type": "aborted"})
@@ -982,77 +989,112 @@ async def chat(req: ChatRequest):
             reasoning_buffer = ""
             tc_buffer = {}  # index -> {id, name, arguments}
 
-            try:
-                chunks_queue = asyncio.Queue()
+            # 尝试主模型 + 备用模型
+            active_client = llm_client
+            fallback_tried = set()
 
-                def stream_worker():
-                    try:
-                        for chunk_type, content in llm_client.chat_stream(
-                            messages, **stream_kwargs
-                        ):
-                            if chat_data.get("abort"):
+            while True:
+                try:
+                    chunks_queue = asyncio.Queue()
+
+                    def stream_worker():
+                        try:
+                            for chunk_type, content in active_client.chat_stream(
+                                messages, **stream_kwargs
+                            ):
+                                if chat_data.get("abort"):
+                                    asyncio.run_coroutine_threadsafe(
+                                        chunks_queue.put(("aborted", "")), loop
+                                    )
+                                    return
                                 asyncio.run_coroutine_threadsafe(
-                                    chunks_queue.put(("aborted", "")), loop
+                                    chunks_queue.put((chunk_type, content)), loop
                                 )
-                                return
                             asyncio.run_coroutine_threadsafe(
-                                chunks_queue.put((chunk_type, content)), loop
+                                chunks_queue.put(None), loop
                             )
-                        asyncio.run_coroutine_threadsafe(
-                            chunks_queue.put(None), loop
-                        )
-                    except Exception as e:
-                        asyncio.run_coroutine_threadsafe(
-                            chunks_queue.put(("error", str(e))), loop
-                        )
+                        except Exception as e:
+                            asyncio.run_coroutine_threadsafe(
+                                chunks_queue.put(("error", str(e))), loop
+                            )
 
-                thread = threading.Thread(target=stream_worker, daemon=True)
-                thread.start()
+                    thread = threading.Thread(target=stream_worker, daemon=True)
+                    thread.start()
 
-                while True:
-                    item = await chunks_queue.get()
-                    if item is None:
+                    stream_error = None
+                    while True:
+                        item = await chunks_queue.get()
+                        if item is None:
+                            break
+                        chunk_type, content = item
+
+                        if chunk_type == "error":
+                            stream_error = content
+                            break
+                        elif chunk_type == "aborted":
+                            yield _sse({"type": "aborted"})
+                            yield _sse({"type": "done"})
+                            return
+                        elif chunk_type == "reasoning":
+                            reasoning_buffer += content
+                            yield _sse({"type": "reasoning", "content": content})
+                        elif chunk_type == "content":
+                            ai_response += content
+                            yield _sse({"type": "content", "content": content})
+                        elif chunk_type == "tool_calls":
+                            # Collect incremental tool_calls data
+                            try:
+                                tool_calls_data = json.loads(content)
+                                for tc in tool_calls_data:
+                                    idx = tc.get("index", 0)
+                                    if idx not in tc_buffer:
+                                        tc_buffer[idx] = {"id": "", "name": "", "arguments": ""}
+                                    if tc.get("id"):
+                                        tc_buffer[idx]["id"] = tc["id"]
+                                    func = tc.get("function", {})
+                                    if func.get("name"):
+                                        tc_buffer[idx]["name"] = func["name"]
+                                    if "arguments" in func:
+                                        tc_buffer[idx]["arguments"] += func["arguments"]
+                            except json.JSONDecodeError:
+                                pass
+
+                    if stream_error is None:
+                        # 流式成功，跳出 fallback 循环
                         break
-                    chunk_type, content = item
 
-                    if chunk_type == "error":
-                        yield _sse({"type": "error", "content": content})
+                    # 主模型/当前模型失败，尝试备用模型
+                    switched = False
+                    for fb_name in fallback_model_names:
+                        if fb_name in fallback_tried:
+                            continue
+                        fb_config = _gc.get_model(fb_name)
+                        if not fb_config:
+                            continue
+                        fallback_tried.add(fb_name)
+                        yield _sse({"type": "fallback", "content": f"切换到备用模型 '{fb_name}'..."})
+                        active_client = LLMClient(fb_config)
+                        # 重置本轮状态
+                        ai_response = ""
+                        reasoning_buffer = ""
+                        tc_buffer = {}
+                        switched = True
+                        break
+
+                    if not switched:
+                        # 没有更多备用模型，返回错误
+                        yield _sse({"type": "error", "content": stream_error})
                         session.add_message("assistant", ai_response or "Error",
                                             reasoning_content=reasoning_buffer or None)
                         yield _sse({"type": "done"})
                         return
-                    elif chunk_type == "aborted":
-                        yield _sse({"type": "aborted"})
-                        yield _sse({"type": "done"})
-                        return
-                    elif chunk_type == "reasoning":
-                        reasoning_buffer += content
-                        yield _sse({"type": "reasoning", "content": content})
-                    elif chunk_type == "content":
-                        ai_response += content
-                        yield _sse({"type": "content", "content": content})
-                    elif chunk_type == "tool_calls":
-                        # Collect incremental tool_calls data
-                        try:
-                            tool_calls_data = json.loads(content)
-                            for tc in tool_calls_data:
-                                idx = tc.get("index", 0)
-                                if idx not in tc_buffer:
-                                    tc_buffer[idx] = {"id": "", "name": "", "arguments": ""}
-                                if tc.get("id"):
-                                    tc_buffer[idx]["id"] = tc["id"]
-                                func = tc.get("function", {})
-                                if func.get("name"):
-                                    tc_buffer[idx]["name"] = func["name"]
-                                if "arguments" in func:
-                                    tc_buffer[idx]["arguments"] += func["arguments"]
-                        except json.JSONDecodeError:
-                            pass
 
-            except Exception as e:
-                yield _sse({"type": "error", "content": str(e)})
-                yield _sse({"type": "done"})
-                return
+                    # 切换成功，继续 while True 重试
+
+                except Exception as e:
+                    yield _sse({"type": "error", "content": str(e)})
+                    yield _sse({"type": "done"})
+                    return
 
             # Build structured tool_calls from buffer
             tool_calls = []

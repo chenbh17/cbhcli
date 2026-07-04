@@ -34,6 +34,8 @@ class GlobalConfig:
             "models": [],
             "embedding_model": None,  # 嵌入模型配置
             "rerank_model": None,     # 重排序模型配置
+            "fallback_models": [],          # 主模型备用顺序（模型名称列表）
+            "fallback_vision_models": [],   # 视觉模型备用顺序（模型名称列表）
             "agents": {
                 "default_agent": "main",
                 "active_agent": None
@@ -150,4 +152,23 @@ class GlobalConfig:
     def delete_rerank_model(self) -> None:
         """删除重排序模型配置"""
         self.config["rerank_model"] = None
+        self.save()
+    
+    # 备用模型管理
+    def get_fallback_models(self) -> list[str]:
+        """获取主模型备用顺序（模型名称列表）"""
+        return self.config.get("fallback_models", [])
+    
+    def set_fallback_models(self, model_names: list[str]) -> None:
+        """设置主模型备用顺序"""
+        self.config["fallback_models"] = model_names
+        self.save()
+    
+    def get_fallback_vision_models(self) -> list[str]:
+        """获取视觉模型备用顺序（模型名称列表）"""
+        return self.config.get("fallback_vision_models", [])
+    
+    def set_fallback_vision_models(self, model_names: list[str]) -> None:
+        """设置视觉模型备用顺序"""
+        self.config["fallback_vision_models"] = model_names
         self.save()
