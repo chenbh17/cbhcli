@@ -19,7 +19,7 @@ from cbhcli_pkg.config.global_config import GlobalConfig, CBHCLI_DIR
 from cbhcli_pkg.core.agent import AgentManager, AgentConfig
 from cbhcli_pkg.core.session_history import SessionHistoryManager
 from cbhcli_pkg.core.model import LLMClient
-from cbhcli_pkg.core.session import Session
+from cbhcli_pkg.core.session import Session, ContextWindow
 from cbhcli_pkg.tools.registry import ToolRegistry, ToolResult
 from cbhcli_pkg.tools.terminal import TerminalTool
 from cbhcli_pkg.tools.file_read import ReadTool
@@ -45,13 +45,14 @@ from cbhcli_pkg.core.tool_executor import ToolExecutor
 from cbhcli_pkg.vector.store import VectorStore
 from cbhcli_pkg.vector.indexer import MemoryIndexer
 from cbhcli_pkg.context.token_counter import get_token_counter
+from cbhcli_pkg.context.compressor import ContextCompressor
 
 
 # ===================================================================
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.8.6")
+app = FastAPI(title="CBHCLI Web", version="4.8.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,6 +87,11 @@ class _WebAgentContext:
         self.token_counter = None
         # Populated after session creation for skills_create
         self.skill_manager = None
+        # Populated after session creation for context compression
+        self.context_compressor = None
+        self.context_window = None
+        self.auto_compress = True
+        self.current_agent_config = None
 
 
 def get_config() -> GlobalConfig:
@@ -943,6 +949,24 @@ async def chat(req: ChatRequest):
         )
         session.add_message("system", system_prompt)
 
+        # 初始化上下文压缩组件
+        token_counter = get_token_counter()
+        context_compressor = ContextCompressor(llm_client, token_counter)
+        tools_schema_tokens = token_counter.count_tokens(
+            json.dumps(tool_registry.get_openai_tools(), ensure_ascii=False)
+        ) if tool_registry.get_openai_tools() else 0
+        context_window = ContextWindow(
+            model_limit=llm_client.context_limit,
+            compression_ratio=agent_config.context_limit_ratio or 0.8,
+            tools_schema_tokens=tools_schema_tokens
+        )
+
+        # 注入到 app_proxy 供 delegate_task 使用
+        app_proxy.context_compressor = context_compressor
+        app_proxy.context_window = context_window
+        app_proxy.auto_compress = agent_config.auto_compress
+        app_proxy.current_agent_config = agent_config
+
         _chat_sessions[session_key] = {
             "session": session,
             "llm_client": llm_client,
@@ -950,6 +974,10 @@ async def chat(req: ChatRequest):
             "mcp_manager": mcp_manager,
             "skill_manager": skill_manager,
             "no_more_confirmations": False,
+            "context_compressor": context_compressor,
+            "context_window": context_window,
+            "auto_compress": agent_config.auto_compress,
+            "token_counter": token_counter,
         }
 
     chat_data = _chat_sessions[session_key]
@@ -983,6 +1011,25 @@ async def chat(req: ChatRequest):
             if chat_data.get("abort"):
                 yield _sse({"type": "aborted"})
                 break
+
+            # 检查上下文是否接近上限，自动压缩
+            ctx_compressor = chat_data.get("context_compressor")
+            ctx_window = chat_data.get("context_window")
+            auto_compress = chat_data.get("auto_compress", True)
+            web_token_counter = chat_data.get("token_counter")
+            if ctx_compressor and ctx_window and auto_compress:
+                total_tokens = session.get_total_tokens(web_token_counter)
+                ctx_window.update(total_tokens)
+                if ctx_window.needs_compression():
+                    yield _sse({"type": "compressing", "content": "上下文接近上限，正在自动压缩..."})
+                    target_tokens = ctx_window.trigger_threshold()
+                    success = ctx_compressor.compress(session, target_tokens)
+                    if success:
+                        new_tokens = session.get_total_tokens(web_token_counter)
+                        ctx_window.update(new_tokens)
+                        yield _sse({"type": "compressed", "content": f"上下文已压缩 ({ctx_window.get_status_text()})"})
+                    else:
+                        yield _sse({"type": "compress_failed", "content": "压缩失败，继续执行"})
 
             messages = session.get_context_messages()
             ai_response = ""

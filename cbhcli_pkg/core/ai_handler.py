@@ -19,6 +19,8 @@ from cbhcli_pkg.core.constants import (
 
 if TYPE_CHECKING:
     from cbhcli_pkg.context.token_counter import TokenCounter
+    from cbhcli_pkg.context.compressor import ContextCompressor
+    from cbhcli_pkg.core.session import ContextWindow
 
 
 class AIHandler:
@@ -50,6 +52,9 @@ class AIHandler:
         self.subagent_scheduler = None  # 由 app.py 注入
         self.agent_name: str = "main"   # 由 app.py 注入
         self.fallback_models: list[str] = []  # 备用主模型名称列表，由 app.py 注入
+        self.context_compressor: Optional['ContextCompressor'] = None  # 由 app.py 注入
+        self.context_window: Optional['ContextWindow'] = None  # 由 app.py 注入
+        self.auto_compress: bool = True  # 由 app.py 注入
 
         # 根据是否为子agent选择颜色
         if is_subagent:
@@ -99,6 +104,9 @@ class AIHandler:
 
         # --- ReAct 循环 ---
         for round_idx in range(MAX_TOOL_ROUNDS):
+            # 检查上下文是否接近上限，自动压缩
+            self._check_and_compress_in_react(round_idx)
+
             messages = self.session.get_context_messages()
 
             ai_response, reasoning_tokens, reasoning_content, tool_calls = self._get_ai_response(
@@ -294,6 +302,47 @@ class AIHandler:
 
         reasoning_tokens = self.token_counter.count_tokens(reasoning_buffer) if reasoning_buffer else 0
         return ai_response, reasoning_tokens, reasoning_buffer, tool_calls
+
+    # ==================================================================
+    #  ReAct 循环内上下文压缩
+    # ==================================================================
+
+    def _check_and_compress_in_react(self, round_idx: int):
+        """在 ReAct 循环中检查上下文使用量，超过阈值时自动压缩。
+
+        与 app.py 中的 _check_and_compress_context 不同，这里是在工具调用
+        循环过程中检查，防止多轮工具调用导致上下文溢出。
+
+        压缩策略与 app.py 一致：保留最早2轮 + 最近3轮，中间部分生成摘要。
+        压缩后 session.messages 被替换，下一轮 LLM 调用将使用压缩后的上下文。
+        """
+        if not self.context_compressor or not self.context_window:
+            return
+
+        if not self.auto_compress:
+            return
+
+        # 使用 token_counter 精确计算（含消息结构开销）
+        total_tokens = self.session.get_total_tokens(self.token_counter)
+        self.context_window.update(total_tokens)
+
+        if not self.context_window.needs_compression():
+            return
+
+        # 上下文接近上限，执行压缩
+        print(f"\n{self._c_dim}📦 上下文接近上限 ({self.context_window.get_status_text()})")
+        print(f"{self._c_dim}   正在自动压缩上下文...{C_RESET}")
+
+        target_tokens = self.context_window.trigger_threshold()
+        success = self.context_compressor.compress(self.session, target_tokens)
+
+        if success:
+            # 压缩后重新计算 token
+            new_tokens = self.session.get_total_tokens(self.token_counter)
+            self.context_window.update(new_tokens)
+            print(f"{self._c_dim}   ✅ 上下文已压缩 ({self.context_window.get_status_text()}){C_RESET}")
+        else:
+            print(f"{self._c_dim}   ⚠️  压缩失败（消息太少或生成摘要异常），继续执行{C_RESET}")
 
     # ==================================================================
     #  工具执行（基于 Function Calling 结构化数据）

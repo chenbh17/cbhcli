@@ -109,13 +109,20 @@ class Session:
         """
         return [msg.to_dict() for msg in self.messages]
     
-    def get_total_tokens(self) -> int:
-        """
-        获取会话总token数
+    def get_total_tokens(self, token_counter=None) -> int:
+        """获取会话总token数
         
+        如果传入 token_counter，则使用 count_message_tokens 重新计算
+        （含消息结构开销，更准确）；否则累加各消息存储的 token_count。
+        
+        Args:
+            token_counter: TokenCounter 实例（可选，传入则精确计算）
+            
         Returns:
             总token数
         """
+        if token_counter is not None:
+            return token_counter.count_messages_tokens(self.messages)
         return sum(msg.token_count for msg in self.messages)
     
     def reset(self) -> None:

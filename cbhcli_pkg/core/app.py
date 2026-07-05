@@ -738,7 +738,7 @@ class CBHCLIApp:
         if not self.context_window or not self.session:
             return
         
-        total_tokens = self.session.get_total_tokens()
+        total_tokens = self.session.get_total_tokens(self.token_counter)
         self.context_window.update(total_tokens)
         
         if (self.current_agent_config and
@@ -985,6 +985,14 @@ class CBHCLIApp:
         gc = GlobalConfig()
         handler.fallback_models = gc.get_fallback_models()
         
+        # 注入上下文压缩相关组件（用于 ReAct 循环内自动压缩）
+        handler.context_compressor = self.context_compressor
+        handler.context_window = self.context_window
+        handler.auto_compress = (
+            self.current_agent_config.auto_compress
+            if self.current_agent_config else True
+        )
+        
         # 设置记忆更新回调
         handler.on_memory_update(self._update_memory)
         
@@ -1032,7 +1040,7 @@ class CBHCLIApp:
         
         ctx_info = ""
         if self.session and self.context_window:
-            total_tokens = self.session.get_total_tokens()
+            total_tokens = self.session.get_total_tokens(self.token_counter)
             self.context_window.update(total_tokens)
             pct = self.context_window.usage_percentage() * 100
             limit = self.context_window.model_limit

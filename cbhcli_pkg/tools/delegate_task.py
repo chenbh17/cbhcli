@@ -91,15 +91,27 @@ class DelegateTaskTool(BaseTool):
         
         is_web = getattr(self._app, 'is_web', False)
         
+        # 获取上下文压缩组件
+        context_compressor = getattr(self._app, 'context_compressor', None)
+        context_window = getattr(self._app, 'context_window', None)
+        auto_compress = True
+        agent_config = getattr(self._app, 'current_agent_config', None)
+        if agent_config:
+            auto_compress = agent_config.auto_compress
+        
         if is_web:
             return self._execute_web(scheduler, agent_name, full_task,
-                                     llm_client, tool_executor, token_counter)
+                                     llm_client, tool_executor, token_counter,
+                                     context_compressor, context_window, auto_compress)
         else:
             return self._execute_cli(scheduler, agent_name, full_task,
-                                     llm_client, tool_executor, token_counter)
+                                     llm_client, tool_executor, token_counter,
+                                     context_compressor, context_window, auto_compress)
     
     def _execute_cli(self, scheduler, agent_name, full_task,
-                     llm_client, tool_executor, token_counter) -> ToolResult:
+                     llm_client, tool_executor, token_counter,
+                     context_compressor=None, context_window=None,
+                     auto_compress=True) -> ToolResult:
         """CLI 模式：子agent直接实时输出到终端（原始行为）"""
         try:
             result = scheduler.delegate_and_run(
@@ -108,7 +120,10 @@ class DelegateTaskTool(BaseTool):
                 model_config={},
                 llm_client=llm_client,
                 tool_executor=tool_executor,
-                token_counter=token_counter
+                token_counter=token_counter,
+                context_compressor=context_compressor,
+                context_window=context_window,
+                auto_compress=auto_compress
             )
             return ToolResult(success=True, output=result)
         except Exception as e:
@@ -118,7 +133,9 @@ class DelegateTaskTool(BaseTool):
             )
     
     def _execute_web(self, scheduler, agent_name, full_task,
-                     llm_client, tool_executor, token_counter) -> ToolResult:
+                     llm_client, tool_executor, token_counter,
+                     context_compressor=None, context_window=None,
+                     auto_compress=True) -> ToolResult:
         """Web 模式：捕获stdout，将子agent全部输出作为ToolResult返回前端"""
         captured = io.StringIO()
         old_stdout = sys.stdout
@@ -136,7 +153,10 @@ class DelegateTaskTool(BaseTool):
                 model_config={},
                 llm_client=llm_client,
                 tool_executor=tool_executor,
-                token_counter=token_counter
+                token_counter=token_counter,
+                context_compressor=context_compressor,
+                context_window=context_window,
+                auto_compress=auto_compress
             )
         except Exception as e:
             return ToolResult(

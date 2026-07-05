@@ -98,7 +98,10 @@ class SubAgentScheduler:
         llm_client: 'LLMClient',
         tool_executor: 'ToolExecutor',
         token_counter: 'TokenCounter',
-        system_prompt: str = ""
+        system_prompt: str = "",
+        context_compressor=None,
+        context_window=None,
+        auto_compress: bool = True
     ) -> str:
         """
         运行子Agent，执行其分配的任务
@@ -112,6 +115,9 @@ class SubAgentScheduler:
             tool_executor: 工具执行器（共享父Agent的）
             token_counter: Token计数器
             system_prompt: 系统提示（可选，不提供则使用默认）
+            context_compressor: 上下文压缩器（可选，用于ReAct循环内自动压缩）
+            context_window: 上下文窗口管理器（可选）
+            auto_compress: 是否启用自动压缩
             
         Returns:
             子Agent执行结果
@@ -147,6 +153,11 @@ class SubAgentScheduler:
                 is_subagent=True
             )
             
+            # 注入上下文压缩组件（用于 ReAct 循环内自动压缩）
+            handler.context_compressor = context_compressor
+            handler.context_window = context_window
+            handler.auto_compress = auto_compress
+            
             result = handler.process_request(sub_agent.task)
             sub_agent.complete(result)
             
@@ -168,7 +179,10 @@ class SubAgentScheduler:
         llm_client: 'LLMClient',
         tool_executor: 'ToolExecutor',
         token_counter: 'TokenCounter',
-        system_prompt: str = ""
+        system_prompt: str = "",
+        context_compressor=None,
+        context_window=None,
+        auto_compress: bool = True
     ) -> str:
         """
         一步完成创建 + 执行子Agent
@@ -181,12 +195,17 @@ class SubAgentScheduler:
             tool_executor: 工具执行器
             token_counter: Token计数器
             system_prompt: 系统提示（可选）
+            context_compressor: 上下文压缩器（可选）
+            context_window: 上下文窗口管理器（可选）
+            auto_compress: 是否启用自动压缩
             
         Returns:
             子Agent执行结果
         """
         sub_agent = self.spawn(parent_name, task, model_config)
-        result = self.run(sub_agent, llm_client, tool_executor, token_counter, system_prompt)
+        result = self.run(sub_agent, llm_client, tool_executor, token_counter,
+                          system_prompt, context_compressor, context_window,
+                          auto_compress)
         return result
     
     def get_result(self, sub_agent_id: str) -> str:
