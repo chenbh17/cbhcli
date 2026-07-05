@@ -1,18 +1,12 @@
 """主应用 - CBHCLIApp"""
-import sys
 import os
 import re
 import json
 import base64
-import datetime
 from pathlib import Path
 from typing import Optional
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.styles import Style
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.formatted_text import ANSI
-from prompt_toolkit.filters import Condition
+from cbhcli_pkg.core.input_box import ChatInputBox
 
 from cbhcli_pkg.config.global_config import GlobalConfig
 from cbhcli_pkg.core.agent import AgentManager, AgentConfig, AgentPersona
@@ -401,95 +395,11 @@ class CBHCLIApp:
         """初始化UI组件"""
         self.tool_verbose = False
         
-        # 补全状态
-        self._completions = []       # [(display, desc, full_cmd), ...]
-        self._comp_index = -1        # 当前选中项，-1 表示无选中
-        self._comp_dismissed = False  # 用户按 Esc 主动关闭
-        self._comp_last_text = ''     # 上次计算补全时的文本
-        
-        self.prompt_style = Style.from_dict({
-            'prompt': 'bold #00bcd4',
-            'input-border': '#555555',
-            'input-hint': '#888888',
-            'bottom-toolbar': 'noinherit #555555',
-            'bottom-toolbar.text': 'noinherit #555555',
-        })
-        
-        self.prompt_bindings = KeyBindings()
-        
-        # 补全是否正在显示的条件
-        @Condition
-        def _has_completions():
-            return bool(self._completions) and not self._comp_dismissed
-        
-        @self.prompt_bindings.add('c-r')
-        def toggle_verbose(event):
-            """Ctrl+R 切换工具显示详细/简洁模式"""
-            self.tool_verbose = not self.tool_verbose
-            self.tool_executor.set_verbose(self.tool_verbose)
-            mode = "详细" if self.tool_verbose else "简洁"
-            print(f"\n{C_SEP}工具显示: {mode}{C_RESET}")
-        
-        @self.prompt_bindings.add('enter')
-        def submit(event):
-            """Enter：补全菜单有选中项时应用选中项，否则提交"""
-            buf = event.current_buffer
-            if self._completions and self._comp_index >= 0 and not self._comp_dismissed:
-                selected = self._completions[self._comp_index]
-                buf.text = selected[2]  # full_cmd
-                buf.cursor_position = len(buf.text)
-                self._comp_index = -1
-                return
-            buf.validate_and_handle()
-        
-        @self.prompt_bindings.add('c-j')
-        def newline_ctrl_j(event):
-            """Ctrl+J 换行"""
-            event.current_buffer.insert_text('\n')
-        
-        @self.prompt_bindings.add('escape', 'enter')
-        def newline_alt(event):
-            """Alt+Enter 换行"""
-            event.current_buffer.insert_text('\n')
-        
-        @self.prompt_bindings.add('escape', filter=_has_completions)
-        def comp_escape(event):
-            """Esc 关闭补全菜单"""
-            self._comp_dismissed = True
-            self._comp_index = -1
-        
-        @self.prompt_bindings.add('up', filter=_has_completions)
-        def comp_up(event):
-            """上键选择上一项"""
-            if self._comp_index > 0:
-                self._comp_index -= 1
-            else:
-                self._comp_index = len(self._completions) - 1
-        
-        @self.prompt_bindings.add('down', filter=_has_completions)
-        def comp_down(event):
-            """下键选择下一项"""
-            if self._comp_index < len(self._completions) - 1:
-                self._comp_index += 1
-            else:
-                self._comp_index = 0
-        
-        @self.prompt_bindings.add('tab', filter=_has_completions)
-        def comp_tab(event):
-            """Tab 选择下一项"""
-            if self._comp_index < len(self._completions) - 1:
-                self._comp_index += 1
-            else:
-                self._comp_index = 0
-        
         # 斜杠命令补全助手
         self._cmd_helper = SlashCommandHelper(self.command_parser)
         
-        self.prompt_session = PromptSession(
-            style=self.prompt_style,
-            key_bindings=self.prompt_bindings,
-            multiline=True,
-        )
+        # 聊天输入框组件（基于 prompt_toolkit 原生补全系统）
+        self._chat_input = ChatInputBox(self._cmd_helper, self)
     
     def _init_agent(self):
         """初始化Agent"""
@@ -1028,115 +938,7 @@ class CBHCLIApp:
     
     def _get_input(self) -> str:
         """获取用户输入（带输入框）"""
-        agent = self.current_agent_name or ""
-        tw = self._get_terminal_width()
-        
-        # === 状态栏：模型名 | 上下文占比 | 当前路径 ===
-        model_name = "未配置模型"
-        if self.llm_client and hasattr(self.llm_client, 'model_name'):
-            model_name = self.llm_client.model_name
-        elif self.current_agent_config and self.current_agent_config.primary_model:
-            model_name = self.current_agent_config.primary_model
-        
-        ctx_info = ""
-        if self.session and self.context_window:
-            total_tokens = self.session.get_total_tokens(self.token_counter)
-            self.context_window.update(total_tokens)
-            pct = self.context_window.usage_percentage() * 100
-            limit = self.context_window.model_limit
-            ctx_info = f"{total_tokens:,}/{limit:,} ({pct:.1f}%)"
-        
-        cwd = os.getcwd()
-        
-        status_parts = []
-        status_parts.append(f"\033[1;36m{model_name}{C_RESET}")
-        if ctx_info:
-            status_parts.append(f"{C_DIM}ctx: {ctx_info}{C_RESET}")
-        status_parts.append(f"{C_DIM}{cwd}{C_RESET}")
-        print(f"  {' | '.join(status_parts)}")
-        
-        # === 已激活技能显示 ===
-        if self.skill_manager:
-            active_names = self.skill_manager.get_active_skill_names()
-            if active_names:
-                skills_str = ', '.join(active_names)
-                print(f"  \033[1;33mskills:\033[0m {C_DIM}{skills_str}{C_RESET}")
-        
-        # === 顶部边框 ===
-        title = f" {agent} "
-        hint = " Enter:发送 | Alt+Enter:换行 "
-        title_len = self._display_width(title)
-        hint_len = self._display_width(hint)
-        mid_len = max(tw - 2 - 2 - title_len - 2 - hint_len, 1)
-        print(
-            f"{C_SEP}╭──\033[1;36m{title}{C_SEP}"
-            f"{'─' * mid_len}"
-            f"{C_DIM}{hint}{C_SEP}──╮{C_RESET}"
-        )
-        
-        prompt_str = ANSI(f"{C_SEP}│{C_RESET} ")
-        
-        # === 重置补全状态 ===
-        self._completions = []
-        self._comp_index = -1
-        self._comp_dismissed = False
-        self._comp_last_text = ''
-        
-        # === 底部边框 + 补全菜单（固定行数，避免输入框跳动）===
-        MAX_COMP_LINES = 10  # 补全区域固定行数
-        bottom_line = '╰' + '─' * (tw - 2) + '╯'
-        
-        def _bottom_toolbar():
-            # 获取当前输入文本
-            try:
-                text = self.prompt_session.app.current_buffer.text
-            except Exception:
-                text = ''
-            
-            # 文本变化时重新计算补全，并重置选中和 dismissed
-            if text != self._comp_last_text:
-                self._comp_last_text = text
-                self._comp_dismissed = False
-                self._comp_index = -1
-                self._completions = self._cmd_helper.compute(text)
-            
-            # 构建 toolbar 内容：底部边框（第1行）
-            result = [('class:bottom-toolbar', bottom_line)]
-            
-            show_comps = self._completions and not self._comp_dismissed
-            visible = self._completions[:MAX_COMP_LINES] if show_comps else []
-            
-            # 修正 index 越界
-            if self._comp_index >= len(self._completions):
-                self._comp_index = -1
-            
-            # 填充固定行数（有补全时显示内容，无内容时空行占位）
-            for i in range(MAX_COMP_LINES):
-                result.append(('', '\n'))
-                if i < len(visible):
-                    display, desc, _full_cmd = visible[i]
-                    if i == self._comp_index:
-                        line = f'  {display:<20s} {desc}'
-                        result.append(('bold bg:#00bcd4 #000000', line))
-                    else:
-                        result.append(('#aaaaaa', f'  {display:<20s} '))
-                        result.append(('#666666', desc))
-                # 没有内容的行不输出任何字符，仅占位换行
-            
-            return result
-        
-        try:
-            user_input = self.prompt_session.prompt(
-                prompt_str,
-                style=self.prompt_style,
-                prompt_continuation=prompt_str,
-                bottom_toolbar=_bottom_toolbar,
-            )
-            return user_input.strip()
-        except EOFError:
-            return "quit"
-        except KeyboardInterrupt:
-            return ""
+        return self._chat_input.prompt()
     
     @staticmethod
     def _display_width(text: str) -> int:
@@ -1149,27 +951,5 @@ class CBHCLIApp:
             return len(text)
     
     def _print_user_input(self, user_input: str):
-        """清除输入框，替换为高亮显示的用户输入"""
-        # prompt_toolkit 提交后会移除 bottom_toolbar，
-        # 终端上剩余：状态栏(1行) + [技能行(0或1行)] + 顶部边框(1行) + 输入内容(N行)
-        input_lines = user_input.count('\n') + 1
-        total_lines = input_lines + 2  # +1 status bar + 1 top border
-        
-        # 如果有已激活技能，多一行技能显示
-        if self.skill_manager and self.skill_manager.get_active_skill_names():
-            total_lines += 1
-        
-        # 向上移动并清除输入框区域
-        for _ in range(total_lines):
-            sys.stdout.write("\033[1A\033[2K")
-        sys.stdout.write("\r")
-        
-        # 打印高亮的用户输入
-        agent = self.current_agent_name or ""
-        prefix = f"[{agent}] " if agent else ""
-        
-        lines = user_input.split('\n')
-        first_line = lines[0]
-        print(f"{C_USER_BG}{C_USER_FG}▌ {prefix}> {first_line}{C_RESET}")
-        for line in lines[1:]:
-            print(f"{C_USER_BG}{C_USER_FG}  {' ' * len(prefix)}  {line}{C_RESET}")
+        """打印用户输入回显（提交后高亮显示）"""
+        self._chat_input.print_user_echo(user_input)

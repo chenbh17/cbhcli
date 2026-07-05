@@ -1,4 +1,4 @@
-# CBHCLI v4.8.7 - AI驱动的终端助手
+# CBHCLI v4.8.8 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -16,6 +16,7 @@
 - **Markdown渲染** - CLI界面支持Markdown格式渲染，代码高亮、表格、列表等美观显示
 - **LaTeX公式渲染** - 支持LaTeX数学公式渲染，行内公式与块级公式均可正常显示
 - **ReAct持续交付** - ReAct循环中自动压缩上下文，突破上下文窗口限制实现长任务持续交付
+- **聊天框重构** - 基于 prompt_toolkit 原生补全系统，支持中英文/emoji输入无错位、终端resize无重叠、斜杠命令补全菜单
 
 ### 14大内置工具
 | 工具 | 功能 |
@@ -113,7 +114,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.8.7-py3-none-any.whl
+pip install dist/cbhcli-4.8.8-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -453,7 +454,12 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 
 | 快捷键 | 功能 |
 |--------|------|
+| `Enter` | 发送消息 / 执行命令 |
+| `Alt+Enter` | 输入框换行 |
+| `Ctrl+J` | 输入框换行 |
 | `Ctrl+R` | 切换工具显示详细/简洁模式 |
+| `Tab` | 补全菜单选择下一项 |
+| `↑` / `↓` | 补全菜单上下选择 |
 
 ## 项目结构
 
@@ -461,6 +467,7 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 cbhcli_pkg/
 ├── core/              # 核心模块
 │   ├── app.py              # 主应用
+│   ├── input_box.py        # 聊天输入框组件（原生补全系统）
 │   ├── agent.py            # Agent管理
 │   ├── session.py          # 会话管理
 │   ├── session_history.py  # 会话历史管理
