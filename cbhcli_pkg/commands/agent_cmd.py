@@ -1,4 +1,5 @@
 """Agent命令处理"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -73,7 +74,7 @@ def _show_agent_menu(app):
     print("\n" + "\n".join(lines))
 
     # 获取用户选择
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return "已取消选择"
@@ -102,7 +103,7 @@ def _create_agent(app, name):
     if app.agent_manager.load_agent(name):
         return f"❌ Agent '{name}' 已存在"
 
-    description = input("请输入Agent描述 (可选): ").strip()
+    description = ask_text("请输入Agent描述 (可选): ").strip()
 
     # 获取可用模型
     models = app.global_config.get_models()
@@ -113,7 +114,7 @@ def _create_agent(app, name):
             ctx = model.get('context_limit', 128000)
             print(f"  {i}. {model['name']} ({model['model']}) - 上下文: {ctx:,}")
 
-        model_choice = input("\n请选择首选模型编号 (直接回车跳过): ").strip()
+        model_choice = ask_text("\n请选择首选模型编号 (直接回车跳过): ").strip()
         if model_choice.isdigit():
             idx = int(model_choice) - 1
             if 0 <= idx < len(models):
@@ -182,7 +183,7 @@ def _show_rm_menu(app):
     lines.append("")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return "已取消"
@@ -212,7 +213,7 @@ def _delete_agent(app, name):
     if name == app.current_agent_name:
         return "❌ 无法删除当前激活的Agent"
 
-    confirm = input(f"确定要删除Agent '{name}' 吗? (y/n): ").strip().lower()
+    confirm = ask_text(f"确定要删除Agent '{name}' 吗? (y/n): ").strip().lower()
     if confirm != 'y':
         return "已取消删除"
 

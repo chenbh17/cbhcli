@@ -1,6 +1,7 @@
 """工具开关命令处理 - 管理当前Agent可用的内置工具"""
 import json
 from pathlib import Path
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -18,7 +19,7 @@ BUILTIN_TOOLS = [
     ("memory_search",   "语义搜索向量化知识",           "知识检索"),
     ("knowledge_base",  "查询知识库内容",               "知识检索"),
     ("skills_create",   "创建新技能",                   "技能系统"),
-    ("delegate_task",   "委托子任务给子Agent",          "任务管理"),
+    ("delegate_task",   "委托子任务给子Agent(可并行)",   "任务管理"),
     ("image",           "使用视觉模型识别图片内容",      "图片识别"),
     # cbhpacks 数据科学工具（默认关闭）
     ("cbhpacks_bins_model",       "分箱WOE/IV/PSI计算",      "数据科学"),
@@ -149,7 +150,7 @@ def _tools_on(app) -> str:
     lines.append("")
 
     print("\n".join(lines))
-    choice = input("请选择编号（多个用逗号分隔，支持范围如 1-5）: ").strip()
+    choice = ask_text("请选择编号（多个用逗号分隔，支持范围如 1-5）: ").strip()
 
     if not choice or choice == '0':
         return "已取消"
@@ -198,7 +199,7 @@ def _tools_off(app) -> str:
     lines.append("")
 
     print("\n".join(lines))
-    choice = input("请选择编号（多个用逗号分隔，支持范围如 1-5）: ").strip()
+    choice = ask_text("请选择编号（多个用逗号分隔，支持范围如 1-5）: ").strip()
 
     if not choice or choice == '0':
         return "已取消"
@@ -322,6 +323,7 @@ def _write_tools_md(workspace: Path, disabled: list) -> None:
     lines.append("- 重要操作前提醒用户")
     lines.append("- 出错时提供解决方案")
     lines.append("- **需要识别图片时使用 image 工具**，传入图片路径和识别需求，工具会自动调用视觉模型识别图片内容")
+    lines.append("- **有多个相互独立的子任务时使用 delegate_task 传入 tasks 列表并行委托**，全部子Agent完成后主Agent再继续，可显著缩短总耗时")
 
     tools_md = "\n".join(lines)
     tools_path = workspace / "tools.md"

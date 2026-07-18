@@ -1,4 +1,5 @@
 """知识库命令处理 - /kb 斜杠命令"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -124,7 +125,7 @@ def _show_rm_kb_menu(app):
     lines.append(f"\n  0. 取消\n")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/文件名]: ").strip()
+    choice = ask_text("请选择 [编号/文件名]: ").strip()
 
     if not choice or choice == '0':
         return "已取消"

@@ -1,4 +1,5 @@
 """备用模型管理命令 - 配置主模型和视觉模型的备用切换顺序"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 from cbhcli_pkg.config.global_config import GlobalConfig
 
@@ -208,7 +209,7 @@ def _reorder_fallback(app, category: str) -> str:
     lines.append("请输入新的顺序（用逗号分隔编号，如 2,1,3）:")
     print("\n".join(lines))
 
-    choice = input("新顺序: ").strip()
+    choice = ask_text("新顺序: ").strip()
     if not choice:
         return "已取消"
 

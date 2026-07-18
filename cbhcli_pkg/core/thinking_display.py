@@ -90,6 +90,9 @@ class ThinkingDisplay:
         self.live: Optional[Live] = None
         self.is_thinking = False
         self._term_width: int = 0
+        # 并行子Agent等输出被捕获的场景下设为 False：
+        # 禁用 rich.Live 原地刷新（其光标控制序列在回放时会产生乱码）
+        self.enabled: bool = True
 
     def _get_term_width(self) -> int:
         try:
@@ -133,14 +136,14 @@ class ThinkingDisplay:
         return False
 
     def start_thinking(self):
-        if self.is_thinking:
+        if not self.enabled or self.is_thinking:
             return
         self.is_thinking = True
         self.full_text = ""
         self._live_start()
 
     def add_content(self, content: str):
-        if not self.is_thinking or not self.live:
+        if not self.enabled or not self.is_thinking or not self.live:
             return
         self.full_text += content
         # 先检测 resize，若已重启则跳过 update（_live_start 已渲染新内容）

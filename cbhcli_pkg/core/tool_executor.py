@@ -1,7 +1,7 @@
 """工具执行器"""
 import json
+import shutil
 import sys
-import unicodedata
 from typing import Optional, Callable
 
 from cbhcli_pkg.tools.registry import ToolRegistry, ToolResult
@@ -11,6 +11,11 @@ from cbhcli_pkg.core.constants import (
     C_DIM, C_SEP, C_AI_HINT, C_ERROR, C_RESET
 )
 from cbhcli_pkg.core.errors import ToolExecutionError
+from cbhcli_pkg.core.text_width import (
+    display_width as _display_width,
+    pad_to_width as _pad_to_width,
+    truncate_to_width as _truncate_to_width,
+)
 
 
 # ANSI 颜色代码（用于预览显示）
@@ -22,35 +27,27 @@ C_WHITE = "\033[97m"       # 亮白色
 C_DIM_TEXT = "\033[90m"    # 灰色
 C_SEP_LINE = "\033[36m"   # 青色分隔线
 
+def _term_width() -> int:
+    """获取终端当前实际宽度
 
-def _display_width(text: str) -> int:
-    """计算字符串的显示宽度（中文占2个宽度）"""
-    width = 0
-    for char in text:
-        if unicodedata.east_asian_width(char) in ('F', 'W'):
-            width += 2
-        else:
-            width += 1
-    return width
-
-
-def _pad_to_width(text: str, target_width: int) -> str:
-    """将文本填充到指定显示宽度"""
-    current_width = _display_width(text)
-    if current_width >= target_width:
-        return text
-    return text + ' ' * (target_width - current_width)
+    直接通过 ioctl 查询（os.get_terminal_size），避免 shutil.get_terminal_size
+    优先读取可能已过期的 COLUMNS 环境变量导致窗口调小后仍按旧宽度渲染。
+    """
+    import os
+    for fd in (sys.stdout.fileno(), sys.stderr.fileno(), 0):
+        try:
+            return os.get_terminal_size(fd).columns
+        except (ValueError, OSError):
+            continue
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
 
 
-def _truncate_to_width(text: str, max_width: int) -> str:
-    """截断文本到指定显示宽度"""
-    width = 0
-    for i, char in enumerate(text):
-        char_width = 2 if unicodedata.east_asian_width(char) in ('F', 'W') else 1
-        if width + char_width > max_width - 3:
-            return text[:i] + "..."
-        width += char_width
-    return text
+def _separator_width() -> int:
+    """工具调用分隔线宽度（适配终端，不超过60）"""
+    return min(60, max(20, _term_width() - 1))
 
 
 class ToolExecutor:
@@ -146,7 +143,7 @@ class ToolExecutor:
         """显示工具调用信息"""
         cmd_preview = self._get_tool_preview(tool_name, arguments)
 
-        print(f"\n{C_SEP}{'─' * 60}")
+        print(f"\n{C_SEP}{'─' * _separator_width()}")
         if cmd_preview:
             print(f"{C_TOOL_DOT}● {C_TOOL_GREEN}{tool_name}{C_RESET}  {C_TOOL_CMD}{cmd_preview}{C_RESET}")
         else:
@@ -187,57 +184,10 @@ class ToolExecutor:
                             while new_lines and new_lines[-1].strip() == '':
                                 new_lines.pop()
 
-                            max_lines = max(len(old_lines), len(new_lines))
-
-                            # 列宽（显示宽度）
-                            content_width = 70  # 内容区域宽度
-                            line_num_width = 4   # 行号宽度（与 {line_num:4d} 一致）
-                            col_width = line_num_width + 1 + content_width  # 每列总宽度：行号+空格+内容
-
-                            print()
-                            # 标题行 - 左右完全分开
-                            left_title = f"--- 原内容 (行 {start_line}) ---"
-                            right_title = f"+++ 新内容 (行 {start_line}) +++"
-                            left_padded = _pad_to_width(left_title, col_width)
-                            right_padded = _pad_to_width(right_title, col_width)
-                            print(f"  {C_RED_BG}{C_WHITE}{C_BOLD}{left_padded}{C_RESET}"
-                                  f" {C_SEP_LINE}│{C_RESET} "
-                                  f"{C_GREEN_BG}{C_WHITE}{C_BOLD}{right_padded}{C_RESET}")
-
-                            # 分隔线
-                            print(f"  {C_SEP_LINE}{'─' * col_width}┼{'─' * col_width}{C_RESET}")
-
-                            # 左右并排显示，最多300行
-                            max_display = 300
-                            for i in range(min(max_lines, max_display)):
-                                line_num = start_line + i
-
-                                # 左侧（原内容）
-                                if i < len(old_lines):
-                                    old_line = old_lines[i]
-                                    old_display = _truncate_to_width(old_line, content_width)
-                                    old_padded = _pad_to_width(old_display, content_width)
-                                    left = f"{C_YELLOW}{line_num:4d}{C_RESET} {C_RED_BG}{C_WHITE}{old_padded}{C_RESET}"
-                                else:
-                                    # 空行用空格填充，不显示颜色
-                                    left = _pad_to_width('', col_width)
-
-                                # 右侧（新内容）
-                                if i < len(new_lines):
-                                    new_line = new_lines[i]
-                                    new_display = _truncate_to_width(new_line, content_width)
-                                    new_padded = _pad_to_width(new_display, content_width)
-                                    right = f"{C_YELLOW}{line_num:4d}{C_RESET} {C_GREEN_BG}{C_WHITE}{new_padded}{C_RESET}"
-                                else:
-                                    # 空行用空格填充，不显示颜色
-                                    right = _pad_to_width('', col_width)
-
-                                print(f"  {left} {C_SEP_LINE}│{C_RESET} {right}")
-
-                            if max_lines > max_display:
-                                print(f"  {C_DIM_TEXT}... 还有 {max_lines - max_display} 行 ...{C_RESET}")
-                            print()
-                    except:
+                            # rich.Table 渲染（内部按终端宽度自动选择
+                            # 宽屏左右并排 / 窄屏上下堆叠）
+                            self._render_edit_preview(old_lines, new_lines, start_line)
+                    except Exception:
                         pass
 
         elif tool_name == "write":
@@ -248,10 +198,11 @@ class ToolExecutor:
                 print()
                 print(f"  {C_GREEN_BG}{C_WHITE}{C_BOLD}--- 写入内容 ---{C_RESET}")
                 lines = content.split('\n')
-                # 最多显示300行
+                # 最多显示300行，宽度适配终端
                 max_display = 300
+                content_w = max(40, _term_width() - 2 - 5)
                 for i, line in enumerate(lines[:max_display], 1):
-                    display_line = _truncate_to_width(line, 100)
+                    display_line = _truncate_to_width(line, content_w)
                     print(f"  {C_YELLOW}{i:4d}{C_RESET} {C_GREEN_BG}{C_WHITE}{display_line}{C_RESET}")
                 if len(lines) > max_display:
                     print(f"  {C_DIM_TEXT}... 还有 {len(lines) - max_display} 行 ...{C_RESET}")
@@ -264,10 +215,11 @@ class ToolExecutor:
                 print()
                 print(f"  {C_GREEN_BG}{C_WHITE}{C_BOLD}--- 执行代码 ---{C_RESET}")
                 lines = code.split('\n')
-                # 最多显示300行
+                # 最多显示300行，宽度适配终端
                 max_display = 300
+                content_w = max(40, _term_width() - 2 - 5)
                 for i, line in enumerate(lines[:max_display], 1):
-                    display_line = _truncate_to_width(line, 100)
+                    display_line = _truncate_to_width(line, content_w)
                     print(f"  {C_YELLOW}{i:4d}{C_RESET} {C_GREEN_BG}{C_WHITE}{display_line}{C_RESET}")
                 if len(lines) > max_display:
                     print(f"  {C_DIM_TEXT}... 还有 {len(lines) - max_display} 行 ...{C_RESET}")
@@ -288,6 +240,90 @@ class ToolExecutor:
                     prompt_display = _truncate_to_width(prompt, 200)
                     print(f"  {C_DIM_TEXT}识别需求: {prompt_display}{C_RESET}")
                 print()
+
+    # ==================================================================
+    #  edit 预览渲染（rich.Table 表格，动态布局）
+    # ==================================================================
+
+    # 宽屏左右并排的最小终端宽度（小于此宽度改为上下堆叠）
+    _EDIT_SIDE_BY_SIDE_MIN = 110
+    # 最多显示的行数
+    _EDIT_MAX_DISPLAY = 200
+
+    def _render_edit_preview(self, old_lines, new_lines, start_line):
+        """用 rich.Table 渲染编辑差异预览
+
+        宽屏(>=110列)：左右并排表格（原内容 | 新内容）
+        窄屏(<110列)：上下堆叠两个表格（先原内容，后新内容）
+        长行自动折行显示（不截断），行号黄色标识。
+        """
+        from rich.console import Console
+        from rich.table import Table
+        from rich.text import Text
+        from rich import box
+
+        # 显式传入 ioctl 实时宽度（Console 默认读 COLUMNS 环境变量，可能过期）
+        term_w = _term_width()
+        console = Console(width=term_w)
+        max_lines = max(len(old_lines), len(new_lines))
+        max_display = self._EDIT_MAX_DISPLAY
+
+        def _cell(lines, i):
+            """构造一个单元格：黄色行号 + 内容"""
+            if i >= len(lines):
+                return Text("")
+            return Text.assemble(
+                (f"{start_line + i:>4} ", "bold yellow"),
+                (lines[i] if lines[i] else " ", "white"),
+            )
+
+        print()
+        if term_w >= self._EDIT_SIDE_BY_SIDE_MIN:
+            # ---- 宽屏：左右并排 ----
+            table = Table(
+                box=box.SQUARE, expand=True, padding=(0, 1),
+                show_lines=False, highlight=False,
+            )
+            table.add_column(
+                f"原内容 (行 {start_line})", ratio=1, overflow="fold",
+                header_style="bold white on #8b2222", style="on #2a0e0e",
+            )
+            table.add_column(
+                f"新内容 (行 {start_line})", ratio=1, overflow="fold",
+                header_style="bold white on #226622", style="on #0e2a0e",
+            )
+            for i in range(min(max_lines, max_display)):
+                table.add_row(_cell(old_lines, i), _cell(new_lines, i))
+            console.print(table)
+        else:
+            # ---- 窄屏：上下堆叠 ----
+            old_table = Table(
+                box=box.SQUARE, expand=True, padding=(0, 1),
+                show_lines=False, highlight=False,
+            )
+            old_table.add_column(
+                f"原内容 (行 {start_line})", ratio=1, overflow="fold",
+                header_style="bold white on #8b2222", style="on #2a0e0e",
+            )
+            for i in range(min(len(old_lines), max_display)):
+                old_table.add_row(_cell(old_lines, i))
+            console.print(old_table)
+
+            new_table = Table(
+                box=box.SQUARE, expand=True, padding=(0, 1),
+                show_lines=False, highlight=False,
+            )
+            new_table.add_column(
+                f"新内容 (行 {start_line})", ratio=1, overflow="fold",
+                header_style="bold white on #226622", style="on #0e2a0e",
+            )
+            for i in range(min(len(new_lines), max_display)):
+                new_table.add_row(_cell(new_lines, i))
+            console.print(new_table)
+
+        if max_lines > max_display:
+            console.print(f"[dim]... 还有 {max_lines - max_display} 行 ...[/dim]")
+        print()
 
     def _get_tool_preview(self, tool_name: str, arguments: dict) -> str:
         """获取工具调用的预览字符串"""
@@ -346,10 +382,11 @@ class ToolExecutor:
                          "memory_search", "knowledge_base"):
             return True
 
-        try:
-            confirm = input(f"\n{C_AI_HINT}确认执行 {tool_name}? [Y/n/all]: {C_RESET}")
-        except (EOFError, KeyboardInterrupt):
-            return False
+        from cbhcli_pkg.core.prompt_utils import ask_text_or_none
+        print()  # 与预览内容间隔一行
+        confirm = ask_text_or_none(f"确认执行 {tool_name}? [Y/n/all]: ")
+        if confirm is None:
+            return False  # EOF / Ctrl+C 视为取消
 
         confirm = confirm.strip().lower()
 
@@ -380,7 +417,7 @@ class ToolExecutor:
             error_msg = result.error or "未知错误"
             print(f"{C_ERROR}   → 失败: {error_msg}{C_RESET}")
 
-        print(f"{C_SEP}{'─' * 60}{C_RESET}")
+        print(f"{C_SEP}{'─' * _separator_width()}{C_RESET}")
 
     def on_tool_execute(self, callback: Callable):
         """设置工具执行回调

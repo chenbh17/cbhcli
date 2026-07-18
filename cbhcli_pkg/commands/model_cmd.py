@@ -1,4 +1,5 @@
 """模型配置命令处理"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -68,7 +69,7 @@ def register_model_commands(parser, app):
 def _add_model(app):
     """添加新模型"""
     print("\n--- 添加新模型 ---")
-    name = input("模型名称: ").strip()
+    name = ask_text("模型名称: ").strip()
     if not name:
         return "❌ 模型名称不能为空"
 
@@ -76,19 +77,19 @@ def _add_model(app):
     if app.global_config.get_model(name):
         return f"❌ 模型 '{name}' 已存在"
 
-    api_key = input("API Key: ").strip()
+    api_key = ask_text("API Key: ").strip()
     if not api_key:
         return "❌ API Key不能为空"
 
-    base_url = input("API Base URL (例如 https://api.openai.com/v1): ").strip()
+    base_url = ask_text("API Base URL (例如 https://api.openai.com/v1): ").strip()
     if not base_url:
         return "❌ API Base URL不能为空"
 
-    model_id = input("模型ID (例如 gpt-4o): ").strip()
+    model_id = ask_text("模型ID (例如 gpt-4o): ").strip()
     if not model_id:
         return "❌ 模型ID不能为空"
 
-    context_limit_str = input("上下文长度限制 (默认 128000): ").strip()
+    context_limit_str = ask_text("上下文长度限制 (默认 128000): ").strip()
     context_limit = 128000
     if context_limit_str:
         try:
@@ -96,7 +97,7 @@ def _add_model(app):
         except ValueError:
             return "❌ 上下文长度必须是数字"
 
-    temperature_str = input("温度参数 (默认使用全局值0.1，留空跳过): ").strip()
+    temperature_str = ask_text("温度参数 (默认使用全局值0.1，留空跳过): ").strip()
     temperature = None
     if temperature_str:
         try:
@@ -107,7 +108,7 @@ def _add_model(app):
             return "❌ 温度参数必须是数字"
 
 
-    vision_str = input("是否支持视觉/图片输入 (y/n, 默认 n): ").strip().lower()
+    vision_str = ask_text("是否支持视觉/图片输入 (y/n, 默认 n): ").strip().lower()
     supports_vision = vision_str == 'y'
 
     model_config = {
@@ -179,7 +180,7 @@ def _show_model_menu(app):
     lines.append("")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return "已取消选择"
@@ -215,7 +216,7 @@ def _show_rm_model_menu(app):
     lines.append("")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return "已取消"
@@ -311,7 +312,7 @@ def _config_model(app, param):
         
         lines.append(f"\n  0. 取消")
         print("\n" + "\n".join(lines))
-        choice = input("请选择 [编号/名称]: ").strip()
+        choice = ask_text("请选择 [编号/名称]: ").strip()
         
         if not choice or choice == '0':
             return "已取消"
@@ -342,7 +343,7 @@ def _config_model(app, param):
     
     # 上下文长度
     current_ctx = model_config.get('context_limit', 128000)
-    ctx_str = input(f"上下文长度限制 (当前: {current_ctx}): ").strip()
+    ctx_str = ask_text(f"上下文长度限制 (当前: {current_ctx}): ").strip()
     if ctx_str:
         try:
             new_ctx = int(ctx_str)
@@ -353,7 +354,7 @@ def _config_model(app, param):
     # 温度参数
     current_temp = model_config.get('temperature')
     temp_display = str(current_temp) if current_temp is not None else "使用全局值(0.1)"
-    temp_str = input(f"温度参数 (当前: {temp_display}): ").strip()
+    temp_str = ask_text(f"温度参数 (当前: {temp_display}): ").strip()
     if temp_str:
         if temp_str.lower() == 'none' or temp_str == '-':
             # 清除模型专属温度，恢复使用全局值
@@ -371,7 +372,7 @@ def _config_model(app, param):
     # 视觉参数
     current_vision = model_config.get('vision', False)
     vision_display = "y" if current_vision else "n"
-    vision_str = input(f"是否支持视觉/图片输入 (当前: {vision_display}): ").strip().lower()
+    vision_str = ask_text(f"是否支持视觉/图片输入 (当前: {vision_display}): ").strip().lower()
     if vision_str:
         model_config['vision'] = vision_str == 'y'
 
@@ -434,23 +435,23 @@ def _embedding_model_menu(app, param):
 def _add_embedding_model(app):
     """添加嵌入模型"""
     print("\n--- 添加嵌入模型 ---")
-    name = input("模型名称 (例如 openai-embedding): ").strip()
+    name = ask_text("模型名称 (例如 openai-embedding): ").strip()
     if not name:
         return "❌ 模型名称不能为空"
     
-    api_key = input("API Key: ").strip()
+    api_key = ask_text("API Key: ").strip()
     if not api_key:
         return "❌ API Key不能为空"
     
-    base_url = input("API Base URL (例如 https://api.openai.com/v1): ").strip()
+    base_url = ask_text("API Base URL (例如 https://api.openai.com/v1): ").strip()
     if not base_url:
         return "❌ API Base URL不能为空"
     
-    model_id = input("模型ID (例如 text-embedding-3-small): ").strip()
+    model_id = ask_text("模型ID (例如 text-embedding-3-small): ").strip()
     if not model_id:
         return "❌ 模型ID不能为空"
     
-    model_type = input("模型类型 (openai/custom, 默认 openai): ").strip() or "openai"
+    model_type = ask_text("模型类型 (openai/custom, 默认 openai): ").strip() or "openai"
     
     config = {
         "name": name,
@@ -491,7 +492,7 @@ def _delete_embedding_model(app):
         return "⚠️  未配置嵌入模型"
     
     name = config.get('name', '未知')
-    confirm = input(f"确定要删除嵌入模型 '{name}' 吗? (y/n): ").strip().lower()
+    confirm = ask_text(f"确定要删除嵌入模型 '{name}' 吗? (y/n): ").strip().lower()
     if confirm != 'y':
         return "已取消删除"
     
@@ -531,23 +532,23 @@ def _rerank_model_menu(app, param):
 def _add_rerank_model(app):
     """添加重排序模型"""
     print("\n--- 添加重排序模型 ---")
-    name = input("模型名称 (例如 jina-reranker): ").strip()
+    name = ask_text("模型名称 (例如 jina-reranker): ").strip()
     if not name:
         return "❌ 模型名称不能为空"
     
-    api_key = input("API Key: ").strip()
+    api_key = ask_text("API Key: ").strip()
     if not api_key:
         return "❌ API Key不能为空"
     
-    base_url = input("API Base URL (例如 https://api.jina.ai/v1): ").strip()
+    base_url = ask_text("API Base URL (例如 https://api.jina.ai/v1): ").strip()
     if not base_url:
         return "❌ API Base URL不能为空"
     
-    model_id = input("模型ID (例如 jina-reranker-v2-base-multilingual): ").strip()
+    model_id = ask_text("模型ID (例如 jina-reranker-v2-base-multilingual): ").strip()
     if not model_id:
         return "❌ 模型ID不能为空"
     
-    top_n = input("返回结果数量 (默认 5): ").strip()
+    top_n = ask_text("返回结果数量 (默认 5): ").strip()
     top_n = int(top_n) if top_n else 5
     
     config = {
@@ -589,7 +590,7 @@ def _delete_rerank_model(app):
         return "⚠️  未配置重排序模型"
     
     name = config.get('name', '未知')
-    confirm = input(f"确定要删除重排序模型 '{name}' 吗? (y/n): ").strip().lower()
+    confirm = ask_text(f"确定要删除重排序模型 '{name}' 吗? (y/n): ").strip().lower()
     if confirm != 'y':
         return "已取消删除"
     

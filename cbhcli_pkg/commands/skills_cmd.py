@@ -1,4 +1,5 @@
 """Skills命令处理 - /skills list|add|use|deactivate|rm"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -89,7 +90,7 @@ def _skills_add(app, name):
 
     # 获取技能名称
     if not name:
-        name = input("请输入技能名称 (英文，如 code-review): ").strip()
+        name = ask_text("请输入技能名称 (英文，如 code-review): ").strip()
     if not name:
         return "已取消"
 
@@ -111,7 +112,7 @@ def _skills_add(app, name):
     lines = []
     while True:
         try:
-            line = input()
+            line = ask_text()
             if line == "" and lines and lines[-1] == "":
                 # 连续两个空行结束
                 lines.pop()  # 移除最后的空行
@@ -126,12 +127,12 @@ def _skills_add(app, name):
     prompt_content = "\n".join(lines)
 
     # 询问是否需要脚本
-    add_script = input("\n是否需要添加脚本? (y/n, 默认n): ").strip().lower()
+    add_script = ask_text("\n是否需要添加脚本? (y/n, 默认n): ").strip().lower()
     scripts = {}
 
     if add_script == 'y':
         while True:
-            script_name = input("脚本文件名 (如 run.sh，空行结束): ").strip()
+            script_name = ask_text("脚本文件名 (如 run.sh，空行结束): ").strip()
             if not script_name:
                 break
 
@@ -139,7 +140,7 @@ def _skills_add(app, name):
             script_lines = []
             while True:
                 try:
-                    line = input()
+                    line = ask_text()
                     if line == "" and script_lines and script_lines[-1] == "":
                         script_lines.pop()
                         break
@@ -214,7 +215,7 @@ def _skills_use(app, param):
     print(f"  q.  取消操作")
     print("")
 
-    choice = input("请选择 [编号]: ").strip()
+    choice = ask_text("请选择 [编号]: ").strip()
 
     if not choice or choice.lower() == 'q':
         return "已取消"
@@ -311,7 +312,7 @@ def _skills_deactivate(app, param):
     print(f"  q.  取消操作")
     print("")
 
-    choice = input("请选择 [编号]: ").strip()
+    choice = ask_text("请选择 [编号]: ").strip()
 
     if not choice or choice.lower() == 'q':
         return "已取消"
@@ -362,7 +363,7 @@ def _show_rm_skills_menu(app):
     lines.append(f"\n  0. 取消\n")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return "已取消"
@@ -386,7 +387,7 @@ def _skills_rm(app, name):
     if not skill:
         return f"未找到技能: {name}"
 
-    confirm = input(f"确定要删除技能 '{name}' 吗? (y/n): ").strip().lower()
+    confirm = ask_text(f"确定要删除技能 '{name}' 吗? (y/n): ").strip().lower()
     if confirm != 'y':
         return "已取消"
 

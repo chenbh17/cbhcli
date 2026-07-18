@@ -1,5 +1,6 @@
 """AskUserQuestion工具 - 向用户提问以澄清需求"""
 import sys
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.tools.registry import BaseTool, ToolResult
 
 # 内联颜色常量（避免从 core.constants 导入产生循环引用）
@@ -87,7 +88,7 @@ class AskUserQuestionTool(BaseTool):
 
         # 获取用户输入
         try:
-            choice = input(f"\n{_C_AI_HINT}请选择: {_C_RESET}").strip()
+            choice = ask_text(f"\n{_C_AI_HINT}请选择: {_C_RESET}").strip()
         except (EOFError, KeyboardInterrupt):
             return ToolResult(
                 success=False, output="",
@@ -131,7 +132,7 @@ class AskUserQuestionTool(BaseTool):
         if needs_custom:
             try:
                 print(f"\n{_C_AI_HINT}请输入你的回答: {_C_RESET}", end='')
-                custom_input = input().strip()
+                custom_input = ask_text().strip()
             except (EOFError, KeyboardInterrupt):
                 return ToolResult(
                     success=False, output="",

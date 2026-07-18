@@ -1,4 +1,4 @@
-# CBHCLI v4.8.8 - AI驱动的终端助手
+# CBHCLI v4.9.0 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -16,7 +16,11 @@
 - **Markdown渲染** - CLI界面支持Markdown格式渲染，代码高亮、表格、列表等美观显示
 - **LaTeX公式渲染** - 支持LaTeX数学公式渲染，行内公式与块级公式均可正常显示
 - **ReAct持续交付** - ReAct循环中自动压缩上下文，突破上下文窗口限制实现长任务持续交付
-- **聊天框重构** - 基于 prompt_toolkit 原生补全系统，支持中英文/emoji输入无错位、终端resize无重叠、斜杠命令补全菜单
+- **聊天输入框** - 基于 prompt_toolkit 原生补全系统，字素簇宽度感知，支持中英文/emoji（含ZWJ/VS16/旗帜/肤色）输入退格无错位、resize防抖防重叠、斜杠命令补全菜单
+- **统一交互输入** - 所有交互式提问（/model add 等）统一使用 prompt_toolkit 输入系统，中英文/emoji 退格行为一致
+- **状态栏** - 输入框下方状态栏以文字标签+高对比配色显示：模型/上下文/Agent/技能/完整路径
+- **并行子Agent** - AI智能拆分多个独立子任务并行委托（最多10个并发），rich.Live 实时状态板展示每个子Agent当前步骤，全部完成后主Agent再继续
+- **智能差异预览** - edit工具预览用 rich.Table 渲染表格：宽屏左右并排、窄屏上下堆叠，长行自动折行，行列精确对齐
 
 ### 14大内置工具
 | 工具 | 功能 |
@@ -33,7 +37,7 @@
 | `memory_search` | 语义搜索向量化知识内容 |
 | `knowledge_base` | 查询知识库内容 |
 | `skills_create` | 创建新技能 |
-| `delegate_task` | 将子任务委托给子Agent执行 |
+| `delegate_task` | 委托子任务给子Agent（单个串行 / 多个并行最多10个，实时状态板） |
 | `image` | 使用视觉模型识别图片内容 |
 
 ### cbhpacks 数据科学工具（13个，默认关闭）
@@ -86,7 +90,7 @@ cbhcli web -p 18888
 ### 高级功能
 - **多步规划** - 复杂任务自动拆解为 Todo 计划列表，逐步执行并追踪进度
 - **自我反思** - 工具执行失败时自动分析原因并重试（最多3次）
-- **子Agent协作** - 将独立子任务委托给子Agent执行，拥有独立上下文
+- **子Agent协作** - 将独立子任务委托给子Agent执行，拥有独立上下文；多个独立子任务可并行委托，全部完成后主Agent再继续
 - **技能系统** - 创建可复用的技能（提示词+脚本），按需激活增强AI能力
 - **嵌入模型支持** - 可配置专用嵌入模型API（OpenAI compatible）
 - **重排序服务** - 支持Jina、Cohere等重排序API提高检索质量
@@ -114,7 +118,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.8.8-py3-none-any.whl
+pip install dist/cbhcli-4.9.0-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -468,13 +472,16 @@ cbhcli_pkg/
 ├── core/              # 核心模块
 │   ├── app.py              # 主应用
 │   ├── input_box.py        # 聊天输入框组件（原生补全系统）
+│   ├── text_width.py       # 字素簇宽度计算（emoji/CJK精确对齐）
+│   ├── resize_fix.py       # 终端resize防抖（防输入框重复显示）
+│   ├── prompt_utils.py     # 统一交互输入（替代内置input）
 │   ├── agent.py            # Agent管理
 │   ├── session.py          # 会话管理
 │   ├── session_history.py  # 会话历史管理
 │   ├── model.py            # LLM客户端
 │   ├── ai_handler.py       # AI请求处理（Function Calling + 反思）
 │   ├── tool_executor.py    # 工具执行
-│   ├── subagent.py         # 子Agent调度器
+│   ├── subagent.py         # 子Agent调度器（支持并行执行）
 │   ├── skill_manager.py    # 技能管理器
 │   ├── response_cleaner.py # 响应清理
 │   ├── embedding_client.py # 嵌入模型客户端
@@ -497,7 +504,7 @@ cbhcli_pkg/
 │   ├── python_tool.py  # Python执行（带会话记忆）
 │   ├── memory_search.py # 记忆搜索
 │   ├── knowledge_base.py # 知识库查询
-│   ├── delegate_task.py  # 子Agent任务委托
+│   ├── delegate_task.py  # 子Agent任务委托（串行/并行）
 │   ├── image.py         # 图片识别（调用视觉模型）
 │   ├── skills_create.py  # 技能创建
 │   ├── base.py          # 工具基类

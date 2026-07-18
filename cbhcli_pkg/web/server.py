@@ -52,7 +52,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.8.8")
+app = FastAPI(title="CBHCLI Web", version="4.9.0")
 
 app.add_middleware(
     CORSMiddleware,

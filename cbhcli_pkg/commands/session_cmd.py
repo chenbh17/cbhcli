@@ -1,4 +1,5 @@
 """会话和上下文命令处理"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -58,7 +59,7 @@ def register_session_commands(parser, app):
             lines.append("")
             
             print("\n" + "\n".join(lines))
-            choice = input("请选择 [编号/文件名]: ").strip()
+            choice = ask_text("请选择 [编号/文件名]: ").strip()
             
             if not choice or choice == '0':
                 return "已取消"
