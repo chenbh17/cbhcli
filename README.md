@@ -1,4 +1,4 @@
-# CBHCLI v4.9.0 - AI驱动的终端助手
+# CBHCLI v4.9.3 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -20,12 +20,15 @@
 - **统一交互输入** - 所有交互式提问（/model add 等）统一使用 prompt_toolkit 输入系统，中英文/emoji 退格行为一致
 - **状态栏** - 输入框下方状态栏以文字标签+高对比配色显示：模型/上下文/Agent/技能/完整路径
 - **并行子Agent** - AI智能拆分多个独立子任务并行委托（最多10个并发），rich.Live 实时状态板展示每个子Agent当前步骤，全部完成后主Agent再继续
-- **智能差异预览** - edit工具预览用 rich.Table 渲染表格：宽屏左右并排、窄屏上下堆叠，长行自动折行，行列精确对齐
+- **工具预览语法高亮** - edit/write/python 工具预览统一用 rich.Table + Pygments 语法高亮（monokai 主题）渲染：edit 差异对比宽屏左右并排、窄屏上下堆叠，write/python 按文件类型自动分色（30+种扩展名识别），长行自动折行，行列精确对齐
+- **后台任务管理** - terminal 命令超时(默认30秒)不杀进程转后台运行，process 工具实时监控进度直到完成，任务满1小时自动终止，kill_process 工具随时手动终止，长任务（pip install 大包等）不再被误杀
 
-### 14大内置工具
+### 16大内置工具
 | 工具 | 功能 |
 |------|------|
-| `terminal` | 执行终端命令 |
+| `terminal` | 执行终端命令（超时自动转后台，不杀进程） |
+| `process` | 实时监控后台任务进度，等待完成获取全部输出 |
+| `kill_process` | 终止运行时间过长的后台任务 |
 | `read` | 读取文件内容 |
 | `write` | 创建/覆盖文件 |
 | `edit` | 精确字符串替换 |
@@ -42,6 +45,8 @@
 
 ### cbhpacks 数据科学工具（13个，默认关闭）
 基于 [cbhpacks](https://github.com/chenbh17/cbhpacks) 数据科学工具包封装，覆盖完整的机器学习建模流水线。默认不开启，通过 `/tools on` 手动开启。
+
+**会话级状态缓存（v4.9.3）**：与 python 工具共享会话命名空间 —— 各工具的执行结果变量（如 `bm`/`woe_data`/`iv_data`/`mt`/`clf`/`selected_cols`/`data`）自动注入会话，可在 python 工具中直接使用做二次分析；同参数重复调用自动复用缓存实例（如 fit 后的模型可直接调参/出报告）。`/new` 或 `/reset` 后所有缓存与变量自动释放。
 
 | 工具 | 功能 | 方法 |
 |------|------|------|
@@ -118,7 +123,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.9.0-py3-none-any.whl
+pip install dist/cbhcli-4.9.3-py3-none-any.whl
 ```
 
 ### 可选依赖

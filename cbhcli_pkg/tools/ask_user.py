@@ -1,6 +1,6 @@
 """AskUserQuestion工具 - 向用户提问以澄清需求"""
 import sys
-from cbhcli_pkg.core.prompt_utils import ask_text
+from cbhcli_pkg.core.prompt_utils import ask_text_or_none
 from cbhcli_pkg.tools.registry import BaseTool, ToolResult
 
 # 内联颜色常量（避免从 core.constants 导入产生循环引用）
@@ -86,10 +86,10 @@ class AskUserQuestionTool(BaseTool):
             print(f"  {_C_AI_TEXT}{i}. {opt}{_C_RESET}")
         print(f"{_C_AI_HINT}{'─' * 50}{_C_RESET}")
 
-        # 获取用户输入
-        try:
-            choice = ask_text(f"\n{_C_AI_HINT}请选择: {_C_RESET}").strip()
-        except (EOFError, KeyboardInterrupt):
+        # 获取用户输入（ask_text_or_none 区分：None=Esc/Ctrl+C取消，""=空回车）
+        choice = ask_text_or_none(f"\n{_C_AI_HINT}请选择: {_C_RESET}")
+
+        if choice is None:
             return ToolResult(
                 success=False, output="",
                 error="用户取消了回答"
@@ -130,10 +130,10 @@ class AskUserQuestionTool(BaseTool):
 
         # 如果选择了"自定义输入"，提示用户输入
         if needs_custom:
-            try:
-                print(f"\n{_C_AI_HINT}请输入你的回答: {_C_RESET}", end='')
-                custom_input = ask_text().strip()
-            except (EOFError, KeyboardInterrupt):
+            custom_input = ask_text_or_none(
+                f"\n{_C_AI_HINT}请输入你的回答: {_C_RESET}"
+            )
+            if custom_input is None:
                 return ToolResult(
                     success=False, output="",
                     error="用户取消了输入"

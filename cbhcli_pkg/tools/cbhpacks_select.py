@@ -1,11 +1,13 @@
 """cbhpacks 特征选择工具 - cols_select 模块封装
 
-状态缓存 + 自动分目录 + 每次执行自动保存可复现的Python源码。
+会话级状态缓存（随 /new /reset 自动释放）+ 自动分目录 + 每次执行自动保存可复现的Python源码。
+执行结果变量(cs/selected_cols等)自动注入 python 会话，可在 python 工具中直接使用。
 """
 import os
 import json
 import pandas as pd
-from cbhcli_pkg.tools.registry import BaseTool, ToolResult
+from cbhcli_pkg.tools.registry import ToolResult
+from cbhcli_pkg.tools.cbhpacks_session import CbhpacksSessionTool
 
 
 def auto_new_path(base_path, cache, cache_key, attr_name="path"):
@@ -24,8 +26,7 @@ def save_script(output_dir, filename, code):
         f.write(code)
 
 
-class ColsSelectTool(BaseTool):
-    _cache = {}
+class ColsSelectTool(CbhpacksSessionTool):
 
     @property
     def name(self): return "cbhpacks_cols_select"
@@ -34,8 +35,9 @@ class ColsSelectTool(BaseTool):
     def description(self):
         return (
             "cbhpacks 通用特征筛选工具 - 10种筛选方法逐步筛选特征。\n"
-            "同一数据集多次调用共享状态，self.cols_s 会逐步缩减。\n"
-            "每次执行自动保存可复现的Python源码脚本到输出目录。\n\n"
+            "同一数据集多次调用共享状态（会话级缓存，/new /reset 后自动释放），self.cols_s 会逐步缩减。\n"
+            "每次执行自动保存可复现的Python源码脚本到输出目录。\n"
+            "执行后结果变量自动注入 python 会话：cs(cols_select实例)/df/selected_cols\n\n"
             "【method】null_select/enumerate_select/iv_select/psi_select/corr_select/chi2_select/logistic_select/ml_select/boostrap_select/vif_select\n\n"
             "【⚠️ 依赖数据说明】\n"
             "- iv_data_csv: iv_select和corr_select必须传入，来自cbhpacks_bins_model.comp_woe_iv产出的iv_data_xxx.csv\n"
@@ -107,11 +109,12 @@ class ColsSelectTool(BaseTool):
 
             from cbhpacks.cols_select import cols_select
 
+            cache = self._get_cache('cols_select')
             cache_key = (csv_path, target)
-            cs = self.__class__._cache.get(cache_key)
+            cs = cache.get(cache_key)
 
             if cs is None or reset:
-                path = auto_new_path(path, self.__class__._cache, cache_key, "path")
+                path = auto_new_path(path, cache, cache_key, "path")
                 df = pd.read_csv(csv_path)
                 iv_data = pd.read_csv(iv_data_csv) if iv_data_csv and os.path.exists(iv_data_csv) else None
                 psi_data = pd.read_csv(psi_data_csv) if psi_data_csv and os.path.exists(psi_data_csv) else None
@@ -124,7 +127,7 @@ class ColsSelectTool(BaseTool):
                     ml_method=ml_method, boot_method=boot_method, boot_thres=boot_thres,
                     vif_thres=vif_thres, nan=nan, path=path
                 )
-                self.__class__._cache[cache_key] = cs
+                cache[cache_key] = cs
             else:
                 path = cs.path
                 if iv_data_csv and os.path.exists(iv_data_csv): cs.iv_data = pd.read_csv(iv_data_csv)
@@ -143,6 +146,9 @@ class ColsSelectTool(BaseTool):
             result = method_map[method]()
             selected_cols = cs.cols_s
             original_count = len(cols)
+
+            # 结果变量注入 python 会话
+            self._expose(cs=cs, df=cs.df, selected_cols=selected_cols)
 
             # 保存筛选结果JSON
             os.makedirs(path, exist_ok=True)
@@ -184,7 +190,8 @@ print(f"筛选后: {{len(cs.cols_s)}} 个特征: {{cs.cols_s}}")
                 f"📁 输出文件:\n" + "\n".join(output_files) + f"\n"
                 f"  📁 输出目录: {path}/\n\n"
                 f"📋 结果:\n{result_text}\n\n"
-                f"💡 selected_cols 可直接作为 cbhpacks_binary_model 的 cols 参数"
+                f"💡 selected_cols 可直接作为 cbhpacks_binary_model 的 cols 参数\n"
+                f"💡 已注入 python 会话变量: cs, df, selected_cols"
             ))
 
         except Exception as e:
@@ -192,13 +199,14 @@ print(f"筛选后: {{len(cs.cols_s)}} 个特征: {{cs.cols_s}}")
             return ToolResult(success=False, output="", error=f"执行失败: {str(e)}\n{traceback.format_exc()}")
 
 
-class ColsSelectJsTool(BaseTool):
+class ColsSelectJsTool(CbhpacksSessionTool):
     @property
     def name(self): return "cbhpacks_cols_select_js"
 
     @property
     def description(self):
-        return "cbhpacks 递归特征筛选工具 - 递归迭代剔除低重要性特征。每次执行自动保存可复现源码。"
+        return ("cbhpacks 递归特征筛选工具 - 递归迭代剔除低重要性特征。每次执行自动保存可复现源码。\n"
+                "执行后结果变量自动注入 python 会话：cs_js/js_data/cols_detail/js_cols/train/test")
 
     @property
     def parameters(self):
@@ -242,6 +250,10 @@ class ColsSelectJsTool(BaseTool):
                                method=method_type, recursion_num=recursion_num, stay_pct=stay_pct, path=path)
             js_data, cols_detail, js_cols = cs.recursion_select()
 
+            # 结果变量注入 python 会话
+            self._expose(cs_js=cs, js_data=js_data, cols_detail=cols_detail, js_cols=js_cols,
+                         train=train, test=test)
+
             script_code = f'''import pandas as pd
 from cbhpacks.cols_select import cols_select_js
 
@@ -260,7 +272,8 @@ print(f"最优特征组合 ({{len(js_cols)}}个): {{js_cols}}")
                 f"  ✅ {path}/ — 递归筛选图表和报告\n"
                 f"  ✅ {path}/run_recursion_select.py — 可复现源码\n\n"
                 f"📋 最优特征组合({len(js_cols)}个): {js_cols}\n\n"
-                f"💡 js_cols 可直接作为 cbhpacks_binary_model 的 cols 参数"
+                f"💡 js_cols 可直接作为 cbhpacks_binary_model 的 cols 参数\n"
+                f"💡 已注入 python 会话变量: cs_js, js_data, cols_detail, js_cols, train, test"
             ))
         except Exception as e:
             import traceback

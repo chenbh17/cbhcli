@@ -38,6 +38,8 @@ from cbhcli_pkg.tools.glob_tool import GlobTool
 from cbhcli_pkg.tools.ask_user import AskUserQuestionTool
 from cbhcli_pkg.tools.todo import TodoTool
 from cbhcli_pkg.tools.image import ImageTool
+from cbhcli_pkg.tools.process import ProcessTool
+from cbhcli_pkg.tools.kill_process import KillProcessTool
 
 # cbhpacks 数据科学工具
 from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
@@ -284,6 +286,8 @@ class CBHCLIApp:
         self.tool_registry.register(GlobTool())
         self.tool_registry.register(AskUserQuestionTool())
         self.tool_registry.register(ImageTool(self))
+        self.tool_registry.register(ProcessTool())
+        self.tool_registry.register(KillProcessTool())
         self.todo_tool = TodoTool()
         self.tool_registry.register(self.todo_tool)
 

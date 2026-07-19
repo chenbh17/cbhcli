@@ -133,8 +133,7 @@ class TodoTool(BaseTool):
         for i, t in enumerate(todos):
             icon = _STATUS_ICONS.get(t["status"], " ")
             content = t["content"]
-            is_last = (i == len(todos) - 1)
-            prefix = "  ⎿ " if is_last else "  │ "
+            prefix = "  "
 
             # 不同状态用不同颜色
             if t["status"] == "completed":

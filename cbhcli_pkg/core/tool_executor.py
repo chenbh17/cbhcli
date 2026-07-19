@@ -34,10 +34,12 @@ def _term_width() -> int:
     优先读取可能已过期的 COLUMNS 环境变量导致窗口调小后仍按旧宽度渲染。
     """
     import os
-    for fd in (sys.stdout.fileno(), sys.stderr.fileno(), 0):
+    # fileno 调用本身也可能失败（如 stdout 被重定向为 StringIO），须放进 try 内
+    for fd_source in (sys.stdout, sys.stderr, None):
         try:
+            fd = fd_source.fileno() if fd_source is not None else 0
             return os.get_terminal_size(fd).columns
-        except (ValueError, OSError):
+        except (ValueError, OSError, AttributeError):
             continue
     try:
         return shutil.get_terminal_size().columns
@@ -185,8 +187,10 @@ class ToolExecutor:
                                 new_lines.pop()
 
                             # rich.Table 渲染（内部按终端宽度自动选择
-                            # 宽屏左右并排 / 窄屏上下堆叠）
-                            self._render_edit_preview(old_lines, new_lines, start_line)
+                            # 宽屏左右并排 / 窄屏上下堆叠，按文件类型语法高亮）
+                            self._render_edit_preview(
+                                old_lines, new_lines, start_line, file_path
+                            )
                     except Exception:
                         pass
 
@@ -195,35 +199,17 @@ class ToolExecutor:
             content = arguments.get("content", "")
 
             if file_path and content:
-                print()
-                print(f"  {C_GREEN_BG}{C_WHITE}{C_BOLD}--- 写入内容 ---{C_RESET}")
-                lines = content.split('\n')
-                # 最多显示300行，宽度适配终端
-                max_display = 300
-                content_w = max(40, _term_width() - 2 - 5)
-                for i, line in enumerate(lines[:max_display], 1):
-                    display_line = _truncate_to_width(line, content_w)
-                    print(f"  {C_YELLOW}{i:4d}{C_RESET} {C_GREEN_BG}{C_WHITE}{display_line}{C_RESET}")
-                if len(lines) > max_display:
-                    print(f"  {C_DIM_TEXT}... 还有 {len(lines) - max_display} 行 ...{C_RESET}")
-                print()
+                from pathlib import Path as _P
+                header = f"写入内容 ({_P(file_path).name})"
+                self._render_code_preview(
+                    content, header, self._guess_lexer(file_path)
+                )
 
         elif tool_name == "python":
             code = arguments.get("code", "")
 
             if code:
-                print()
-                print(f"  {C_GREEN_BG}{C_WHITE}{C_BOLD}--- 执行代码 ---{C_RESET}")
-                lines = code.split('\n')
-                # 最多显示300行，宽度适配终端
-                max_display = 300
-                content_w = max(40, _term_width() - 2 - 5)
-                for i, line in enumerate(lines[:max_display], 1):
-                    display_line = _truncate_to_width(line, content_w)
-                    print(f"  {C_YELLOW}{i:4d}{C_RESET} {C_GREEN_BG}{C_WHITE}{display_line}{C_RESET}")
-                if len(lines) > max_display:
-                    print(f"  {C_DIM_TEXT}... 还有 {len(lines) - max_display} 行 ...{C_RESET}")
-                print()
+                self._render_code_preview(code, "执行代码", "python")
 
         elif tool_name == "image":
             image_paths = arguments.get("image_paths", [])
@@ -250,12 +236,19 @@ class ToolExecutor:
     # 最多显示的行数
     _EDIT_MAX_DISPLAY = 200
 
-    def _render_edit_preview(self, old_lines, new_lines, start_line):
+    def _render_edit_preview(self, old_lines, new_lines, start_line, file_path=""):
         """用 rich.Table 渲染编辑差异预览
 
         宽屏(>=110列)：左右并排表格（原内容 | 新内容）
         窄屏(<110列)：上下堆叠两个表格（先原内容，后新内容）
         长行自动折行显示（不截断），行号黄色标识。
+        代码区域按文件类型做 Pygments 语法高亮（monokai 主题）。
+
+        Args:
+            old_lines: 原内容行列表
+            new_lines: 新内容行列表
+            start_line: 起始行号
+            file_path: 目标文件路径（用于推断语法高亮 lexer）
         """
         from rich.console import Console
         from rich.table import Table
@@ -268,13 +261,21 @@ class ToolExecutor:
         max_lines = max(len(old_lines), len(new_lines))
         max_display = self._EDIT_MAX_DISPLAY
 
-        def _cell(lines, i):
-            """构造一个单元格：黄色行号 + 内容"""
-            if i >= len(lines):
+        # 对完整 old/new 代码做语法高亮（保留跨行上下文），再按行切分
+        lexer = self._guess_lexer(file_path) if file_path else "text"
+        old_hl = self._highlight_code_lines('\n'.join(old_lines), lexer)
+        new_hl = self._highlight_code_lines('\n'.join(new_lines), lexer)
+
+        def _cell(hl_lines, i):
+            """构造一个单元格：黄色行号 + 语法高亮内容"""
+            if i >= len(hl_lines):
                 return Text("")
+            content = hl_lines[i]
+            if not content.plain:
+                content = Text(" ")  # 空行占位，保持行高
             return Text.assemble(
                 (f"{start_line + i:>4} ", "bold yellow"),
-                (lines[i] if lines[i] else " ", "white"),
+                content,
             )
 
         print()
@@ -293,7 +294,7 @@ class ToolExecutor:
                 header_style="bold white on #226622", style="on #0e2a0e",
             )
             for i in range(min(max_lines, max_display)):
-                table.add_row(_cell(old_lines, i), _cell(new_lines, i))
+                table.add_row(_cell(old_hl, i), _cell(new_hl, i))
             console.print(table)
         else:
             # ---- 窄屏：上下堆叠 ----
@@ -306,7 +307,7 @@ class ToolExecutor:
                 header_style="bold white on #8b2222", style="on #2a0e0e",
             )
             for i in range(min(len(old_lines), max_display)):
-                old_table.add_row(_cell(old_lines, i))
+                old_table.add_row(_cell(old_hl, i))
             console.print(old_table)
 
             new_table = Table(
@@ -318,11 +319,140 @@ class ToolExecutor:
                 header_style="bold white on #226622", style="on #0e2a0e",
             )
             for i in range(min(len(new_lines), max_display)):
-                new_table.add_row(_cell(new_lines, i))
+                new_table.add_row(_cell(new_hl, i))
             console.print(new_table)
 
         if max_lines > max_display:
             console.print(f"[dim]... 还有 {max_lines - max_display} 行 ...[/dim]")
+        print()
+
+    # ==================================================================
+    #  代码预览渲染（rich.Table + Syntax 语法高亮，python/write 共用）
+    # ==================================================================
+
+    # 最多显示的行数
+    _CODE_MAX_DISPLAY = 300
+
+    # 文件扩展名 → Pygments lexer 映射（write 预览用）
+    _LEXER_MAP = {
+        ".py": "python", ".pyw": "python",
+        ".md": "markdown", ".markdown": "markdown",
+        ".json": "json", ".jsonl": "json",
+        ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+        ".yaml": "yaml", ".yml": "yaml",
+        ".toml": "toml", ".ini": "ini", ".cfg": "ini",
+        ".js": "javascript", ".jsx": "jsx",
+        ".ts": "typescript", ".tsx": "tsx",
+        ".html": "html", ".htm": "html", ".css": "css",
+        ".sql": "sql", ".xml": "xml",
+        ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp",
+        ".java": "java", ".go": "go", ".rs": "rust", ".rb": "ruby",
+    }
+
+    def _guess_lexer(self, file_path: str) -> str:
+        """根据文件扩展名推断 Pygments lexer，无法识别回退 text"""
+        from pathlib import Path
+        suffix = Path(file_path).suffix.lower()
+        if suffix in self._LEXER_MAP:
+            return self._LEXER_MAP[suffix]
+        # 映射表未命中时让 pygments 猜（覆盖 Dockerfile/Makefile 等无扩展名场景）
+        try:
+            from pygments.lexers import get_lexer_for_filename
+            from pygments.util import ClassNotFound
+            lexer = get_lexer_for_filename(file_path)
+            if lexer.aliases:
+                return lexer.aliases[0]
+        except Exception:
+            pass
+        return "text"
+
+    def _highlight_code_lines(self, code: str, lexer_name: str):
+        """用 Pygments 对完整代码做语法高亮，返回逐行 rich.Text 列表
+
+        先对完整 code 做 lex（保留多行字符串/注释等跨行上下文），
+        再按 \\n 把带样式的 token 流切分成行，兼容表格的逐行渲染。
+
+        Args:
+            code: 完整代码文本
+            lexer_name: Pygments lexer 名（无法识别时按纯文本处理）
+
+        Returns:
+            list[rich.Text]: 每行一个 Text 对象（含 monokai 主题颜色样式）
+        """
+        from pygments import lex
+        from pygments.lexers import get_lexer_by_name, TextLexer
+        from pygments.util import ClassNotFound
+        from rich.syntax import PygmentsSyntaxTheme
+        from rich.text import Text
+
+        try:
+            lexer = get_lexer_by_name(lexer_name)
+        except ClassNotFound:
+            lexer = TextLexer()
+
+        theme = PygmentsSyntaxTheme("monokai")
+        lines = [Text()]
+        for ttype, value in lex(code, lexer):
+            style = theme.get_style_for_token(ttype)
+            for i, part in enumerate(value.split('\n')):
+                if i > 0:
+                    lines.append(Text())
+                if part:
+                    lines[-1].append(part, style=style)
+        # pygments 常在末尾补一个换行 token，切分后会多出尾部空行，
+        # 需去除以保持与源行数对齐（中间空行不受影响）
+        while len(lines) > 1 and not lines[-1].plain:
+            lines.pop()
+        return lines
+
+    def _render_code_preview(self, code: str, header: str, lexer: str = "text"):
+        """用 rich.Table + Syntax 渲染代码预览
+
+        与 edit 预览同款表格风格（SQUARE 边框 + 绿色表头），
+        代码区域使用 Pygments 语法高亮（monokai 主题，关键字/字符串/
+        函数名/数字等不同颜色），自带行号，长行自动折行，宽度适配终端。
+
+        Args:
+            code: 代码内容
+            header: 表头文字（如 "执行代码" / "写入内容 (xx.py)"）
+            lexer: Pygments lexer 名（python/markdown/json/...，无法识别用 text）
+        """
+        from rich.console import Console
+        from rich.table import Table
+        from rich.syntax import Syntax
+        from rich import box
+
+        # 显式传入 ioctl 实时宽度（Console 默认读 COLUMNS 环境变量，可能过期）
+        term_w = _term_width()
+        console = Console(width=term_w)
+        max_display = self._CODE_MAX_DISPLAY
+
+        lines = code.split('\n')
+        # 移除末尾空行（避免显示空代码区）
+        while lines and lines[-1].strip() == '':
+            lines.pop()
+
+        display_code = '\n'.join(lines[:max_display])
+
+        table = Table(
+            box=box.SQUARE, expand=True, padding=(0, 1),
+            show_lines=False, highlight=False,
+        )
+        table.add_column(
+            header, ratio=1, overflow="fold",
+            header_style="bold white on #226622",
+        )
+        syntax = Syntax(
+            display_code, lexer,
+            theme="monokai", line_numbers=True,
+            word_wrap=True,
+        )
+        table.add_row(syntax)
+
+        print()
+        console.print(table)
+        if len(lines) > max_display:
+            console.print(f"[dim]... 还有 {len(lines) - max_display} 行 ...[/dim]")
         print()
 
     def _get_tool_preview(self, tool_name: str, arguments: dict) -> str:

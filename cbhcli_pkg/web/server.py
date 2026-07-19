@@ -32,9 +32,11 @@ from cbhcli_pkg.tools.todo import TodoTool
 from cbhcli_pkg.tools.memory_search import MemorySearchTool
 from cbhcli_pkg.tools.knowledge_base import KnowledgeBaseTool
 from cbhcli_pkg.tools.delegate_task import DelegateTaskTool
-from cbhcli_pkg.tools.python_tool import PythonTool
+from cbhcli_pkg.tools.python_tool import PythonTool, remove_python_session
 from cbhcli_pkg.tools.skills_create import SkillsCreateTool
 from cbhcli_pkg.tools.image import ImageTool
+from cbhcli_pkg.tools.process import ProcessTool
+from cbhcli_pkg.tools.kill_process import KillProcessTool
 from cbhcli_pkg.core.mcp_manager import MCPManager
 from cbhcli_pkg.core.skill_manager import SkillManager
 from cbhcli_pkg.core.constants import MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE
@@ -52,7 +54,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.9.0")
+app = FastAPI(title="CBHCLI Web", version="4.9.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -165,6 +167,8 @@ def _get_tool_registry(agent_name: str = "", app_proxy: '_WebAgentContext' = Non
     registry.register(GlobTool())
     registry.register(AskUserQuestionTool())
     registry.register(TodoTool())
+    registry.register(ProcessTool())
+    registry.register(KillProcessTool())
     registry.register(PythonTool("default"))
 
     # Register knowledge_base, memory_search, delegate_task, skills_create tools
@@ -1408,6 +1412,9 @@ async def reset_chat(req: Request):
                     session.get_context_messages(), session.id
                 )
         del _chat_sessions[session_key]
+
+    # 释放 python 会话（含 cbhpacks 工具缓存），与 CLI 端 /new 行为一致
+    remove_python_session("default")
 
     return {"message": "Session reset"}
 

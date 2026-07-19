@@ -10,10 +10,11 @@ GetRandomDataTool: 生成随机测试数据集
 import os
 import json
 import pandas as pd
-from cbhcli_pkg.tools.registry import BaseTool, ToolResult
+from cbhcli_pkg.tools.registry import ToolResult
+from cbhcli_pkg.tools.cbhpacks_session import CbhpacksSessionTool
 
 
-class GetRandomDataTool(BaseTool):
+class GetRandomDataTool(CbhpacksSessionTool):
     """cbhpacks 测试数据生成工具"""
 
     @property
@@ -32,6 +33,7 @@ class GetRandomDataTool(BaseTool):
             "【依赖关系】\n"
             "  - 独立使用，无上游依赖\n"
             "  - 产出的CSV可供所有cbhpacks工具使用\n"
+            "  - 生成的数据自动注入 python 会话变量 data，可在 python 工具中直接使用\n"
         )
 
     @property
@@ -99,10 +101,14 @@ class GetRandomDataTool(BaseTool):
                 f"缺失值统计:\n{data.isnull().sum().to_string()}"
             )
 
+            # 结果变量注入 python 会话
+            self._expose(data=data)
+
             output = (
                 f"📊 cbhpacks_get_random_data 执行完成\n\n"
                 f"📁 输出文件:\n" + "\n".join(output_files) + "\n\n"
                 f"📋 结果:\n{result_text}\n\n"
+                f"💡 已注入 python 会话变量: data（python 工具中可直接使用）\n"
                 f"💡 提示: 生成的CSV可供所有cbhpacks工具使用，如:\n"
                 f"  - cbhpacks_bins_model: 分箱WOE/IV计算\n"
                 f"  - cbhpacks_cols_encode: 特征编码\n"

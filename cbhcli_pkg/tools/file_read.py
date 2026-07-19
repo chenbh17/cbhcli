@@ -12,7 +12,7 @@ class ReadTool(BaseTool):
     
     @property
     def description(self) -> str:
-        return "读取文件内容。可以读取任何文本文件,支持指定行范围。"
+        return "读取文件内容。可以读取任何文本文件,支持指定行范围。**注意**: read工具的输出内容不显示给用户。"
     
     @property
     def parameters(self) -> dict:

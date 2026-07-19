@@ -1,11 +1,14 @@
 """cbhpacks 分箱工具 - bins_model 模块封装
 
-状态缓存 + 自动分目录 + 每次执行自动保存可复现的Python源码。
+会话级状态缓存（随 /new /reset 自动释放）+ 自动分目录 + 每次执行自动保存可复现的Python源码。
+执行结果变量(bm/woe_data/iv_data等)自动注入 python 会话，可在 python 工具中直接使用。
 """
 import os
 import json
+import numpy as np
 import pandas as pd
-from cbhcli_pkg.tools.registry import BaseTool, ToolResult
+from cbhcli_pkg.tools.registry import ToolResult
+from cbhcli_pkg.tools.cbhpacks_session import CbhpacksSessionTool
 
 
 def auto_new_path(base_path, cache, cache_key, attr_name="path"):
@@ -25,8 +28,7 @@ def save_script(output_dir, filename, code):
         f.write(code)
 
 
-class BinsModelTool(BaseTool):
-    _cache = {}
+class BinsModelTool(CbhpacksSessionTool):
 
     @property
     def name(self): return "cbhpacks_bins_model"
@@ -35,8 +37,10 @@ class BinsModelTool(BaseTool):
     def description(self):
         return (
             "cbhpacks 分箱模型工具 - 分箱、WOE转换、IV计算、PSI稳定性检验。\n"
-            "同一数据集多次调用共享状态。不同分箱类型自动分目录。\n"
-            "每次执行自动保存可复现的Python源码脚本到输出目录。\n\n"
+            "同一数据集多次调用共享状态（会话级缓存，/new /reset 后自动释放）。不同分箱类型自动分目录。\n"
+            "每次执行自动保存可复现的Python源码脚本到输出目录。\n"
+            "执行后结果变量自动注入 python 会话，可在 python 工具中直接使用：\n"
+            "  bm(bins_model实例)/df/woe_data/iv_data/woe_df/woe_mapping/psi_data/psi_avg_data\n\n"
             "【method】comp_woe_iv/bins_rpt/data_to_woe/get_psi/psi_mth_avg/plot_col_rpt/plot_cols_rpt\n\n"
             "【⚠️ 注意事项】\n"
             "1. WOE转换必须使用本工具的data_to_woe，禁止使用cbhpacks_cols_encode.data_to_woe，"
@@ -99,12 +103,13 @@ class BinsModelTool(BaseTool):
 
             from cbhpacks.bins_model import bins_model
 
+            cache = self._get_cache('bins_model')
             cache_key = (csv_path, target, bins_type, group, tuple(sorted(cols)))
-            bm = self.__class__._cache.get(cache_key)
+            bm = cache.get(cache_key)
             new_instance = bm is None
 
             if bm is None:
-                output_path = auto_new_path(output_path, self.__class__._cache, cache_key, "path")
+                output_path = auto_new_path(output_path, cache, cache_key, "path")
                 df = pd.read_csv(csv_path)
                 bm = bins_model(
                     df=df, cols=cols, group=group, target=target, nan=nan,
@@ -113,7 +118,7 @@ class BinsModelTool(BaseTool):
                     chi2_initial_group=chi2_initial_group, adj_bin=adj_bin,
                     cat_cols=cat_cols, min_group=min_group, path=output_path
                 )
-                self.__class__._cache[cache_key] = bm
+                cache[cache_key] = bm
             else:
                 output_path = bm.path
                 if col: bm.col = col
@@ -124,13 +129,17 @@ class BinsModelTool(BaseTool):
             output_files = []
             result_text = ""
             script_code = ""
+            exposed = {'bm': bm, 'df': bm.df}  # 注入 python 会话的变量
 
             if method == "comp_woe_iv":
                 woe_data, iv_data = bm.comp_woe_iv()
+                # IV inf 防御（兼容旧版 cbhpacks 库）
+                iv_data['iv_value'] = iv_data['iv_value'].replace([np.inf, -np.inf], 0)
                 bm.cols_bins_rpt = woe_data
                 bm.cols_iv_data = iv_data
                 iv_data.to_csv(os.path.join(output_path, "iv_data.csv"), index=False)
                 woe_data.to_csv(os.path.join(output_path, "woe_data.csv"), index=False)
+                exposed.update(woe_data=woe_data, iv_data=iv_data)
                 output_files += [f"  ✅ {output_path}/iv_data.csv", f"  ✅ {output_path}/woe_data.csv"]
                 result_text = f"iv_data:\n{iv_data.to_string()}\n\nwoe_data前5行:\n{woe_data.head().to_string()}"
                 script_code = f'''import pandas as pd
@@ -151,7 +160,11 @@ print(iv_data)
                 if not col: return ToolResult(success=False, output="", error="bins_rpt需要指定col参数")
                 bm.col = col
                 woe_final, iv = bm.bins_rpt()
+                # IV inf 防御（兼容旧版 cbhpacks 库）
+                if iv == np.inf or iv == -np.inf:
+                    iv = 0
                 result_text = f"变量 {col} 分箱报告 (IV={iv}):\n{woe_final.to_string()}"
+                exposed.update(woe_final=woe_final, iv=iv)
                 script_code = f'''import pandas as pd
 from cbhpacks.bins_model import bins_model
 
@@ -166,6 +179,7 @@ print(woe_final)
             elif method == "data_to_woe":
                 woedf, woe_mapping = bm.data_to_woe()
                 woedf.to_csv(os.path.join(output_path, "woe_transformed_data.csv"), index=False)
+                exposed.update(woe_df=woedf, woe_mapping=woe_mapping)
                 output_files += [f"  ✅ {output_path}/woe_mapping_*.pkl", f"  ✅ {output_path}/woe_transformed_data.csv"]
                 result_text = f"WOE转换完成，{len(woe_mapping)} 个变量"
                 script_code = f'''import pandas as pd
@@ -185,6 +199,7 @@ print(f"WOE转换完成，{{len(woe_mapping)}} 个变量")
                     return ToolResult(success=False, output="", error="get_psi需要指定mth_col/base_mth/cmp_mth")
                 bm.mth_col, bm.base_mth, bm.cmp_mth = mth_col, base_mth, cmp_mth
                 psi_data = bm.get_psi()
+                exposed.update(psi_data=psi_data)
                 output_files.append(f"  ✅ {output_path}/psi_single_rpt_*.xlsx")
                 result_text = f"PSI数据:\n{psi_data.to_string()}"
                 script_code = f'''import pandas as pd
@@ -202,6 +217,7 @@ print(psi_data)
                     return ToolResult(success=False, output="", error="psi_mth_avg需要指定mth_col/base_mth")
                 bm.mth_col, bm.base_mth = mth_col, base_mth
                 psi_avg_data = bm.psi_mth_avg()
+                exposed.update(psi_avg_data=psi_avg_data)
                 output_files.append(f"  ✅ {output_path}/psi_avg_rpt_*.xlsx")
                 result_text = f"PSI月均值:\n{psi_avg_data.to_string()}"
                 script_code = f'''import pandas as pd
@@ -246,6 +262,9 @@ print("图表已保存到 {output_path}/")
             else:
                 return ToolResult(success=False, output="", error=f"未知方法: {method}")
 
+            # 结果变量注入 python 会话（bm/df/woe_data/iv_data 等，python 工具可直接使用）
+            self._expose(**exposed)
+
             # 保存可复现源码
             if script_code:
                 save_script(output_path, f"run_{method}.py", script_code)
@@ -254,7 +273,8 @@ print("图表已保存到 {output_path}/")
             output = (
                 f"📊 cbhpacks_bins_model.{method} 执行完成\n\n"
                 f"📁 输出文件:\n" + "\n".join(output_files) + "\n\n"
-                f"📋 结果:\n{result_text}"
+                f"📋 结果:\n{result_text}\n\n"
+                f"💡 已注入 python 会话变量: {', '.join(exposed.keys())}"
             )
             return ToolResult(success=True, output=output)
 

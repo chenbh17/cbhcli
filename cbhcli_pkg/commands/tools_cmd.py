@@ -7,7 +7,9 @@ from cbhcli_pkg.commands.parser import SlashCommand
 
 # 内置工具定义：(工具名, 中文描述, 分类)
 BUILTIN_TOOLS = [
-    ("terminal",        "执行终端命令",                 "文件操作"),
+    ("terminal",        "执行终端命令(超时转后台)",      "文件操作"),
+    ("process",         "监控后台任务进度",              "文件操作"),
+    ("kill_process",    "终止后台任务",                  "文件操作"),
     ("read",            "读取文件内容",                 "文件操作"),
     ("write",           "写入文件",                     "文件操作"),
     ("edit",            "精确替换文件内容",             "文件操作"),
@@ -299,6 +301,14 @@ def _write_tools_md(workspace: Path, disabled: list) -> None:
         "## 工具调用说明",
         "所有工具的详细参数定义通过 API 的 Function Calling 协议自动获取，你只需根据参数 schema 正确传参即可。",
         "MCP 扩展工具名称格式为 `mcp_服务器名_工具名`，使用方式与内置工具完全相同。",
+        "",
+        "## 后台任务管理（terminal 超时）",
+        "terminal 命令超过 timeout(默认30秒) 未完成时进程**不会被终止**，而是转为后台任务继续运行：",
+        "- **立即使用 process 工具**（task_id）实时监控进度，等待任务完成并获取全部输出",
+        "- 监控期间用户可 Ctrl+C 停止监控（任务仍继续运行）",
+        "- 任务运行满 1 小时将自动终止",
+        "- 用户要求终止或任务失控时，使用 kill_process 工具（task_id）手动终止",
+        "- 不传参数的 process 工具可列出所有后台任务",
         "",
     ]
 
