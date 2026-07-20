@@ -1,17 +1,23 @@
-"""CBHCLI Web Server - FastAPI backend"""
+"""CBHCLI Web Server - FastAPI backend (v2 重构版)
+
+与 CLI 端逻辑完全对齐：
+- WebChatSession 统一封装会话状态（工具注册表/MCP/技能/上下文压缩组件）
+- ReAct 循环：Function Calling + 自我反思重试 + 循环内自动压缩 + 备用模型切换
+- 工具确认 / ask_user 通过 SSE 事件 + /api/chat/respond 应答队列实现
+- 管理 API：模型/备用模型/Agent/技能/MCP/工具/知识库/向量索引/历史会话/设置
+"""
 import json
 import asyncio
 import threading
 import os
 import uuid
 import base64
-import shutil
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -39,7 +45,10 @@ from cbhcli_pkg.tools.process import ProcessTool
 from cbhcli_pkg.tools.kill_process import KillProcessTool
 from cbhcli_pkg.core.mcp_manager import MCPManager
 from cbhcli_pkg.core.skill_manager import SkillManager
-from cbhcli_pkg.core.constants import MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE
+from cbhcli_pkg.core.constants import (
+    MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE,
+    MAX_REFLECTION_RETRIES,
+)
 from cbhcli_pkg.core.embedding_client import EmbeddingClient
 from cbhcli_pkg.core.rerank_client import RerankClient
 from cbhcli_pkg.core.subagent import SubAgentScheduler
@@ -54,7 +63,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.9.3")
+app = FastAPI(title="CBHCLI Web", version="4.9.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,36 +73,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global state
+
+# ===================================================================
+#  Global State
+# ===================================================================
+
 _global_config: Optional[GlobalConfig] = None
 _agent_manager: Optional[AgentManager] = None
 _vector_store: Optional[VectorStore] = None
 _memory_indexer: Optional[MemoryIndexer] = None
 _embedding_client = None
 _rerank_client = None
+_vector_init_attempted = False
 
-
-class _WebAgentContext:
-    """Mutable proxy that holds per-session state for tools that need app-level references.
-
-    Used by KnowledgeBaseTool, MemorySearchTool (current_agent_name) and
-    DelegateTaskTool (subagent_scheduler, llm_client, tool_executor, token_counter).
-    """
-    def __init__(self, agent_name: str):
-        self.current_agent_name = agent_name
-        self.is_web = True
-        # Populated after session creation for delegate_task
-        self.subagent_scheduler = None
-        self.llm_client = None
-        self.tool_executor = None
-        self.token_counter = None
-        # Populated after session creation for skills_create
-        self.skill_manager = None
-        # Populated after session creation for context compression
-        self.context_compressor = None
-        self.context_window = None
-        self.auto_compress = True
-        self.current_agent_config = None
+# 活跃聊天会话: session_key(agent:model) -> WebChatSession
+_chat_sessions: dict[str, 'WebChatSession'] = {}
+# MCP 管理器缓存（管理 API 专用，带独立注册表）: agent_name -> MCPManager
+_mcp_managers: dict[str, MCPManager] = {}
 
 
 def get_config() -> GlobalConfig:
@@ -115,15 +111,16 @@ def get_agent_manager() -> AgentManager:
 
 
 def _init_vector_store():
-    """Initialize vector store, embedding client, rerank client (once, lazily)."""
+    """懒初始化向量库/嵌入/重排序客户端（只尝试一次）。"""
     global _vector_store, _memory_indexer, _embedding_client, _rerank_client
+    global _vector_init_attempted
 
-    if _embedding_client is not None or _vector_store is not None:
-        return  # already initialized or attempted
+    if _vector_init_attempted:
+        return
+    _vector_init_attempted = True
 
     config = get_config()
 
-    # Embedding client
     embedding_config = config.get_embedding_model()
     if embedding_config and embedding_config.get("apiKey"):
         try:
@@ -131,7 +128,6 @@ def _init_vector_store():
         except Exception:
             _embedding_client = None
 
-    # Rerank client
     rerank_config = config.get_rerank_model()
     if rerank_config and rerank_config.get("apiKey"):
         try:
@@ -139,7 +135,6 @@ def _init_vector_store():
         except Exception:
             _rerank_client = None
 
-    # Vector store (requires embedding client)
     if _embedding_client:
         try:
             vector_dir = Path.home() / ".cbhcli" / "vectors"
@@ -150,12 +145,47 @@ def _init_vector_store():
             _memory_indexer = None
 
 
-# Tools that skip confirmation (read-only / interactive)
-_READONLY_TOOLS = {"grep", "glob", "ask_user", "read", "Todo", "memory_search", "knowledge_base", "delegate_task"}
+def _reset_vector_store():
+    """嵌入/重排序模型配置变更后调用，下次使用时重建。"""
+    global _vector_store, _memory_indexer, _embedding_client, _rerank_client
+    global _vector_init_attempted
+    _vector_store = None
+    _memory_indexer = None
+    _embedding_client = None
+    _rerank_client = None
+    _vector_init_attempted = False
 
 
-def _get_tool_registry(agent_name: str = "", app_proxy: '_WebAgentContext' = None) -> ToolRegistry:
-    """Create and populate a ToolRegistry with standard tools."""
+# ===================================================================
+#  工具注册表构建
+# ===================================================================
+
+# 只读/交互工具 — 无需用户确认
+_READONLY_TOOLS = {
+    "grep", "glob", "ask_user", "read", "Todo",
+    "memory_search", "knowledge_base", "delegate_task",
+}
+
+
+class _WebAgentContext:
+    """会话级可变代理，为需要 app 级引用的工具提供上下文。"""
+
+    def __init__(self, agent_name: str):
+        self.current_agent_name = agent_name
+        self.is_web = True
+        self.subagent_scheduler = None
+        self.llm_client = None
+        self.tool_executor = None
+        self.token_counter = None
+        self.skill_manager = None
+        self.context_compressor = None
+        self.context_window = None
+        self.auto_compress = True
+        self.current_agent_config = None
+
+
+def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext) -> ToolRegistry:
+    """构建完整工具注册表（内置工具 + cbhpacks + 知识库/记忆/子Agent）。"""
     _init_vector_store()
 
     registry = ToolRegistry()
@@ -171,25 +201,22 @@ def _get_tool_registry(agent_name: str = "", app_proxy: '_WebAgentContext' = Non
     registry.register(KillProcessTool())
     registry.register(PythonTool("default"))
 
-    # Register knowledge_base, memory_search, delegate_task, skills_create tools
-    ctx = app_proxy or (_WebAgentContext(agent_name) if agent_name else None)
     registry.register(MemorySearchTool(
         vector_store=_vector_store,
         agent_manager=get_agent_manager(),
-        app=ctx,
+        app=app_proxy,
     ))
     registry.register(KnowledgeBaseTool(
         vector_store=_vector_store,
         agent_manager=get_agent_manager(),
         rerank_client=_rerank_client,
-        app=ctx,
+        app=app_proxy,
     ))
-    if ctx:
-        registry.register(DelegateTaskTool(ctx))
-        registry.register(SkillsCreateTool(ctx))
-        registry.register(ImageTool(ctx))
+    registry.register(DelegateTaskTool(app_proxy))
+    registry.register(SkillsCreateTool(app_proxy))
+    registry.register(ImageTool(app_proxy))
 
-    # Register cbhpacks tools
+    # cbhpacks 数据科学工具
     from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
     from cbhcli_pkg.tools.cbhpacks_training import BinaryModelTool, UnsModelTool, LinearModelTool
     from cbhcli_pkg.tools.cbhpacks_select import ColsSelectTool, ColsSelectJsTool
@@ -213,7 +240,7 @@ def _get_tool_registry(agent_name: str = "", app_proxy: '_WebAgentContext' = Non
     registry.register(ConLinuxTool())
     registry.register(GetRandomDataTool())
 
-    # Apply disabled tools from agent config
+    # 应用 Agent 配置中的禁用工具
     if agent_name:
         config = get_agent_manager().load_agent(agent_name)
         if config and config.disabled_tools:
@@ -222,25 +249,297 @@ def _get_tool_registry(agent_name: str = "", app_proxy: '_WebAgentContext' = Non
     return registry
 
 
+# ===================================================================
+#  WebChatSession — 统一会话封装
+# ===================================================================
+
+class WebChatSession:
+    """封装一个 (agent, model) 聊天会话的全部状态。"""
+
+    def __init__(self, agent_name: str, model_name: str):
+        self.agent_name = agent_name
+        self.model_name = model_name
+        self.session_key = f"{agent_name}:{model_name}"
+
+        self.agent_config: Optional[AgentConfig] = None
+        self.session: Optional[Session] = None
+        self.llm_client: Optional[LLMClient] = None
+        self.tool_registry: Optional[ToolRegistry] = None
+        self.mcp_manager: Optional[MCPManager] = None
+        self.skill_manager: Optional[SkillManager] = None
+        self.app_proxy: Optional[_WebAgentContext] = None
+        self.context_compressor: Optional[ContextCompressor] = None
+        self.context_window: Optional[ContextWindow] = None
+        self.token_counter = None
+
+        self.auto_compress = True
+        self.no_more_confirmations = False
+        self.abort = False
+
+        # asyncio 原语（在首次使用时绑定到运行中的事件循环）
+        self.respond_queue: Optional[asyncio.Queue] = None
+        self.lock: Optional[asyncio.Lock] = None
+
+    # --------------------------------------------------------------
+    #  构造
+    # --------------------------------------------------------------
+
+    @classmethod
+    def create(cls, agent_name: str, model_name: str) -> 'WebChatSession':
+        """完整初始化会话（工具/MCP/技能/系统提示/压缩组件）。"""
+        config = get_config()
+        manager = get_agent_manager()
+
+        model_config = config.get_model(model_name)
+        if not model_config:
+            raise HTTPException(400, f"模型 '{model_name}' 不存在")
+        agent_config = manager.load_agent(agent_name)
+        if not agent_config:
+            raise HTTPException(400, f"Agent '{agent_name}' 不存在")
+
+        cs = cls(agent_name, model_name)
+        cs.agent_config = agent_config
+        cs.session = Session(agent_name=agent_name)
+        cs.llm_client = LLMClient(model_config)
+        cs.token_counter = get_token_counter()
+        cs.auto_compress = agent_config.auto_compress
+        cs.respond_queue = asyncio.Queue()
+        cs.lock = asyncio.Lock()
+
+        # 工具上下文代理
+        cs.app_proxy = _WebAgentContext(agent_name)
+        cs._rebuild_tools()
+
+        # 注入 delegate_task 所需引用
+        cs.app_proxy.llm_client = cs.llm_client
+        cs.app_proxy.subagent_scheduler = SubAgentScheduler()
+        cs.app_proxy.token_counter = cs.token_counter
+
+        # 技能
+        try:
+            cs.skill_manager = SkillManager(agent_config.workspace_path)
+        except Exception:
+            cs.skill_manager = None
+        cs.app_proxy.skill_manager = cs.skill_manager
+
+        # 系统提示
+        cs._rebuild_system_prompt()
+
+        # 上下文压缩组件
+        cs.context_compressor = ContextCompressor(cs.llm_client, cs.token_counter)
+        tools_schema_tokens = cs.token_counter.count_tokens(
+            json.dumps(cs.tool_registry.get_openai_tools(), ensure_ascii=False)
+        ) if cs.tool_registry.get_openai_tools() else 0
+        cs.context_window = ContextWindow(
+            model_limit=cs.llm_client.context_limit,
+            compression_ratio=agent_config.context_limit_ratio or 0.8,
+            tools_schema_tokens=tools_schema_tokens,
+        )
+        cs.app_proxy.context_compressor = cs.context_compressor
+        cs.app_proxy.context_window = cs.context_window
+        cs.app_proxy.auto_compress = cs.auto_compress
+        cs.app_proxy.current_agent_config = agent_config
+
+        return cs
+
+    def _rebuild_tools(self):
+        """重建工具注册表和 MCP 管理器（MCP 配置变更后同步调用）。"""
+        self.tool_registry = _build_tool_registry(self.agent_name, self.app_proxy)
+        self.app_proxy.tool_executor = ToolExecutor(self.tool_registry)
+
+        self.mcp_manager = None
+        try:
+            self.mcp_manager = MCPManager(
+                self.agent_name, self.agent_config.workspace_path, self.tool_registry
+            )
+        except Exception:
+            pass
+
+        # 更新 tools schema token 数
+        if self.context_window and self.token_counter:
+            try:
+                self.context_window.tools_schema_tokens = self.token_counter.count_tokens(
+                    json.dumps(self.tool_registry.get_openai_tools(), ensure_ascii=False)
+                )
+            except Exception:
+                pass
+
+    def rebuild_tools_sync(self):
+        """供管理 API 调用：工具开关 / MCP 配置变更后同步会话工具。"""
+        try:
+            self._rebuild_tools()
+        except Exception:
+            pass
+
+    def _rebuild_system_prompt(self):
+        """重建系统提示（首条 system 消息）。"""
+        manager = get_agent_manager()
+        persona = manager.load_agent_persona(self.agent_name)
+        active_skills_prompt = ""
+        if self.skill_manager:
+            try:
+                active_skills_prompt = self.skill_manager.build_skills_prompt()
+            except Exception:
+                pass
+        system_prompt = persona.build_system_prompt(
+            agent_name=self.agent_name,
+            model_name=self.model_name,
+            active_skills_prompt=active_skills_prompt,
+            cwd=os.getcwd(),
+            supports_vision=getattr(self.llm_client, "supports_vision", False),
+        )
+        # 替换或插入首条 system 消息
+        if self.session.messages and self.session.messages[0].role == "system":
+            self.session.messages[0].content = system_prompt
+        else:
+            self.session.add_message("system", system_prompt)
+
+    # --------------------------------------------------------------
+    #  应答等待（工具确认 / ask_user）
+    # --------------------------------------------------------------
+
+    async def wait_response(self, timeout: float = 600.0) -> Optional[str]:
+        """等待前端应答，支持中断。返回 None 表示超时或被中断。"""
+        # 清空过期应答
+        while not self.respond_queue.empty():
+            try:
+                self.respond_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        elapsed = 0.0
+        interval = 0.5
+        while elapsed < timeout:
+            if self.abort:
+                return None
+            try:
+                return await asyncio.wait_for(self.respond_queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                elapsed += interval
+        return None
+
+    # --------------------------------------------------------------
+    #  状态导出
+    # --------------------------------------------------------------
+
+    def usage_stats(self) -> dict:
+        total = self.session.get_total_tokens(self.token_counter)
+        self.context_window.update(total)
+        return {
+            "token_estimate": total,
+            "model_limit": self.context_window.model_limit,
+            "ctx_percentage": round(self.context_window.usage_percentage() * 100, 1),
+            "remaining_tokens": self.context_window.remaining_tokens(),
+            "message_count": len(self.session.messages),
+            "tool_call_count": self.session.tool_call_count,
+            "auto_compress": self.auto_compress,
+            "compression_ratio": self.context_window.compression_ratio,
+        }
+
+    def export_messages(self) -> list[dict]:
+        """导出为前端可恢复的展示结构（assistant 消息聚合 tool 结果）。"""
+        result = []
+        for m in self.session.messages:
+            if m.role == "system":
+                continue
+            if m.role == "user":
+                result.append({
+                    "role": "user",
+                    "content": m.content or "",
+                    "image_count": len(m.images) if m.images else 0,
+                })
+            elif m.role == "assistant":
+                tool_calls = []
+                if m.tool_calls:
+                    for tc in m.tool_calls:
+                        func = tc.get("function", {})
+                        try:
+                            args = json.loads(func.get("arguments", "{}"))
+                        except Exception:
+                            args = {}
+                        tool_calls.append({
+                            "id": tc.get("id", ""),
+                            "name": func.get("name", ""),
+                            "arguments": args,
+                            "result": None,
+                            "success": None,
+                        })
+                result.append({
+                    "role": "assistant",
+                    "content": m.content or "",
+                    "reasoning": m.reasoning_content or "",
+                    "tool_calls": tool_calls,
+                })
+            elif m.role == "tool":
+                # 挂到最近一条 assistant 的对应 tool_call 上
+                tcid = m.tool_call_id or ""
+                for item in reversed(result):
+                    if item["role"] != "assistant":
+                        continue
+                    for tc in item["tool_calls"]:
+                        if tc["id"] == tcid:
+                            tc["result"] = (m.content or "")[:2000]
+                            tc["success"] = (m.metadata or {}).get("success")
+                            break
+                    break
+        return result
+
+
+def _get_session_key(agent_name: str, model_name: str) -> str:
+    return f"{agent_name}:{model_name}"
+
+
+def _get_or_create_session(agent_name: str, model_name: str) -> WebChatSession:
+    key = _get_session_key(agent_name, model_name)
+    cs = _chat_sessions.get(key)
+    if cs is None:
+        cs = WebChatSession.create(agent_name, model_name)
+        _chat_sessions[key] = cs
+    return cs
+
+
+def _sync_agent_tool_change(agent_name: str, full_rebuild: bool = False):
+    """工具开关/MCP 变更后同步到该 Agent 的所有活跃会话。"""
+    for cs in _chat_sessions.values():
+        if cs.agent_name != agent_name:
+            continue
+        try:
+            if full_rebuild:
+                cs.rebuild_tools_sync()
+            else:
+                config = get_agent_manager().load_agent(agent_name)
+                if config and cs.tool_registry:
+                    cs.tool_registry.set_disabled_tools(config.disabled_tools or [])
+        except Exception:
+            pass
+
+
 def _get_agent_workspace(agent_name: str) -> Path:
-    """Get agent workspace path, raise 404 if not found."""
     manager = get_agent_manager()
     config = manager.load_agent(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
     return config.workspace_path
 
 
-def _get_agent_config(agent_name: str):
-    """Get agent config, return None if not found."""
-    manager = get_agent_manager()
-    return manager.load_agent(agent_name)
+def _get_agent_config(agent_name: str) -> Optional[AgentConfig]:
+    return get_agent_manager().load_agent(agent_name)
 
 
-def _save_agent_config(config):
-    """Save agent config."""
-    manager = get_agent_manager()
-    manager._save_config(config)
+def _save_agent_config(config: AgentConfig):
+    get_agent_manager()._save_config(config)
+
+
+def _get_mcp_manager(agent_name: str) -> MCPManager:
+    """管理 API 专用 MCP 管理器（带独立注册表，按 Agent 缓存）。"""
+    if agent_name not in _mcp_managers:
+        workspace = _get_agent_workspace(agent_name)
+        _mcp_managers[agent_name] = MCPManager(agent_name, workspace, ToolRegistry())
+    return _mcp_managers[agent_name]
+
+
+def _invalidate_mcp_manager(agent_name: str):
+    _mcp_managers.pop(agent_name, None)
 
 
 # ===================================================================
@@ -254,6 +553,11 @@ class ModelConfig(BaseModel):
     model: str
     context_limit: int = 128000
     vision: bool = False
+    temperature: Optional[float] = None  # 模型专属温度（None 使用全局默认）
+
+    def to_config_dict(self) -> dict:
+        """转为存储配置（None 字段不写入，避免覆盖已有配置）。"""
+        return self.model_dump(exclude_none=True)
 
 
 class EmbeddingModelConfig(BaseModel):
@@ -322,8 +626,53 @@ class KnowledgeAdd(BaseModel):
     file_path: str
 
 
-class MCPToolToggle(BaseModel):
+class Toggle(BaseModel):
     enable: bool
+
+
+class FallbackAdd(BaseModel):
+    category: str  # main | vision
+    model_name: str
+
+
+class FallbackReorder(BaseModel):
+    order: list[str]
+
+
+# ===================================================================
+#  API: System Info / Settings
+# ===================================================================
+
+@app.get("/api/info")
+def get_info():
+    from cbhcli_pkg import __version__
+    config = get_config()
+    manager = get_agent_manager()
+    return {
+        "version": __version__,
+        "config_dir": str(CBHCLI_DIR),
+        "agents_count": len(manager.list_agents()),
+        "models_count": len(config.get_models()),
+        "active_agent": config.get_active_agent(),
+        "last_model": config.get_last_selected_model(),
+    }
+
+
+@app.get("/api/settings")
+def get_settings():
+    config = get_config()
+    return {
+        "settings": config.get_settings(),
+        "config_dir": str(CBHCLI_DIR),
+    }
+
+
+@app.put("/api/settings")
+def update_settings(update: SettingsUpdate):
+    config = get_config()
+    for key, val in update.model_dump(exclude_none=True).items():
+        config.update_setting(key, val)
+    return {"message": "设置已更新"}
 
 
 # ===================================================================
@@ -345,69 +694,161 @@ def list_models():
 def add_model(model: ModelConfig):
     config = get_config()
     if config.get_model(model.name):
-        raise HTTPException(400, f"Model '{model.name}' already exists")
-    config.add_model(model.model_dump())
-    return {"message": f"Model '{model.name}' added"}
+        raise HTTPException(400, f"模型 '{model.name}' 已存在")
+    config.add_model(model.to_config_dict())
+    return {"message": f"模型 '{model.name}' 已添加"}
 
 
-# --- Embedding Model (must be before {model_name} routes) ---
 @app.put("/api/models/embedding")
 def update_embedding_model(model: EmbeddingModelConfig):
     config = get_config()
     config.set_embedding_model(model.model_dump())
-    return {"message": "Embedding model updated"}
+    _reset_vector_store()
+    return {"message": "嵌入模型已更新"}
 
 
 @app.delete("/api/models/embedding")
 def delete_embedding_model():
     config = get_config()
     config.delete_embedding_model()
-    return {"message": "Embedding model deleted"}
+    _reset_vector_store()
+    return {"message": "嵌入模型已删除"}
 
 
-# --- Rerank Model (must be before {model_name} routes) ---
 @app.put("/api/models/rerank")
 def update_rerank_model(model: RerankModelConfig):
     config = get_config()
     config.set_rerank_model(model.model_dump())
-    return {"message": "Rerank model updated"}
+    _reset_vector_store()
+    return {"message": "重排序模型已更新"}
 
 
 @app.delete("/api/models/rerank")
 def delete_rerank_model():
     config = get_config()
     config.delete_rerank_model()
-    return {"message": "Rerank model deleted"}
+    _reset_vector_store()
+    return {"message": "重排序模型已删除"}
 
 
-# --- Generic model CRUD (parameterized, must come after specific routes) ---
 @app.put("/api/models/{model_name}")
 def update_model(model_name: str, model: ModelConfig):
     config = get_config()
     models = config.get_models()
     for i, m in enumerate(models):
         if m.get("name") == model_name:
-            models[i] = model.model_dump()
+            models[i] = model.to_config_dict()
             config.save()
-            return {"message": f"Model '{model_name}' updated"}
-    raise HTTPException(404, f"Model '{model_name}' not found")
+            return {"message": f"模型 '{model_name}' 已更新"}
+    raise HTTPException(404, f"模型 '{model_name}' 不存在")
 
 
 @app.delete("/api/models/{model_name}")
 def delete_model(model_name: str):
     config = get_config()
     if config.delete_model(model_name):
-        return {"message": f"Model '{model_name}' deleted"}
-    raise HTTPException(404, f"Model '{model_name}' not found")
+        return {"message": f"模型 '{model_name}' 已删除"}
+    raise HTTPException(404, f"模型 '{model_name}' 不存在")
 
 
 @app.post("/api/models/{model_name}/select")
 def select_model(model_name: str):
     config = get_config()
     if not config.get_model(model_name):
-        raise HTTPException(404, f"Model '{model_name}' not found")
+        raise HTTPException(404, f"模型 '{model_name}' 不存在")
     config.set_last_selected_model(model_name)
-    return {"message": f"Selected model '{model_name}'"}
+    return {"message": f"已选择模型 '{model_name}'"}
+
+
+# ===================================================================
+#  API: Fallback Models (备用模型)
+# ===================================================================
+
+@app.get("/api/fallback")
+def get_fallback():
+    config = get_config()
+    models = config.get_models()
+    return {
+        "main": config.get_fallback_models(),
+        "vision": config.get_fallback_vision_models(),
+        "available_models": [
+            {"name": m.get("name", ""), "vision": m.get("vision", False)}
+            for m in models
+        ],
+    }
+
+
+@app.post("/api/fallback")
+def add_fallback(body: FallbackAdd):
+    config = get_config()
+    category = body.category.lower()
+    if category not in ("main", "vision"):
+        raise HTTPException(400, "类别必须是 main 或 vision")
+
+    model = config.get_model(body.model_name)
+    if not model:
+        raise HTTPException(404, f"模型 '{body.model_name}' 不存在")
+    if category == "vision" and not model.get("vision", False):
+        raise HTTPException(400, f"模型 '{body.model_name}' 不支持视觉功能")
+
+    lst = config.get_fallback_models() if category == "main" else config.get_fallback_vision_models()
+    if body.model_name in lst:
+        raise HTTPException(400, f"模型 '{body.model_name}' 已在备用列表中")
+
+    lst.append(body.model_name)
+    if category == "main":
+        config.set_fallback_models(lst)
+    else:
+        config.set_fallback_vision_models(lst)
+    return {"message": f"已添加 '{body.model_name}' 到 {category} 备用列表"}
+
+
+@app.delete("/api/fallback/{category}")
+def clear_fallback(category: str):
+    config = get_config()
+    category = category.lower()
+    if category == "main":
+        config.set_fallback_models([])
+    elif category == "vision":
+        config.set_fallback_vision_models([])
+    else:
+        raise HTTPException(400, "类别必须是 main 或 vision")
+    return {"message": f"已清空 {category} 备用列表"}
+
+
+@app.delete("/api/fallback/{category}/{model_name}")
+def remove_fallback(category: str, model_name: str):
+    config = get_config()
+    category = category.lower()
+    if category not in ("main", "vision"):
+        raise HTTPException(400, "类别必须是 main 或 vision")
+
+    lst = config.get_fallback_models() if category == "main" else config.get_fallback_vision_models()
+    if model_name not in lst:
+        raise HTTPException(404, f"模型 '{model_name}' 不在备用列表中")
+    lst.remove(model_name)
+    if category == "main":
+        config.set_fallback_models(lst)
+    else:
+        config.set_fallback_vision_models(lst)
+    return {"message": f"已移除 '{model_name}'"}
+
+
+@app.put("/api/fallback/{category}/reorder")
+def reorder_fallback(category: str, body: FallbackReorder):
+    config = get_config()
+    category = category.lower()
+    if category not in ("main", "vision"):
+        raise HTTPException(400, "类别必须是 main 或 vision")
+
+    lst = config.get_fallback_models() if category == "main" else config.get_fallback_vision_models()
+    if sorted(body.order) != sorted(lst):
+        raise HTTPException(400, "新顺序必须包含且仅包含当前列表中的所有模型")
+    if category == "main":
+        config.set_fallback_models(list(body.order))
+    else:
+        config.set_fallback_vision_models(list(body.order))
+    return {"message": f"{category} 备用顺序已更新"}
 
 
 # ===================================================================
@@ -419,10 +860,9 @@ def list_agents():
     manager = get_agent_manager()
     config = get_config()
     agents = manager.list_agents()
-    active = config.get_active_agent()
     return {
         "agents": [a.to_dict() for a in agents],
-        "active_agent": active,
+        "active_agent": config.get_active_agent(),
     }
 
 
@@ -430,13 +870,13 @@ def list_agents():
 def create_agent(agent: AgentCreate):
     manager = get_agent_manager()
     if manager.load_agent(agent.name):
-        raise HTTPException(400, f"Agent '{agent.name}' already exists")
+        raise HTTPException(400, f"Agent '{agent.name}' 已存在")
     config = manager.create_agent(
         name=agent.name,
         description=agent.description,
         primary_model=agent.primary_model,
     )
-    return {"message": f"Agent '{agent.name}' created", "agent": config.to_dict()}
+    return {"message": f"Agent '{agent.name}' 已创建", "agent": config.to_dict()}
 
 
 @app.get("/api/agents/{agent_name}")
@@ -444,17 +884,15 @@ def get_agent(agent_name: str):
     manager = get_agent_manager()
     config = manager.load_agent(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
     workspace = config.workspace_path
-
     files = {}
     for fname in ["soul.md", "tools.md", "memory.md", "usage.md"]:
         fpath = workspace / fname
         if fpath.exists():
             files[fname] = fpath.read_text(encoding="utf-8")
 
-    # Skills summary
     skills = []
     skills_dir = workspace / "skills"
     if skills_dir.exists():
@@ -465,9 +903,8 @@ def get_agent(agent_name: str):
                     "content": (d / "skills.md").read_text(encoding="utf-8")[:200],
                 })
 
-    # MCP config
-    mcp_config_file = workspace / "mcp.json"
     mcp_servers = []
+    mcp_config_file = workspace / "mcp.json"
     if mcp_config_file.exists():
         try:
             data = json.loads(mcp_config_file.read_text(encoding="utf-8"))
@@ -488,7 +925,7 @@ def update_agent(agent_name: str, update: AgentUpdate):
     manager = get_agent_manager()
     config = manager.load_agent(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
     data = config.to_dict()
     for key, val in update.model_dump(exclude_none=True).items():
@@ -499,15 +936,20 @@ def update_agent(agent_name: str, update: AgentUpdate):
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(new_config.to_dict(), f, indent=2, ensure_ascii=False)
 
-    return {"message": f"Agent '{agent_name}' updated"}
+    return {"message": f"Agent '{agent_name}' 已更新"}
 
 
 @app.delete("/api/agents/{agent_name}")
 def delete_agent(agent_name: str):
     manager = get_agent_manager()
+    # 清理该 Agent 的活跃会话与 MCP 管理器缓存
+    for key in [k for k, cs in _chat_sessions.items() if cs.agent_name == agent_name]:
+        del _chat_sessions[key]
+    _invalidate_mcp_manager(agent_name)
+
     if manager.delete_agent(agent_name):
-        return {"message": f"Agent '{agent_name}' deleted"}
-    raise HTTPException(404, f"Agent '{agent_name}' not found")
+        return {"message": f"Agent '{agent_name}' 已删除"}
+    raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
 
 @app.post("/api/agents/{agent_name}/select")
@@ -515,25 +957,33 @@ def select_agent(agent_name: str):
     manager = get_agent_manager()
     config = get_config()
     if not manager.load_agent(agent_name):
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
     config.set_active_agent(agent_name)
-    return {"message": f"Switched to Agent '{agent_name}'"}
+    return {"message": f"已切换到 Agent '{agent_name}'"}
 
 
 @app.put("/api/agents/{agent_name}/files/{filename}")
 def update_agent_file(agent_name: str, filename: str, body: FileContent):
-    manager = get_agent_manager()
-    config = manager.load_agent(agent_name)
+    config = _get_agent_config(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
     allowed = {"soul.md", "tools.md", "memory.md", "usage.md"}
     if filename not in allowed:
-        raise HTTPException(400, f"Cannot edit file: {filename}")
+        raise HTTPException(400, f"不允许编辑文件: {filename}")
 
     fpath = config.workspace_path / filename
     fpath.write_text(body.content, encoding="utf-8")
-    return {"message": f"{filename} updated"}
+
+    # 系统提示包含这些文件内容，同步刷新活跃会话
+    for cs in _chat_sessions.values():
+        if cs.agent_name == agent_name:
+            try:
+                cs._rebuild_system_prompt()
+            except Exception:
+                pass
+
+    return {"message": f"{filename} 已更新"}
 
 
 # ===================================================================
@@ -543,7 +993,6 @@ def update_agent_file(agent_name: str, filename: str, body: FileContent):
 @app.get("/api/agents/{agent_name}/skills")
 def list_skills(agent_name: str):
     workspace = _get_agent_workspace(agent_name)
-    from cbhcli_pkg.core.skill_manager import SkillManager
     sm = SkillManager(workspace)
     skills = sm.list_skills()
     active_names = sm.get_active_skill_names()
@@ -554,7 +1003,8 @@ def list_skills(agent_name: str):
                 "active": s.name in active_names,
                 "has_scripts": s.has_scripts,
                 "scripts": s.list_scripts(),
-                "prompt_preview": s.prompt[:300] if s.prompt else "",
+                "prompt": s.prompt or "",
+                "prompt_preview": (s.prompt or "")[:300],
             }
             for s in skills
         ],
@@ -565,158 +1015,100 @@ def list_skills(agent_name: str):
 @app.post("/api/agents/{agent_name}/skills/activate")
 def activate_skills(agent_name: str, body: SkillActivate):
     workspace = _get_agent_workspace(agent_name)
-    from cbhcli_pkg.core.skill_manager import SkillManager
     sm = SkillManager(workspace)
     activated = sm.activate_skills(body.names)
-    return {"message": f"Activated {len(activated)} skills", "activated": activated}
+    return {"message": f"已激活 {len(activated)} 个技能", "activated": activated}
 
 
 @app.post("/api/agents/{agent_name}/skills/{skill_name}/deactivate")
 def deactivate_skill(agent_name: str, skill_name: str):
     workspace = _get_agent_workspace(agent_name)
-    from cbhcli_pkg.core.skill_manager import SkillManager
     sm = SkillManager(workspace)
     if sm.deactivate_skill(skill_name):
-        return {"message": f"Deactivated skill '{skill_name}'"}
-    raise HTTPException(404, f"Skill '{skill_name}' not found or not active")
+        return {"message": f"已取消激活技能 '{skill_name}'"}
+    raise HTTPException(404, f"技能 '{skill_name}' 不存在或未激活")
 
 
 @app.delete("/api/agents/{agent_name}/skills/{skill_name}")
 def delete_skill(agent_name: str, skill_name: str):
     workspace = _get_agent_workspace(agent_name)
-    from cbhcli_pkg.core.skill_manager import SkillManager
     sm = SkillManager(workspace)
     if sm.remove_skill(skill_name):
-        return {"message": f"Deleted skill '{skill_name}'"}
-    raise HTTPException(404, f"Skill '{skill_name}' not found")
+        return {"message": f"技能 '{skill_name}' 已删除"}
+    raise HTTPException(404, f"技能 '{skill_name}' 不存在")
 
 
 # ===================================================================
-#  API: MCP Management
+#  API: MCP Management（真实连接/刷新，与 CLI 一致）
 # ===================================================================
 
 @app.get("/api/agents/{agent_name}/mcp")
 def list_mcp_servers(agent_name: str):
-    workspace = _get_agent_workspace(agent_name)
-    mcp_config_file = workspace / "mcp.json"
-    servers = []
-    if mcp_config_file.exists():
-        try:
-            data = json.loads(mcp_config_file.read_text(encoding="utf-8"))
-            servers = data.get("servers", [])
-        except Exception:
-            pass
-    return {"servers": servers}
+    manager = _get_mcp_manager(agent_name)
+    return {"servers": manager.list_servers()}
 
 
 @app.post("/api/agents/{agent_name}/mcp")
 def add_mcp_server(agent_name: str, body: MCPServerAdd):
-    workspace = _get_agent_workspace(agent_name)
-    mcp_config_file = workspace / "mcp.json"
-    data = {"servers": []}
-    if mcp_config_file.exists():
-        try:
-            data = json.loads(mcp_config_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    servers = data.get("servers", [])
-    if any(s["name"] == body.name for s in servers):
-        raise HTTPException(400, f"MCP server '{body.name}' already exists")
-
-    servers.append({
-        "name": body.name,
-        "url": body.url,
-        "headers": body.headers or {},
-        "enabled_tools": body.enabled_tools,
-    })
-    data["servers"] = servers
-    mcp_config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"message": f"Added MCP server '{body.name}'"}
+    manager = _get_mcp_manager(agent_name)
+    msg = manager.add_server(
+        name=body.name, url=body.url,
+        headers=body.headers, enabled_tools=body.enabled_tools,
+    )
+    if "❌" in msg:
+        raise HTTPException(400, msg)
+    _sync_agent_tool_change(agent_name, full_rebuild=True)
+    return {"message": msg}
 
 
 @app.delete("/api/agents/{agent_name}/mcp/{server_name}")
 def remove_mcp_server(agent_name: str, server_name: str):
-    workspace = _get_agent_workspace(agent_name)
-    mcp_config_file = workspace / "mcp.json"
-    if not mcp_config_file.exists():
-        raise HTTPException(404, "No MCP config")
-
-    data = json.loads(mcp_config_file.read_text(encoding="utf-8"))
-    servers = data.get("servers", [])
-    new_servers = [s for s in servers if s["name"] != server_name]
-    if len(new_servers) == len(servers):
-        raise HTTPException(404, f"MCP server '{server_name}' not found")
-
-    data["servers"] = new_servers
-    mcp_config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"message": f"Removed MCP server '{server_name}'"}
+    manager = _get_mcp_manager(agent_name)
+    msg = manager.remove_server(server_name)
+    if "❌" in msg:
+        raise HTTPException(404, msg)
+    _sync_agent_tool_change(agent_name, full_rebuild=True)
+    return {"message": msg}
 
 
 @app.post("/api/agents/{agent_name}/mcp/{server_name}/refresh")
 def refresh_mcp_server(agent_name: str, server_name: str):
-    # Config-level refresh: just verify config exists
-    workspace = _get_agent_workspace(agent_name)
-    mcp_config_file = workspace / "mcp.json"
-    if not mcp_config_file.exists():
-        raise HTTPException(404, "No MCP config")
+    manager = _get_mcp_manager(agent_name)
+    msg = manager.refresh_server(server_name)
+    if "❌" in msg:
+        raise HTTPException(404, msg)
+    _sync_agent_tool_change(agent_name, full_rebuild=True)
+    return {"message": msg}
 
-    data = json.loads(mcp_config_file.read_text(encoding="utf-8"))
-    servers = data.get("servers", [])
-    if not any(s["name"] == server_name for s in servers):
-        raise HTTPException(404, f"MCP server '{server_name}' not found")
 
-    return {"message": f"MCP server '{server_name}' refresh requested (effective on next CLI session)"}
+@app.get("/api/agents/{agent_name}/mcp/{server_name}/tools")
+def list_mcp_server_tools(agent_name: str, server_name: str):
+    manager = _get_mcp_manager(agent_name)
+    tools = manager.get_all_server_tools(server_name)
+    return {"tools": tools}
 
 
 @app.put("/api/agents/{agent_name}/mcp/{server_name}/tools/{tool_name}")
-def toggle_mcp_tool(agent_name: str, server_name: str, tool_name: str, body: MCPToolToggle):
-    workspace = _get_agent_workspace(agent_name)
-    mcp_config_file = workspace / "mcp.json"
-    if not mcp_config_file.exists():
-        raise HTTPException(404, "No MCP config")
-
-    data = json.loads(mcp_config_file.read_text(encoding="utf-8"))
-    servers = data.get("servers", [])
-    server = None
-    for s in servers:
-        if s["name"] == server_name:
-            server = s
-            break
-    if not server:
-        raise HTTPException(404, f"MCP server '{server_name}' not found")
-
-    enabled_tools = server.get("enabled_tools")
-    if body.enable:
-        if enabled_tools is not None and tool_name not in enabled_tools:
-            enabled_tools.append(tool_name)
-    else:
-        if enabled_tools is None:
-            # Switch from "all enabled" to explicit list minus this tool
-            server["enabled_tools"] = []  # Frontend must re-populate
-        elif tool_name in enabled_tools:
-            enabled_tools.remove(tool_name)
-
-    data["servers"] = servers
-    mcp_config_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    action = "enabled" if body.enable else "disabled"
-    return {"message": f"Tool '{tool_name}' {action}"}
+def toggle_mcp_tool(agent_name: str, server_name: str, tool_name: str, body: Toggle):
+    manager = _get_mcp_manager(agent_name)
+    msg = manager.toggle_tool(server_name, tool_name, body.enable)
+    if "❌" in msg:
+        raise HTTPException(400, msg)
+    _sync_agent_tool_change(agent_name, full_rebuild=True)
+    return {"message": msg}
 
 
 # ===================================================================
 #  API: Tools Management
 # ===================================================================
 
-class ToolToggle(BaseModel):
-    enable: bool
-
-
 @app.get("/api/agents/{agent_name}/tools")
 def list_tools(agent_name: str):
-    """列出所有工具及其启用/禁用状态"""
     from cbhcli_pkg.commands.tools_cmd import BUILTIN_TOOLS
     config = _get_agent_config(agent_name)
-    disabled = config.disabled_tools or [] if config else []
+    if not config:
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
+    disabled = config.disabled_tools or []
 
     tools = []
     for name, desc, category in BUILTIN_TOOLS:
@@ -730,14 +1122,12 @@ def list_tools(agent_name: str):
 
 
 @app.put("/api/agents/{agent_name}/tools/{tool_name}")
-def toggle_tool(agent_name: str, tool_name: str, body: ToolToggle):
-    """启用/禁用指定工具"""
+def toggle_tool(agent_name: str, tool_name: str, body: Toggle):
     config = _get_agent_config(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
     disabled = list(config.disabled_tools or [])
-
     if body.enable:
         if tool_name in disabled:
             disabled.remove(tool_name)
@@ -747,99 +1137,137 @@ def toggle_tool(agent_name: str, tool_name: str, body: ToolToggle):
 
     config.disabled_tools = disabled
     _save_agent_config(config)
+    _sync_agent_tool_change(agent_name, full_rebuild=False)
 
-    action = "enabled" if body.enable else "disabled"
-    return {"message": f"Tool '{tool_name}' {action}", "disabled": disabled}
+    action = "启用" if body.enable else "禁用"
+    return {"message": f"工具 '{tool_name}' 已{action}", "disabled": disabled}
 
 
 # ===================================================================
 #  API: Knowledge Base Management
 # ===================================================================
 
+def _get_kb(agent_name: str):
+    _init_vector_store()
+    _get_agent_workspace(agent_name)
+    from cbhcli_pkg.core.knowledge_base import KnowledgeBase
+    return KnowledgeBase(agent_name, vector_store=_vector_store, indexer=_memory_indexer)
+
+
 @app.get("/api/agents/{agent_name}/knowledge")
 def list_knowledge(agent_name: str):
-    workspace = _get_agent_workspace(agent_name)
-    kb_dir = workspace / "knowledge"
-    if not kb_dir.exists():
-        return {"files": []}
-    files = []
-    for f in sorted(kb_dir.iterdir()):
-        if f.is_file():
-            files.append({
-                "name": f.name,
-                "size": f.stat().st_size,
-                "path": str(f),
-            })
-    return {"files": files}
+    kb = _get_kb(agent_name)
+    return {"files": kb.list_files(), "vector_enabled": _vector_store is not None}
 
 
 @app.post("/api/agents/{agent_name}/knowledge")
 def add_knowledge_file(agent_name: str, body: KnowledgeAdd):
-    _init_vector_store()
-    workspace = _get_agent_workspace(agent_name)
-    from cbhcli_pkg.core.knowledge_base import KnowledgeBase
-    kb = KnowledgeBase(agent_name, vector_store=_vector_store, indexer=_memory_indexer)
+    kb = _get_kb(agent_name)
     result = kb.add_file(body.file_path)
     if not result.get("success"):
-        raise HTTPException(400, result.get("message", "Failed"))
+        raise HTTPException(400, result.get("message", "添加失败"))
     return result
 
 
 @app.post("/api/agents/{agent_name}/knowledge/upload")
 async def upload_knowledge_file(agent_name: str, file: UploadFile = File(...)):
-    """Upload a file from browser to the agent's knowledge base."""
-    _init_vector_store()
-    workspace = _get_agent_workspace(agent_name)
+    _get_agent_workspace(agent_name)
     if not file.filename:
-        raise HTTPException(400, "No file provided")
+        raise HTTPException(400, "未提供文件")
 
     content = await file.read()
-    max_size = 50 * 1024 * 1024  # 50MB limit
+    max_size = 50 * 1024 * 1024
     if len(content) > max_size:
-        raise HTTPException(400, "File too large (max 50MB)")
+        raise HTTPException(400, "文件过大（最大 50MB）")
 
-    # Save to a temp location, then use KnowledgeBase.add_file
     upload_dir = CBHCLI_DIR / "web_uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     safe_name = file.filename.replace("/", "_").replace("\\", "_")
     temp_path = upload_dir / safe_name
     temp_path.write_bytes(content)
 
-    from cbhcli_pkg.core.knowledge_base import KnowledgeBase
-    kb = KnowledgeBase(agent_name, vector_store=_vector_store, indexer=_memory_indexer)
+    kb = _get_kb(agent_name)
     result = kb.add_file(str(temp_path))
 
-    # Clean up temp file
     try:
         temp_path.unlink()
     except Exception:
         pass
 
     if not result.get("success"):
-        raise HTTPException(400, result.get("message", "Failed"))
+        raise HTTPException(400, result.get("message", "添加失败"))
     return result
 
 
 @app.delete("/api/agents/{agent_name}/knowledge/{file_name}")
 def remove_knowledge_file(agent_name: str, file_name: str):
-    _init_vector_store()
-    workspace = _get_agent_workspace(agent_name)
-    from cbhcli_pkg.core.knowledge_base import KnowledgeBase
-    kb = KnowledgeBase(agent_name, vector_store=_vector_store, indexer=_memory_indexer)
+    kb = _get_kb(agent_name)
     result = kb.remove_file(file_name)
     if not result.get("success"):
-        raise HTTPException(404, result.get("message", "Not found"))
+        raise HTTPException(404, result.get("message", "文件不存在"))
     return result
 
 
 @app.post("/api/agents/{agent_name}/knowledge/reindex")
 def reindex_knowledge(agent_name: str):
+    kb = _get_kb(agent_name)
+    return kb.reindex_all()
+
+
+# ===================================================================
+#  API: Embedding / Vector Index
+# ===================================================================
+
+@app.get("/api/agents/{agent_name}/embedding/status")
+def embedding_status(agent_name: str):
     _init_vector_store()
     _get_agent_workspace(agent_name)
-    from cbhcli_pkg.core.knowledge_base import KnowledgeBase
-    kb = KnowledgeBase(agent_name, vector_store=_vector_store, indexer=_memory_indexer)
-    result = kb.reindex_all()
-    return result
+    if not _vector_store:
+        return {"enabled": False, "count": 0,
+                "message": "向量数据库未启用，请先配置嵌入模型"}
+    try:
+        count = _vector_store.count(agent_name)
+    except Exception:
+        count = 0
+    return {"enabled": True, "count": count}
+
+
+@app.post("/api/agents/{agent_name}/embedding/index")
+def embedding_index(agent_name: str):
+    _init_vector_store()
+    config = _get_agent_config(agent_name)
+    if not config:
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
+    if not _memory_indexer:
+        raise HTTPException(400, "向量数据库未启用，请先配置嵌入模型")
+
+    try:
+        _vector_store.delete_collection(agent_name)
+        segments = _memory_indexer.index_agent_workspace(agent_name, config.workspace_path)
+        if segments > 0:
+            return {"message": f"已索引 {segments} 个段落", "segments": segments}
+        return {"message": "未找到可索引的内容", "segments": 0}
+    except Exception as e:
+        raise HTTPException(500, f"索引失败: {e}")
+
+
+@app.post("/api/agents/{agent_name}/embedding/clear")
+def embedding_clear(agent_name: str):
+    _init_vector_store()
+    _get_agent_workspace(agent_name)
+    if not _vector_store:
+        raise HTTPException(400, "向量数据库未启用")
+    try:
+        _vector_store.delete_collection(agent_name)
+        return {"message": f"已清除 Agent '{agent_name}' 的索引"}
+    except Exception as e:
+        raise HTTPException(500, f"清除失败: {e}")
+
+
+@app.post("/api/agents/{agent_name}/embedding/reindex")
+def embedding_reindex(agent_name: str):
+    embedding_clear(agent_name)
+    return embedding_index(agent_name)
 
 
 # ===================================================================
@@ -847,508 +1275,486 @@ def reindex_knowledge(agent_name: str):
 # ===================================================================
 
 @app.get("/api/agents/{agent_name}/history")
-def list_history(agent_name: str, limit: int = 20):
-    manager = get_agent_manager()
-    config = manager.load_agent(agent_name)
+def list_history(agent_name: str, limit: int = 50):
+    config = _get_agent_config(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
-
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
     history_mgr = SessionHistoryManager(config.workspace_path)
-    sessions = history_mgr.list_sessions(limit)
-    return {"sessions": sessions}
+    return {"sessions": history_mgr.list_sessions(limit)}
 
 
 @app.get("/api/agents/{agent_name}/history/{filename}")
 def get_history(agent_name: str, filename: str):
-    manager = get_agent_manager()
-    config = manager.load_agent(agent_name)
+    config = _get_agent_config(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
-
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
     history_mgr = SessionHistoryManager(config.workspace_path)
     messages = history_mgr.load_session(filename)
     if messages is None:
-        raise HTTPException(404, "Session not found")
+        raise HTTPException(404, "会话不存在")
     return {"messages": messages}
 
 
 @app.delete("/api/agents/{agent_name}/history/{filename}")
 def delete_history(agent_name: str, filename: str):
-    manager = get_agent_manager()
-    config = manager.load_agent(agent_name)
+    config = _get_agent_config(agent_name)
     if not config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
-
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
     history_mgr = SessionHistoryManager(config.workspace_path)
     if history_mgr.delete_session(filename):
-        return {"message": "Session deleted"}
-    raise HTTPException(404, "Session not found")
+        return {"message": "会话已删除"}
+    raise HTTPException(404, "会话不存在")
 
 
 # ===================================================================
-#  API: Chat (SSE Streaming)
+#  API: Chat (SSE Streaming + ReAct Loop)
 # ===================================================================
 
-_chat_sessions: dict[str, dict] = {}
-# Pending action responses: session_key -> asyncio.Queue for user responses
-_pending_responses: dict[str, asyncio.Queue] = {}
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _tool_preview(tool_name: str, arguments: dict) -> str:
+    """工具参数摘要，用于确认卡片展示。"""
+    if tool_name == "terminal":
+        return (arguments.get("command", "") or "")[:200]
+    if tool_name in ("read", "write", "edit"):
+        return arguments.get("file_path", arguments.get("path", ""))
+    if tool_name == "grep":
+        return f"/{arguments.get('pattern', '')}/ in {arguments.get('path', '.')}"
+    if tool_name == "glob":
+        return arguments.get("pattern", "")
+    if tool_name == "ask_user":
+        return arguments.get("question", "")[:100]
+    if tool_name == "python":
+        return (arguments.get("code", "") or "")[:200]
+    if tool_name == "delegate_task":
+        task = arguments.get("task", "")
+        if task:
+            return task[:120]
+        tasks = arguments.get("tasks", [])
+        return f"并行委托 {len(tasks)} 个子任务"
+    if tool_name == "skills_create":
+        return arguments.get("skill_name", "")
+    if tool_name == "image":
+        paths = arguments.get("image_paths", [])
+        return f"{len(paths)} 张图片"
+    return json.dumps(arguments, ensure_ascii=False)[:150]
+
+
+async def _stream_round(cs: WebChatSession, messages: list, stream_kwargs: dict,
+                        result: dict):
+    """单轮流式请求（含备用模型切换）。产生 SSE 事件并填充 result。
+
+    result 键: ai_response, reasoning, tool_calls, error, aborted
+    """
+    config = get_config()
+    fallback_names = config.get_fallback_models()
+    active_client = cs.llm_client
+    fallback_tried: set[str] = set()
+    loop = asyncio.get_event_loop()
+
+    while True:
+        ai_response = ""
+        reasoning_buffer = ""
+        tc_buffer: dict[int, dict] = {}
+        stream_error = None
+
+        chunks_queue: asyncio.Queue = asyncio.Queue()
+
+        def stream_worker(client=active_client):
+            try:
+                for chunk_type, content in client.chat_stream(messages, **stream_kwargs):
+                    if cs.abort:
+                        asyncio.run_coroutine_threadsafe(
+                            chunks_queue.put(("aborted", "")), loop)
+                        return
+                    asyncio.run_coroutine_threadsafe(
+                        chunks_queue.put((chunk_type, content)), loop)
+            except Exception as e:
+                asyncio.run_coroutine_threadsafe(
+                    chunks_queue.put(("error", str(e))), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(chunks_queue.put(None), loop)
+
+        threading.Thread(target=stream_worker, daemon=True).start()
+
+        # 消费流（轮询以快速响应中断）
+        stream_done = False
+        while not stream_done:
+            if cs.abort:
+                result["aborted"] = True
+                return
+            try:
+                item = await asyncio.wait_for(chunks_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            if item is None:
+                stream_done = True
+                break
+            chunk_type, content = item
+
+            if chunk_type == "error":
+                stream_error = content
+                stream_done = True
+            elif chunk_type == "aborted":
+                result["aborted"] = True
+                return
+            elif chunk_type == "reasoning":
+                reasoning_buffer += content
+                yield _sse({"type": "reasoning", "content": content})
+            elif chunk_type == "content":
+                ai_response += content
+                yield _sse({"type": "content", "content": content})
+            elif chunk_type == "tool_calls":
+                try:
+                    for tc in json.loads(content):
+                        idx = tc.get("index", 0)
+                        if idx not in tc_buffer:
+                            tc_buffer[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc.get("id"):
+                            tc_buffer[idx]["id"] = tc["id"]
+                        func = tc.get("function", {})
+                        if func.get("name"):
+                            tc_buffer[idx]["name"] = func["name"]
+                        if "arguments" in func:
+                            tc_buffer[idx]["arguments"] += func["arguments"]
+                except json.JSONDecodeError:
+                    pass
+
+        if stream_error is None:
+            # 成功 — 组装工具调用
+            tool_calls = []
+            for idx in sorted(tc_buffer.keys()):
+                tc = tc_buffer[idx]
+                if not tc["name"]:
+                    continue
+                tc_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
+                try:
+                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                tool_calls.append({"id": tc_id, "name": tc["name"], "arguments": args})
+            result.update({
+                "ai_response": ai_response,
+                "reasoning": reasoning_buffer,
+                "tool_calls": tool_calls,
+                "error": None,
+            })
+            return
+
+        # 失败 — 尝试备用模型
+        switched = False
+        for fb_name in fallback_names:
+            if fb_name in fallback_tried:
+                continue
+            fb_config = config.get_model(fb_name)
+            if not fb_config:
+                continue
+            fallback_tried.add(fb_name)
+            yield _sse({"type": "fallback",
+                        "content": f"主模型调用失败，切换到备用模型 '{fb_name}'..."})
+            active_client = LLMClient(fb_config)
+            switched = True
+            break
+
+        if not switched:
+            result.update({
+                "ai_response": ai_response,
+                "reasoning": reasoning_buffer,
+                "tool_calls": [],
+                "error": stream_error,
+            })
+            return
+
+
+async def _react_loop(cs: WebChatSession):
+    """完整 ReAct 循环（与 CLI ai_handler 对齐），产生 SSE 事件。"""
+    failure_counts: dict[str, int] = {}
+    openai_tools = cs.tool_registry.get_openai_tools()
+    stream_kwargs = {"temperature": API_TEMPERATURE}
+    if openai_tools:
+        stream_kwargs["tools"] = openai_tools
+        stream_kwargs["tool_choice"] = "auto"
+
+    for round_idx in range(MAX_TOOL_ROUNDS):
+        if cs.abort:
+            yield _sse({"type": "aborted"})
+            return
+
+        # ---- ReAct 循环内自动压缩 ----
+        if cs.auto_compress and cs.context_compressor and cs.context_window:
+            total_tokens = cs.session.get_total_tokens(cs.token_counter)
+            cs.context_window.update(total_tokens)
+            if cs.context_window.needs_compression():
+                yield _sse({"type": "compressing",
+                            "content": f"上下文接近上限 ({cs.context_window.get_status_text()})，正在自动压缩..."})
+                try:
+                    success = await asyncio.to_thread(
+                        cs.context_compressor.compress,
+                        cs.session, cs.context_window.trigger_threshold())
+                except Exception:
+                    success = False
+                if success:
+                    new_tokens = cs.session.get_total_tokens(cs.token_counter)
+                    cs.context_window.update(new_tokens)
+                    yield _sse({"type": "compressed",
+                                "content": f"上下文已压缩 ({cs.context_window.get_status_text()})"})
+                else:
+                    yield _sse({"type": "compress_failed", "content": "压缩失败，继续执行"})
+
+        messages = cs.session.get_context_messages()
+
+        # ---- 流式请求一轮 ----
+        result: dict = {}
+        async for ev in _stream_round(cs, messages, stream_kwargs, result):
+            yield ev
+
+        if result.get("aborted"):
+            yield _sse({"type": "aborted"})
+            return
+
+        if result.get("error"):
+            yield _sse({"type": "error", "content": result["error"]})
+            cs.session.add_message(
+                "assistant", result.get("ai_response") or "Error",
+                reasoning_content=result.get("reasoning") or None)
+            return
+
+        ai_response = result.get("ai_response", "")
+        reasoning_buffer = result.get("reasoning", "")
+        tool_calls = result.get("tool_calls", [])
+
+        # ---- 无工具调用 → 结束 ----
+        if not tool_calls:
+            if ai_response:
+                cs.session.add_message(
+                    "assistant", ai_response,
+                    reasoning_content=reasoning_buffer or None)
+            yield _sse({"type": "done", "usage": cs.usage_stats()})
+            return
+
+        # ---- 去重 + 解析工具名（与 CLI 一致）----
+        valid_calls = []
+        seen = set()
+        for tc in tool_calls:
+            tool_obj = cs.tool_registry.fuzzy_get(tc["name"])
+            if not tool_obj:
+                continue
+            resolved = tool_obj.name
+            args_key = json.dumps(tc.get("arguments", {}), sort_keys=True)
+            if (resolved, args_key) in seen:
+                continue
+            seen.add((resolved, args_key))
+            valid_calls.append({
+                "id": tc["id"], "tool": resolved,
+                "arguments": tc.get("arguments", {}),
+            })
+
+        if not valid_calls:
+            # 所有工具名都无法解析 — 当作普通回复结束
+            if ai_response:
+                cs.session.add_message(
+                    "assistant", ai_response,
+                    reasoning_content=reasoning_buffer or None)
+            yield _sse({"type": "done", "usage": cs.usage_stats()})
+            return
+
+        # ---- 记录 assistant 消息（含 tool_calls）----
+        openai_tool_calls = [{
+            "id": tc["id"], "type": "function",
+            "function": {"name": tc["tool"],
+                         "arguments": json.dumps(tc["arguments"], ensure_ascii=False)},
+        } for tc in valid_calls]
+        cs.session.add_message(
+            "assistant", ai_response or "",
+            reasoning_content=reasoning_buffer or None,
+            tool_calls=openai_tool_calls)
+
+        # ---- 逐个执行工具 ----
+        for tc in valid_calls:
+            if cs.abort:
+                yield _sse({"type": "aborted"})
+                return
+
+            tool_name = tc["tool"]
+            tool_args = tc["arguments"]
+            tool_id = tc["id"]
+
+            # ---- ask_user 特判（web 交互）----
+            if tool_name == "ask_user":
+                yield _sse({
+                    "type": "ask_user",
+                    "question": tool_args.get("question", "AI 需要你的输入"),
+                    "options": tool_args.get("options", []),
+                    "allow_multiple": tool_args.get("allow_multiple", False),
+                    "tool_id": tool_id,
+                })
+                answer = await cs.wait_response(timeout=600)
+                if answer is None:
+                    if cs.abort:
+                        yield _sse({"type": "aborted"})
+                        return
+                    answer = "用户未回答"
+                tool_output = f"用户回答: {answer}"
+                cs.session.add_message(
+                    "tool", tool_output, tool_call_id=tool_id,
+                    metadata={"tool_name": tool_name, "success": True})
+                yield _sse({
+                    "type": "tool_result", "tool_name": tool_name,
+                    "tool_id": tool_id, "success": True,
+                    "preview": tool_output,
+                    "answer": answer,
+                })
+                continue
+
+            # ---- 工具确认 ----
+            needs_confirm = (
+                tool_name not in _READONLY_TOOLS
+                and not cs.no_more_confirmations
+            )
+            yield _sse({
+                "type": "tool_confirm",
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "preview": _tool_preview(tool_name, tool_args),
+                "tool_id": tool_id,
+                "needs_confirm": needs_confirm,
+            })
+
+            if needs_confirm:
+                user_response = await cs.wait_response(timeout=600)
+                if user_response is None:
+                    if cs.abort:
+                        yield _sse({"type": "aborted"})
+                        return
+                    user_response = "n"
+                user_response = user_response.strip().lower()
+            else:
+                user_response = "y"
+                yield _sse({"type": "tool_auto_confirmed",
+                            "tool_name": tool_name, "tool_id": tool_id})
+
+            if user_response == "all":
+                cs.no_more_confirmations = True
+                user_response = "y"
+
+            if user_response in ("n", "no"):
+                yield _sse({"type": "tool_rejected",
+                            "tool_name": tool_name, "tool_id": tool_id})
+                cs.session.add_message(
+                    "tool", "用户取消了执行", tool_call_id=tool_id,
+                    metadata={"tool_name": tool_name, "success": False})
+                continue
+
+            # ---- 执行工具（线程池，避免阻塞事件循环）----
+            yield _sse({"type": "tool_executing",
+                        "tool_name": tool_name, "tool_id": tool_id})
+            try:
+                result = await asyncio.to_thread(
+                    cs.tool_registry.execute, tool_name, **tool_args)
+            except Exception as e:
+                result = ToolResult(success=False, output="", error=str(e))
+
+            if result.success:
+                tool_output = (result.output or "")[:MAX_TOOL_OUTPUT_LENGTH]
+            else:
+                tool_output = (result.output or f"错误: {result.error}")[:MAX_TOOL_OUTPUT_LENGTH]
+
+            # ---- 自我反思（与 CLI 一致）----
+            if not result.success:
+                failure_counts[tool_name] = failure_counts.get(tool_name, 0) + 1
+                retry_count = failure_counts[tool_name]
+                if retry_count <= MAX_REFLECTION_RETRIES:
+                    yield _sse({
+                        "type": "reflection", "tool_name": tool_name,
+                        "retry": retry_count, "max_retries": MAX_REFLECTION_RETRIES,
+                    })
+                    tool_output = (
+                        f"[反思提示] 上一个工具调用失败，请分析原因并重试。\n"
+                        f"失败工具: {tool_name}\n"
+                        f"参数: {json.dumps(tool_args, ensure_ascii=False)}\n"
+                        f"剩余重试: {MAX_REFLECTION_RETRIES - retry_count}/{MAX_REFLECTION_RETRIES}\n\n"
+                        f"--- 原始输出 ---\n{tool_output}"
+                    )
+            else:
+                failure_counts.pop(tool_name, None)
+
+            # ---- 结构化预览 ----
+            preview = tool_output[:7500] if len(tool_output) > 7500 else tool_output
+            preview_data = None
+            if tool_name == "edit" and result.success:
+                preview_data = {
+                    "type": "edit",
+                    "file_path": tool_args.get("file_path", ""),
+                    "old_str": tool_args.get("old_str", ""),
+                    "new_str": tool_args.get("new_str", ""),
+                }
+            elif tool_name == "write" and result.success:
+                preview_data = {
+                    "type": "write",
+                    "file_path": tool_args.get("file_path", ""),
+                    "content": tool_args.get("content", ""),
+                }
+            elif tool_name == "python":
+                preview_data = {
+                    "type": "python",
+                    "code": tool_args.get("code", ""),
+                    "output": preview,
+                    "success": result.success,
+                }
+
+            sse_data = {
+                "type": "tool_result",
+                "tool_name": tool_name,
+                "tool_id": tool_id,
+                "success": result.success,
+                "preview": preview,
+            }
+            if preview_data:
+                sse_data["preview_data"] = preview_data
+            yield _sse(sse_data)
+
+            cs.session.add_message(
+                "tool", tool_output, tool_call_id=tool_id,
+                metadata={"tool_name": tool_name, "success": result.success})
+
+            # 工具结果携带图片（image 工具直发模式）：追加带图用户消息，
+            # 使支持视觉的主模型直接在当前会话中查看图片（与 CLI 一致）
+            if result.success and getattr(result, "images", None):
+                vision_prompt = (result.metadata or {}).get("vision_prompt", "")
+                note = f"[image 工具传入 {len(result.images)} 张图片]"
+                if vision_prompt:
+                    note += f" 识别需求: {vision_prompt}"
+                cs.session.add_message("user", note, images=result.images)
+
+        # 继续下一轮 ReAct
+
+    yield _sse({"type": "content", "content": "\n\n[达到最大工具调用轮数]"})
+    yield _sse({"type": "done", "usage": cs.usage_stats()})
 
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """SSE streaming chat endpoint with full ReAct tool execution loop."""
-    config = get_config()
-    manager = get_agent_manager()
+    """SSE 流式聊天端点（完整 ReAct 工具执行循环）。"""
+    cs = _get_or_create_session(req.agent_name, req.model_name)
 
-    model_config = config.get_model(req.model_name)
-    if not model_config:
-        raise HTTPException(400, f"Model '{req.model_name}' not found")
+    if cs.lock.locked():
+        raise HTTPException(409, "该会话正在处理中，请等待完成或先中断")
 
-    agent_config = manager.load_agent(req.agent_name)
-    if not agent_config:
-        raise HTTPException(400, f"Agent '{req.agent_name}' not found")
-
-    session_key = f"{req.agent_name}:{req.model_name}"
-    if session_key not in _chat_sessions:
-        persona = manager.load_agent_persona(req.agent_name)
-        session = Session(agent_name=req.agent_name)
-        llm_client = LLMClient(model_config)
-
-        # Create a mutable proxy for tools that need app-level references
-        app_proxy = _WebAgentContext(req.agent_name)
-        tool_registry = _get_tool_registry(req.agent_name, app_proxy=app_proxy)
-
-        # Populate proxy for delegate_task tool
-        app_proxy.llm_client = llm_client
-        app_proxy.subagent_scheduler = SubAgentScheduler()
-        app_proxy.tool_executor = ToolExecutor(tool_registry)
-        app_proxy.token_counter = get_token_counter()
-
-        # Load MCP tools for this agent
-        mcp_manager = None
-        try:
-            mcp_manager = MCPManager(
-                req.agent_name, agent_config.workspace_path, tool_registry
-            )
-        except Exception:
-            pass
-
-        # Load Skills prompt for this agent
-        active_skills_prompt = ""
-        skill_manager = None
-        try:
-            skill_manager = SkillManager(agent_config.workspace_path)
-            active_skills_prompt = skill_manager.build_skills_prompt()
-        except Exception:
-            pass
-        app_proxy.skill_manager = skill_manager
-
-        # Build system prompt with skills
-        system_prompt = persona.build_system_prompt(
-            agent_name=req.agent_name,
-            model_name=req.model_name,
-            active_skills_prompt=active_skills_prompt,
-            cwd=os.getcwd(),
-            supports_vision=llm_client.supports_vision,
-        )
-        session.add_message("system", system_prompt)
-
-        # 初始化上下文压缩组件
-        token_counter = get_token_counter()
-        context_compressor = ContextCompressor(llm_client, token_counter)
-        tools_schema_tokens = token_counter.count_tokens(
-            json.dumps(tool_registry.get_openai_tools(), ensure_ascii=False)
-        ) if tool_registry.get_openai_tools() else 0
-        context_window = ContextWindow(
-            model_limit=llm_client.context_limit,
-            compression_ratio=agent_config.context_limit_ratio or 0.8,
-            tools_schema_tokens=tools_schema_tokens
-        )
-
-        # 注入到 app_proxy 供 delegate_task 使用
-        app_proxy.context_compressor = context_compressor
-        app_proxy.context_window = context_window
-        app_proxy.auto_compress = agent_config.auto_compress
-        app_proxy.current_agent_config = agent_config
-
-        _chat_sessions[session_key] = {
-            "session": session,
-            "llm_client": llm_client,
-            "tool_registry": tool_registry,
-            "mcp_manager": mcp_manager,
-            "skill_manager": skill_manager,
-            "no_more_confirmations": False,
-            "context_compressor": context_compressor,
-            "context_window": context_window,
-            "auto_compress": agent_config.auto_compress,
-            "token_counter": token_counter,
-        }
-
-    chat_data = _chat_sessions[session_key]
-    session = chat_data["session"]
-    llm_client = chat_data["llm_client"]
-    tool_registry = chat_data["tool_registry"]
-
-    session.add_message("user", req.message, images=req.images if req.images else None)
-    # Reset abort flag
-    chat_data["abort"] = False
-
-    # Create response queue for tool confirmations
-    if session_key not in _pending_responses:
-        _pending_responses[session_key] = asyncio.Queue()
+    cs.session.add_message("user", req.message,
+                           images=req.images if req.images else None)
+    cs.abort = False
 
     async def event_stream():
-        openai_tools = tool_registry.get_openai_tools()
-        stream_kwargs = {"temperature": API_TEMPERATURE}
-        if openai_tools:
-            stream_kwargs["tools"] = openai_tools
-            stream_kwargs["tool_choice"] = "auto"
-
-        loop = asyncio.get_event_loop()
-
-        # 加载备用主模型列表
-        from cbhcli_pkg.config.global_config import GlobalConfig
-        _gc = GlobalConfig()
-        fallback_model_names = _gc.get_fallback_models()
-
-        for round_idx in range(MAX_TOOL_ROUNDS):
-            if chat_data.get("abort"):
-                yield _sse({"type": "aborted"})
-                break
-
-            # 检查上下文是否接近上限，自动压缩
-            ctx_compressor = chat_data.get("context_compressor")
-            ctx_window = chat_data.get("context_window")
-            auto_compress = chat_data.get("auto_compress", True)
-            web_token_counter = chat_data.get("token_counter")
-            if ctx_compressor and ctx_window and auto_compress:
-                total_tokens = session.get_total_tokens(web_token_counter)
-                ctx_window.update(total_tokens)
-                if ctx_window.needs_compression():
-                    yield _sse({"type": "compressing", "content": "上下文接近上限，正在自动压缩..."})
-                    target_tokens = ctx_window.trigger_threshold()
-                    success = ctx_compressor.compress(session, target_tokens)
-                    if success:
-                        new_tokens = session.get_total_tokens(web_token_counter)
-                        ctx_window.update(new_tokens)
-                        yield _sse({"type": "compressed", "content": f"上下文已压缩 ({ctx_window.get_status_text()})"})
-                    else:
-                        yield _sse({"type": "compress_failed", "content": "压缩失败，继续执行"})
-
-            messages = session.get_context_messages()
-            ai_response = ""
-            reasoning_buffer = ""
-            tc_buffer = {}  # index -> {id, name, arguments}
-
-            # 尝试主模型 + 备用模型
-            active_client = llm_client
-            fallback_tried = set()
-
-            while True:
-                try:
-                    chunks_queue = asyncio.Queue()
-
-                    def stream_worker():
-                        try:
-                            for chunk_type, content in active_client.chat_stream(
-                                messages, **stream_kwargs
-                            ):
-                                if chat_data.get("abort"):
-                                    asyncio.run_coroutine_threadsafe(
-                                        chunks_queue.put(("aborted", "")), loop
-                                    )
-                                    return
-                                asyncio.run_coroutine_threadsafe(
-                                    chunks_queue.put((chunk_type, content)), loop
-                                )
-                            asyncio.run_coroutine_threadsafe(
-                                chunks_queue.put(None), loop
-                            )
-                        except Exception as e:
-                            asyncio.run_coroutine_threadsafe(
-                                chunks_queue.put(("error", str(e))), loop
-                            )
-
-                    thread = threading.Thread(target=stream_worker, daemon=True)
-                    thread.start()
-
-                    stream_error = None
-                    while True:
-                        item = await chunks_queue.get()
-                        if item is None:
-                            break
-                        chunk_type, content = item
-
-                        if chunk_type == "error":
-                            stream_error = content
-                            break
-                        elif chunk_type == "aborted":
-                            yield _sse({"type": "aborted"})
-                            yield _sse({"type": "done"})
-                            return
-                        elif chunk_type == "reasoning":
-                            reasoning_buffer += content
-                            yield _sse({"type": "reasoning", "content": content})
-                        elif chunk_type == "content":
-                            ai_response += content
-                            yield _sse({"type": "content", "content": content})
-                        elif chunk_type == "tool_calls":
-                            # Collect incremental tool_calls data
-                            try:
-                                tool_calls_data = json.loads(content)
-                                for tc in tool_calls_data:
-                                    idx = tc.get("index", 0)
-                                    if idx not in tc_buffer:
-                                        tc_buffer[idx] = {"id": "", "name": "", "arguments": ""}
-                                    if tc.get("id"):
-                                        tc_buffer[idx]["id"] = tc["id"]
-                                    func = tc.get("function", {})
-                                    if func.get("name"):
-                                        tc_buffer[idx]["name"] = func["name"]
-                                    if "arguments" in func:
-                                        tc_buffer[idx]["arguments"] += func["arguments"]
-                            except json.JSONDecodeError:
-                                pass
-
-                    if stream_error is None:
-                        # 流式成功，跳出 fallback 循环
-                        break
-
-                    # 主模型/当前模型失败，尝试备用模型
-                    switched = False
-                    for fb_name in fallback_model_names:
-                        if fb_name in fallback_tried:
-                            continue
-                        fb_config = _gc.get_model(fb_name)
-                        if not fb_config:
-                            continue
-                        fallback_tried.add(fb_name)
-                        yield _sse({"type": "fallback", "content": f"切换到备用模型 '{fb_name}'..."})
-                        active_client = LLMClient(fb_config)
-                        # 重置本轮状态
-                        ai_response = ""
-                        reasoning_buffer = ""
-                        tc_buffer = {}
-                        switched = True
-                        break
-
-                    if not switched:
-                        # 没有更多备用模型，返回错误
-                        yield _sse({"type": "error", "content": stream_error})
-                        session.add_message("assistant", ai_response or "Error",
-                                            reasoning_content=reasoning_buffer or None)
-                        yield _sse({"type": "done"})
-                        return
-
-                    # 切换成功，继续 while True 重试
-
-                except Exception as e:
-                    yield _sse({"type": "error", "content": str(e)})
-                    yield _sse({"type": "done"})
-                    return
-
-            # Build structured tool_calls from buffer
-            tool_calls = []
-            if tc_buffer:
-                for idx in sorted(tc_buffer.keys()):
-                    tc = tc_buffer[idx]
-                    if tc["name"]:
-                        tc_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
-                        try:
-                            args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                        except json.JSONDecodeError:
-                            args = {}
-                        tool_calls.append({
-                            "id": tc_id,
-                            "name": tc["name"],
-                            "arguments": args,
-                        })
-
-            if not tool_calls:
-                # No tool calls -> save response, done
-                if ai_response:
-                    session.add_message("assistant", ai_response,
-                                        reasoning_content=reasoning_buffer or None)
-                yield _sse({"type": "done"})
-                return
-
-            # === Tool calls detected ===
-            # Save assistant message with tool_calls to session
-            openai_tool_calls = []
-            for tc in tool_calls:
-                openai_tool_calls.append({
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"])
-                    }
-                })
-            session.add_message("assistant", ai_response or "",
-                                reasoning_content=reasoning_buffer or None,
-                                tool_calls=openai_tool_calls)
-
-            # Execute each tool call
-            for tc in tool_calls:
-                tool_name = tc["name"]
-                tool_args = tc["arguments"]
-                tool_id = tc["id"]
-
-                # Resolve tool name via fuzzy matching
-                tool_obj = tool_registry.fuzzy_get(tool_name)
-                resolved_name = tool_obj.name if tool_obj else tool_name
-
-                # Special handling for ask_user (needs web interaction, not stdin)
-                if resolved_name == "ask_user":
-                    question = tool_args.get("question", "AI needs your input")
-                    options = tool_args.get("options", [])
-                    yield _sse({
-                        "type": "ask_user",
-                        "question": question,
-                        "options": options,
-                        "tool_id": tool_id,
-                    })
-                    # Wait for user answer
-                    try:
-                        resp_queue = _pending_responses[session_key]
-                        while not resp_queue.empty():
-                            try: resp_queue.get_nowait()
-                            except asyncio.QueueEmpty: break
-                        user_answer = await asyncio.wait_for(
-                            resp_queue.get(), timeout=300
-                        )
-                    except asyncio.TimeoutError:
-                        user_answer = "用户未回答"
-                    tool_output = f"用户回答: {user_answer}"
-                    session.add_message("tool", tool_output, tool_call_id=tool_id,
-                                        metadata={"tool_name": resolved_name})
-                    yield _sse({
-                        "type": "tool_result",
-                        "tool_name": resolved_name,
-                        "tool_id": tool_id,
-                        "success": True,
-                        "preview": tool_output,
-                    })
-                    continue
-
-                # Emit tool_confirm event to frontend
-                yield _sse({
-                    "type": "tool_confirm",
-                    "tool_name": resolved_name,
-                    "tool_args": _tool_preview(resolved_name, tool_args),
-                    "tool_id": tool_id,
-                })
-
-                # Decide if we need user confirmation
-                needs_confirm = (
-                    resolved_name not in _READONLY_TOOLS
-                    and not chat_data.get("no_more_confirmations")
-                )
-
-                user_response = "y"
-                if needs_confirm:
-                    # Wait for user response via /api/chat/respond
-                    try:
-                        resp_queue = _pending_responses[session_key]
-                        # Drain stale responses
-                        while not resp_queue.empty():
-                            try:
-                                resp_queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
-                        user_response = await asyncio.wait_for(
-                            resp_queue.get(), timeout=300  # 5 min timeout
-                        )
-                    except asyncio.TimeoutError:
-                        user_response = "n"
-                else:
-                    # Auto-confirm for read-only tools
-                    yield _sse({
-                        "type": "tool_auto_confirmed",
-                        "tool_name": resolved_name,
-                        "tool_id": tool_id,
-                    })
-
-                user_response = user_response.strip().lower()
-                if user_response == "all":
-                    chat_data["no_more_confirmations"] = True
-                    user_response = "y"
-
-                if user_response in ("n", "no"):
-                    # User rejected
-                    yield _sse({
-                        "type": "tool_rejected",
-                        "tool_name": resolved_name,
-                        "tool_id": tool_id,
-                    })
-                    tool_output = "用户取消了执行"
-                    session.add_message("tool", tool_output, tool_call_id=tool_id,
-                                        metadata={"tool_name": resolved_name})
-                    continue
-
-                # Execute tool
-                yield _sse({
-                    "type": "tool_executing",
-                    "tool_name": resolved_name,
-                    "tool_id": tool_id,
-                })
-
-                try:
-                    result = tool_registry.execute(resolved_name, **tool_args)
-                    if result.success:
-                        tool_output = result.output[:MAX_TOOL_OUTPUT_LENGTH] if result.output else ""
-                    else:
-                        tool_output = f"错误: {result.error}"
-                except Exception as e:
-                    tool_output = f"工具执行异常: {str(e)}"
-                    result = ToolResult(success=False, output="", error=str(e))
-
-                # Send result preview to frontend
-                preview = tool_output[:7500] if len(tool_output) > 7500 else tool_output
-                
-                # Build structured preview for special tools
-                preview_data = None
-                if resolved_name == "edit" and result.success:
-                    preview_data = {
-                        "type": "edit",
-                        "file_path": tool_args.get("file_path", ""),
-                        "old_str": tool_args.get("old_str", ""),
-                        "new_str": tool_args.get("new_str", ""),
-                    }
-                elif resolved_name == "write" and result.success:
-                    preview_data = {
-                        "type": "write",
-                        "file_path": tool_args.get("file_path", ""),
-                        "content": tool_args.get("content", ""),
-                    }
-                elif resolved_name == "python":
-                    preview_data = {
-                        "type": "python",
-                        "code": tool_args.get("code", ""),
-                        "output": preview,
-                        "success": result.success if hasattr(result, 'success') else True,
-                    }
-                
-                sse_data = {
-                    "type": "tool_result",
-                    "tool_name": resolved_name,
-                    "tool_id": tool_id,
-                    "success": result.success if hasattr(result, 'success') else True,
-                    "preview": preview,
-                }
-                if preview_data:
-                    sse_data["preview_data"] = preview_data
-                yield _sse(sse_data)
-
-                # Add tool result to session for next LLM round
-                session.add_message("tool", tool_output, tool_call_id=tool_id,
-                                    metadata={"tool_name": resolved_name})
-
-            # Continue the ReAct loop - next round will call LLM with tool results
-
-        # Max rounds reached
-        yield _sse({"type": "content", "content": "\n\n[达到最大工具调用轮数]"})
-        yield _sse({"type": "done"})
+        async with cs.lock:
+            try:
+                async for ev in _react_loop(cs):
+                    yield ev
+            except Exception as e:
+                yield _sse({"type": "error", "content": str(e)})
+                yield _sse({"type": "done", "usage": cs.usage_stats()})
 
     return StreamingResponse(
         event_stream(),
@@ -1361,254 +1767,189 @@ async def chat(req: ChatRequest):
     )
 
 
-def _sse(data: dict) -> str:
-    """Format a dict as an SSE data line."""
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def _tool_preview(tool_name: str, arguments: dict) -> str:
-    """Get a short preview of tool arguments for display."""
-    if tool_name == "terminal":
-        cmd = arguments.get("command", "") or arguments.get("cmd", "")
-        return cmd[:100] if cmd else ""
-    elif tool_name in ("read", "write", "edit"):
-        return arguments.get("path", arguments.get("file_path", ""))
-    elif tool_name == "grep":
-        pattern = arguments.get("pattern", "")
-        path = arguments.get("path", ".")
-        return f"/{pattern}/ in {path}"
-    elif tool_name == "glob":
-        return arguments.get("pattern", "")
-    elif tool_name == "ask_user":
-        return arguments.get("question", "")[:80]
-    elif tool_name == "Todo":
-        return "Todo list update"
-    elif tool_name == "delegate_task":
-        return arguments.get("task", "")[:100]
-    elif tool_name == "python":
-        code = arguments.get("code", "")
-        return code[:100] if code else ""
-    elif tool_name == "skills_create":
-        return arguments.get("skill_name", "")
-    return json.dumps(arguments, ensure_ascii=False)[:100]
+@app.post("/api/chat/respond")
+async def chat_respond(req: ChatRespondRequest):
+    """工具确认 / ask_user 应答。"""
+    key = _get_session_key(req.agent_name, req.model_name)
+    cs = _chat_sessions.get(key)
+    if cs and cs.respond_queue is not None:
+        await cs.respond_queue.put(req.response)
+        return {"message": "应答已接收"}
+    return {"message": "无待处理操作"}
 
 
 @app.post("/api/chat/reset")
 async def reset_chat(req: Request):
+    """新建会话（自动保存当前会话到历史）。"""
     body = await req.json()
     agent_name = body.get("agent_name", "")
     model_name = body.get("model_name", "")
-    session_key = f"{agent_name}:{model_name}"
+    key = _get_session_key(agent_name, model_name)
 
-    if session_key in _chat_sessions:
-        chat_data = _chat_sessions[session_key]
-        session = chat_data["session"]
-        if len(session.messages) > 1:
-            manager = get_agent_manager()
-            agent_config = manager.load_agent(agent_name)
+    cs = _chat_sessions.pop(key, None)
+    if cs:
+        cs.abort = True
+        if cs.session and len(cs.session.messages) > 1:
+            agent_config = _get_agent_config(agent_name)
             if agent_config:
                 history_mgr = SessionHistoryManager(agent_config.workspace_path)
-                history_mgr.save_session(
-                    session.get_context_messages(), session.id
-                )
-        del _chat_sessions[session_key]
+                try:
+                    history_mgr.save_session(
+                        cs.session.get_context_messages(), cs.session.id)
+                except Exception:
+                    pass
 
-    # 释放 python 会话（含 cbhpacks 工具缓存），与 CLI 端 /new 行为一致
+    # 释放 python 会话（含 cbhpacks 工具缓存），与 CLI /new 行为一致
     remove_python_session("default")
-
-    return {"message": "Session reset"}
-
-
-@app.post("/api/chat/respond")
-async def chat_respond(req: ChatRespondRequest):
-    """Endpoint for tool confirmation / ask_user / password responses."""
-    session_key = f"{req.agent_name}:{req.model_name}"
-    if session_key in _pending_responses:
-        await _pending_responses[session_key].put(req.response)
-        return {"message": "Response received"}
-    return {"message": "No pending action"}
-
-
-@app.get("/api/chat/status")
-def chat_status(agent_name: str, model_name: str):
-    """Get current chat session status: message count, token estimate, ctx percentage."""
-    session_key = f"{agent_name}:{model_name}"
-    if session_key not in _chat_sessions:
-        return {
-            "active": False,
-            "message_count": 0,
-            "token_estimate": 0,
-            "ctx_percentage": 0.0,
-            "model_limit": 0,
-            "cwd": os.getcwd(),
-        }
-    chat_data = _chat_sessions[session_key]
-    session = chat_data["session"]
-    llm_client = chat_data["llm_client"]
-
-    # Simple token estimation: ~4 chars per token
-    total_chars = sum(len(m.content or "") for m in session.messages)
-    token_estimate = total_chars // 4
-    model_limit = llm_client.context_limit if hasattr(llm_client, 'context_limit') else 128000
-    if model_limit <= 0:
-        model_limit = 128000
-    ctx_pct = min(100.0, (token_estimate / model_limit) * 100)
-
-    return {
-        "active": True,
-        "message_count": len(session.messages),
-        "token_estimate": token_estimate,
-        "ctx_percentage": round(ctx_pct, 1),
-        "model_limit": model_limit,
-        "cwd": os.getcwd(),
-    }
+    return {"message": "会话已重置"}
 
 
 @app.post("/api/chat/abort")
 async def chat_abort(req: Request):
-    """Abort the current streaming response."""
+    """中断当前流式响应。"""
     body = await req.json()
     agent_name = body.get("agent_name", "")
     model_name = body.get("model_name", "")
-    session_key = f"{agent_name}:{model_name}"
-    # Set abort flag
-    if session_key in _chat_sessions:
-        _chat_sessions[session_key]["abort"] = True
-    return {"message": "Abort requested"}
+    key = _get_session_key(agent_name, model_name)
+    cs = _chat_sessions.get(key)
+    if cs:
+        # wait_response 每 0.5s 轮询一次 abort 标志，无需唤醒队列
+        # （向队列投放空串会被误判为用户确认，导致中断失效继续执行工具）
+        cs.abort = True
+    return {"message": "已请求中断"}
+
+
+@app.get("/api/chat/status")
+def chat_status(agent_name: str, model_name: str):
+    """会话状态：token 精确统计 + 上下文占比。"""
+    key = _get_session_key(agent_name, model_name)
+    cs = _chat_sessions.get(key)
+    if not cs:
+        return {
+            "active": False, "message_count": 0, "token_estimate": 0,
+            "ctx_percentage": 0.0, "model_limit": 0, "remaining_tokens": 0,
+            "tool_call_count": 0, "cwd": os.getcwd(),
+        }
+    stats = cs.usage_stats()
+    stats.update({"active": True, "cwd": os.getcwd(),
+                  "busy": bool(cs.lock and cs.lock.locked())})
+    return stats
+
+
+@app.get("/api/chat/messages")
+def chat_messages(agent_name: str, model_name: str):
+    """导出当前会话消息（前端刷新后恢复对话）。"""
+    key = _get_session_key(agent_name, model_name)
+    cs = _chat_sessions.get(key)
+    if not cs:
+        return {"messages": []}
+    return {"messages": cs.export_messages()}
 
 
 @app.post("/api/chat/load")
 async def chat_load(req: Request):
-    """Load a history session into the current chat session."""
+    """加载历史会话为当前会话（完整重建压缩组件，修复旧版缺陷）。"""
     body = await req.json()
     agent_name = body.get("agent_name", "")
     model_name = body.get("model_name", "")
     filename = body.get("filename", "")
 
     if not agent_name or not model_name or not filename:
-        raise HTTPException(400, "Missing agent_name, model_name, or filename")
+        raise HTTPException(400, "缺少 agent_name / model_name / filename")
 
-    manager = get_agent_manager()
-    agent_config = manager.load_agent(agent_name)
+    agent_config = _get_agent_config(agent_name)
     if not agent_config:
-        raise HTTPException(404, f"Agent '{agent_name}' not found")
+        raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
-    config = get_config()
-    model_config = config.get_model(model_name)
-    if not model_config:
-        raise HTTPException(400, f"Model '{model_name}' not found")
-
-    # Load history messages
     history_mgr = SessionHistoryManager(agent_config.workspace_path)
     hist_messages = history_mgr.load_session(filename)
     if hist_messages is None:
-        raise HTTPException(404, "Session not found")
+        raise HTTPException(404, "会话不存在")
 
-    session_key = f"{agent_name}:{model_name}"
+    # 先保存并移除旧会话
+    key = _get_session_key(agent_name, model_name)
+    old = _chat_sessions.pop(key, None)
+    if old and old.session and len(old.session.messages) > 1:
+        try:
+            history_mgr.save_session(old.session.get_context_messages(), old.session.id)
+        except Exception:
+            pass
 
-    # Create or reset session
-    session = Session(agent_name=agent_name)
-    llm_client = LLMClient(model_config)
-
-    # Create a mutable proxy for tools that need app-level references
-    app_proxy = _WebAgentContext(agent_name)
-    tool_registry = _get_tool_registry(agent_name, app_proxy=app_proxy)
-
-    # Populate proxy for delegate_task tool
-    app_proxy.llm_client = llm_client
-    app_proxy.subagent_scheduler = SubAgentScheduler()
-    app_proxy.tool_executor = ToolExecutor(tool_registry)
-    app_proxy.token_counter = get_token_counter()
-
-    # Load MCP tools
-    mcp_manager = None
-    try:
-        mcp_manager = MCPManager(agent_name, agent_config.workspace_path, tool_registry)
-    except Exception:
-        pass
-
-    # Load Skills prompt
-    active_skills_prompt = ""
-    skill_manager = None
-    try:
-        skill_manager = SkillManager(agent_config.workspace_path)
-        active_skills_prompt = skill_manager.build_skills_prompt()
-    except Exception:
-        pass
-    app_proxy.skill_manager = skill_manager
-
-    # Restore messages from history into session
+    # 全新会话（含全部组件），再注入历史消息
+    cs = WebChatSession.create(agent_name, model_name)
     for msg in hist_messages:
         role = msg.get("role", "")
-        content = msg.get("content", "")
-        tool_call_id = msg.get("tool_call_id")
-        tool_calls = msg.get("tool_calls")
-        reasoning_content = msg.get("reasoning_content")
-
         if role == "system":
-            # Rebuild system prompt with current skills instead of old one
-            persona = manager.load_agent_persona(agent_name)
-            # Try to get vision support from existing session
-            supports_vision = False
-            if session_key in _chat_sessions:
-                supports_vision = _chat_sessions[session_key].get("llm_client", {}).supports_vision
-            system_prompt = persona.build_system_prompt(
-                agent_name=agent_name,
-                model_name=model_name,
-                active_skills_prompt=active_skills_prompt,
-                cwd=os.getcwd(),
-                supports_vision=supports_vision,
-            )
-            session.add_message("system", system_prompt)
-        else:
-            session.add_message(
-                role, content,
-                tool_call_id=tool_call_id,
-                tool_calls=tool_calls,
-                reasoning_content=reasoning_content,
-            )
+            continue  # 保留新建系统提示（含最新 skills/tools.md）
+        cs.session.add_message(
+            role, msg.get("content", "") or "",
+            tool_call_id=msg.get("tool_call_id"),
+            tool_calls=msg.get("tool_calls"),
+            reasoning_content=msg.get("reasoning_content"),
+        )
+    _chat_sessions[key] = cs
 
-    _chat_sessions[session_key] = {
-        "session": session,
-        "llm_client": llm_client,
-        "tool_registry": tool_registry,
-        "mcp_manager": mcp_manager,
-        "skill_manager": skill_manager,
-        "no_more_confirmations": False,
-    }
+    return {"message": "会话已加载",
+            "messages": cs.export_messages(),
+            "usage": cs.usage_stats()}
 
-    return {"message": "Session loaded", "message_count": len(session.messages)}
+
+@app.post("/api/chat/compress")
+async def chat_compress(req: Request):
+    """手动压缩上下文（对应 CLI /comp）。"""
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    model_name = body.get("model_name", "")
+    key = _get_session_key(agent_name, model_name)
+    cs = _chat_sessions.get(key)
+    if not cs:
+        raise HTTPException(400, "当前没有活动会话")
+    if not cs.context_compressor:
+        raise HTTPException(400, "压缩组件未初始化")
+
+    before = cs.session.get_total_tokens(cs.token_counter)
+    try:
+        success = await asyncio.to_thread(
+            cs.context_compressor.compress,
+            cs.session, cs.context_window.trigger_threshold())
+    except Exception as e:
+        raise HTTPException(500, f"压缩失败: {e}")
+
+    if not success:
+        return {"message": "上下文较短，无需压缩", "compressed": False,
+                "usage": cs.usage_stats()}
+
+    after = cs.session.get_total_tokens(cs.token_counter)
+    cs.context_window.update(after)
+    return {"message": f"上下文已压缩（{before:,} → {after:,} tokens）",
+            "compressed": True, "usage": cs.usage_stats()}
 
 
 @app.post("/api/chat/upload")
-async def chat_upload(file: UploadFile = File(...), agent_name: str = Form(...), model_name: str = Form(...)):
-    """Upload a file or image to be included in the next chat message."""
+async def chat_upload(file: UploadFile = File(...),
+                      agent_name: str = Form(...), model_name: str = Form(...)):
+    """上传文件/图片供下一条消息使用。"""
     if not file.filename:
-        raise HTTPException(400, "No file provided")
+        raise HTTPException(400, "未提供文件")
 
     content = await file.read()
-    max_size = 10 * 1024 * 1024  # 10MB limit
+    max_size = 10 * 1024 * 1024
     if len(content) > max_size:
-        raise HTTPException(400, "File too large (max 10MB)")
+        raise HTTPException(400, "文件过大（最大 10MB）")
 
-    # Save to temp upload dir
     upload_dir = CBHCLI_DIR / "web_uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # Sanitize filename
     safe_name = file.filename.replace("/", "_").replace("\\", "_")
     dest = upload_dir / safe_name
-    # Handle name conflicts
     counter = 1
     while dest.exists():
         stem = Path(safe_name).stem
         suffix = Path(safe_name).suffix
         dest = upload_dir / f"{stem}_{counter}{suffix}"
         counter += 1
-
     dest.write_bytes(content)
 
-    # Determine file type
     content_type = file.content_type or ""
     is_image = content_type.startswith("image/")
 
@@ -1619,53 +1960,10 @@ async def chat_upload(file: UploadFile = File(...), agent_name: str = Form(...),
         "content_type": content_type,
         "is_image": is_image,
     }
-
-    # For images, also return base64 for vision API
     if is_image:
         b64 = base64.b64encode(content).decode("utf-8")
         result["base64"] = f"data:{content_type};base64,{b64}"
-
     return result
-
-
-# ===================================================================
-#  API: Settings
-# ===================================================================
-
-@app.get("/api/settings")
-def get_settings():
-    config = get_config()
-    return {
-        "settings": config.get_settings(),
-        "config_dir": str(CBHCLI_DIR),
-    }
-
-
-@app.put("/api/settings")
-def update_settings(update: SettingsUpdate):
-    config = get_config()
-    for key, val in update.model_dump(exclude_none=True).items():
-        config.update_setting(key, val)
-    return {"message": "Settings updated"}
-
-
-# ===================================================================
-#  API: System Info
-# ===================================================================
-
-@app.get("/api/info")
-def get_info():
-    from cbhcli_pkg import __version__
-    config = get_config()
-    manager = get_agent_manager()
-    return {
-        "version": __version__,
-        "config_dir": str(CBHCLI_DIR),
-        "agents_count": len(manager.list_agents()),
-        "models_count": len(config.get_models()),
-        "active_agent": config.get_active_agent(),
-        "last_model": config.get_last_selected_model(),
-    }
 
 
 # ===================================================================
@@ -1684,6 +1982,48 @@ def setup_static():
 #  Server Start
 # ===================================================================
 
+def _get_lan_ips() -> list[str]:
+    """获取本机所有内网 IPv4 地址（纯标准库实现）。
+
+    1. UDP 连接外网地址获取主出口 IP（不实际发送数据包）
+    2. hostname 解析兜底，枚举全部非回环地址
+    """
+    import socket
+
+    ips: set[str] = set()
+
+    # 主出口 IP（UDP 不产生真实流量）
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+
+    # hostname 解析枚举兜底
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+
+    # 排序：192.168 优先，其次 10.x，再次其他
+    def _sort_key(ip: str):
+        if ip.startswith("192.168."):
+            return (0, ip)
+        if ip.startswith("10."):
+            return (1, ip)
+        if ip.startswith("172."):
+            return (2, ip)
+        return (3, ip)
+
+    return sorted(ips, key=_sort_key)
+
+
 def run_server(port: int = 18888, host: str = "0.0.0.0"):
     import uvicorn
 
@@ -1691,7 +2031,19 @@ def run_server(port: int = 18888, host: str = "0.0.0.0"):
 
     from cbhcli_pkg import __version__
     print(f"CBHCLI Web v{__version__}")
-    print(f"Server started: http://localhost:{port}")
+
+    # 展示所有可访问地址（localhost + 内网 IP）
+    if host in ("0.0.0.0", "::", ""):
+        print(f"  ➜ Local:   http://localhost:{port}")
+        lan_ips = _get_lan_ips()
+        for i, ip in enumerate(lan_ips):
+            prefix = "  ➜ Network: " if i == 0 else "             "
+            print(f"{prefix}http://{ip}:{port}")
+        if not lan_ips:
+            print(f"  ➜ Network: （未检测到内网 IP）")
+    else:
+        print(f"  ➜ Server:  http://{host}:{port}")
+
     print(f"Config dir: {CBHCLI_DIR}")
     print("Press Ctrl+C to stop\n")
 

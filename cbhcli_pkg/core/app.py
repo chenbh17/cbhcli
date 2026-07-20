@@ -1,8 +1,6 @@
 """主应用 - CBHCLIApp"""
 import os
-import re
 import json
-import base64
 from pathlib import Path
 from typing import Optional
 
@@ -488,6 +486,29 @@ class CBHCLIApp:
         
         self._reset_session()
         return True
+
+    def switch_model(self, model_config: dict):
+        """原地切换模型，保留当前会话全部内容
+
+        供 /model use 调用：仅替换 LLM 客户端及关联组件（token计数/压缩器/
+        上下文窗口限制），会话消息原样保留，系统提示原地更新
+        （模型名称、视觉能力描述可能随模型变化）。
+
+        Args:
+            model_config: 新模型配置字典
+        """
+        self.llm_client = LLMClient(model_config)
+        self.token_counter = get_token_counter(model_config.get("model"))
+        self.context_compressor = ContextCompressor(
+            self.llm_client, self.token_counter
+        )
+
+        # 更新上下文窗口的模型限制（新模型的 context_limit 可能不同）
+        if self.context_window:
+            self.context_window.model_limit = self.llm_client.context_limit
+
+        # 原地更新系统提示（会话消息不受影响）
+        self._update_system_prompt()
     
     def _reset_session(self, save_current: bool = True):
         """重置会话
@@ -701,15 +722,7 @@ class CBHCLIApp:
                 
                 # 处理AI请求
                 if self.llm_client and self.session:
-                    # 检测图片路径
-                    images = []
-                    if self.llm_client.supports_vision:
-                        image_paths = self._extract_image_paths(user_input)
-                        if image_paths:
-                            images = self._load_images_as_base64(image_paths)
-                            if images:
-                                print(f"\n{C_DIM}📷 检测到 {len(images)} 张图片{C_RESET}")
-                    self._handle_ai_request(user_input, images)
+                    self._handle_ai_request(user_input)
                 else:
                     print(f"\n{C_DIM}当前Agent未配置模型。请使用 /model 命令配置模型。{C_RESET}")
                 
@@ -720,164 +733,7 @@ class CBHCLIApp:
                 print(f"\n错误: {str(e)}{C_RESET}")
                 continue
     
-    def _extract_image_paths(self, text: str) -> list[str]:
-        """从用户输入中提取图片路径
-
-        触发条件（必须同时满足）：
-        1. 用户有明确的图片识别意图（包含动作词：查看/识别/看看/分析图片等）
-        2. 输入中包含显式图片路径 或 从上下文可找到图片
-
-        Args:
-            text: 用户输入文本
-
-        Returns:
-            图片路径列表
-        """
-        # 意图检测：必须同时包含动作词和对象词（允许中间有路径等文字）
-        # 例如: "识别/path/to/image.png图片" -> 动作词"识别" + 对象词"图片"
-        action_words = ['识别', '查看', '看看', '分析', '读取', '看一下', '这是什么']
-        object_words = ['图片', '图像', '截图', '照片', '图表']
-        has_action = any(w in text for w in action_words)
-        has_object = any(w in text for w in object_words)
-        has_vision_intent = has_action and has_object
-
-        if not has_vision_intent:
-            return []
-
-        # 模式1: 匹配显式图片路径
-        image_paths = []
-        path_patterns = [
-            r'(/[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
-            r'(~/[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
-            r'(\./[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
-        ]
-
-        for pattern in path_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                expanded = os.path.expanduser(match.strip())
-                if os.path.exists(expanded):
-                    image_paths.append(expanded)
-
-        if image_paths:
-            return image_paths
-
-        # 模式2: 从上下文搜索图片
-        return self._search_images_in_context(text)
-
-    def _search_images_in_context(self, text: str) -> list[str]:
-        """从对话上下文中搜索图片
-
-        当用户要求查看图片但没有显式指定路径时，从会话历史中找到图片目录并搜索
-        """
-        IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
-
-        # 支持"当前路径/当前目录"
-        current_dir_keywords = ['当前路径', '当前目录', '当前文件夹', '这个目录']
-        use_cwd = any(kw in text for kw in current_dir_keywords)
-
-        # 支持"这些/所有"
-        all_keywords = ['这些', '所有', '全部', '上面', '刚才']
-        want_all = any(kw in text for kw in all_keywords)
-
-        # 从会话历史中收集图片路径
-        recent_images_from_history = []
-        recent_image_dir = None
-
-        if self.session:
-            for msg in reversed(self.session.messages):
-                content = msg.content if isinstance(msg.content, str) else ''
-                for ext in IMAGE_EXTENSIONS:
-                    pattern = r'(/[\w\u4e00-\u9fff./\ -]+' + re.escape(ext) + r')'
-                    matches = re.findall(pattern, content, re.IGNORECASE)
-                    for match in matches:
-                        match = match.strip()
-                        if os.path.exists(match) and match not in recent_images_from_history:
-                            recent_images_from_history.append(match)
-                            if not recent_image_dir:
-                                recent_image_dir = os.path.dirname(match)
-
-        # "这些/所有" 直接返回历史中的图片
-        if want_all and len(recent_images_from_history) > 1:
-            return recent_images_from_history
-
-        # 确定搜索目录
-        search_dir = None
-        if use_cwd:
-            search_dir = os.getcwd()
-        elif recent_image_dir and os.path.isdir(recent_image_dir):
-            search_dir = recent_image_dir
-
-        if not search_dir:
-            return []
-
-        # 搜索目录中的图片
-        all_images = []
-        try:
-            for f in os.listdir(search_dir):
-                if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
-                    all_images.append(os.path.join(search_dir, f))
-        except PermissionError:
-            return []
-
-        if not all_images:
-            return []
-
-        if want_all:
-            return all_images
-
-        # 关键词匹配
-        matched = []
-        for img_path in all_images:
-            filename = os.path.splitext(os.path.basename(img_path))[0]
-            if filename in text:
-                matched.append(img_path)
-            else:
-                for i in range(len(filename) - 1):
-                    substr = filename[i:i+2]
-                    if '\u4e00' <= substr[0] <= '\u9fff' and '\u4e00' <= substr[1] <= '\u9fff':
-                        if substr in text:
-                            matched.append(img_path)
-                            break
-
-        if matched:
-            return matched
-
-        # 无匹配返回全部
-        return all_images
-
-    def _load_images_as_base64(self, image_paths: list[str]) -> list[str]:
-        """将图片文件加载为base64编码
-
-        Args:
-            image_paths: 图片文件路径列表
-
-        Returns:
-            base64编码的图片数据列表
-        """
-        import mimetypes
-        
-        base64_images = []
-        for path in image_paths:
-            try:
-                # 检测图片类型
-                mime_type, _ = mimetypes.guess_type(path)
-                if not mime_type or not mime_type.startswith('image/'):
-                    print(f"\n{C_DIM}⚠️  跳过非图片文件: {path}{C_RESET}")
-                    continue
-                
-                # 读取并编码图片
-                with open(path, 'rb') as f:
-                    image_data = f.read()
-                    base64_data = base64.b64encode(image_data).decode('utf-8')
-                    base64_images.append(base64_data)
-                    
-            except Exception as e:
-                print(f"\n{C_DIM}⚠️  加载图片失败 {path}: {str(e)}{C_RESET}")
-        
-        return base64_images
-
-    def _handle_ai_request(self, user_input: str, images: list[str] = None):
+    def _handle_ai_request(self, user_input: str):
         """处理AI请求 - 委托给AIHandler"""
         # 检查上下文压缩
         self._check_and_compress_context()
@@ -911,7 +767,7 @@ class CBHCLIApp:
         handler.on_memory_update(self._update_memory)
         
         # 处理请求
-        handler.process_request(user_input, images=images if images else None)
+        handler.process_request(user_input)
     
     def _update_memory(self, user_input: str, ai_response: str):
         """更新记忆回调 - 仅用于保存会话历史

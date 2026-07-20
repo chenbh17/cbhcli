@@ -22,7 +22,7 @@ BUILTIN_TOOLS = [
     ("knowledge_base",  "查询知识库内容",               "知识检索"),
     ("skills_create",   "创建新技能",                   "技能系统"),
     ("delegate_task",   "委托子任务给子Agent(可并行)",   "任务管理"),
-    ("image",           "使用视觉模型识别图片内容",      "图片识别"),
+    ("image",           "识别图片(主模型支持视觉时直发)", "图片识别"),
     # cbhpacks 数据科学工具（默认关闭）
     ("cbhpacks_bins_model",       "分箱WOE/IV/PSI计算",      "数据科学"),
     ("cbhpacks_binary_model",     "二分类模型训练评估",        "数据科学"),
@@ -332,7 +332,7 @@ def _write_tools_md(workspace: Path, disabled: list) -> None:
     lines.append("- 在需求不明确时使用 ask_user 向用户确认，而不是猜测")
     lines.append("- 重要操作前提醒用户")
     lines.append("- 出错时提供解决方案")
-    lines.append("- **需要识别图片时使用 image 工具**，传入图片路径和识别需求，工具会自动调用视觉模型识别图片内容")
+    lines.append("- **需要识别图片时使用 image 工具**，传入图片路径和识别需求；当前主模型支持视觉时图片会直接发送到会话中由你识别，否则工具自动调用其他视觉模型识别")
     lines.append("- **有多个相互独立的子任务时使用 delegate_task 传入 tasks 列表并行委托**，全部子Agent完成后主Agent再继续，可显著缩短总耗时")
 
     tools_md = "\n".join(lines)

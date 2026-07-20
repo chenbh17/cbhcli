@@ -251,12 +251,11 @@ def _use_model(app, model_name):
     # 保存上次选择的模型
     app.global_config.set_last_selected_model(model_name)
 
-    # 重新加载Agent以应用新模型
-    if app.current_agent_name:
-        app._load_agent(app.current_agent_name)
+    # 原地切换模型，保留当前会话全部内容（不再重建会话）
+    app.switch_model(model_config)
 
     ctx = model_config.get('context_limit', 128000)
-    return f"✅ 已切换到模型: {model_name}\n   模型ID: {model_config['model']}\n   上下文限制: {ctx:,} tokens"
+    return f"✅ 已切换到模型: {model_name}\n   模型ID: {model_config['model']}\n   上下文限制: {ctx:,} tokens\n   当前会话内容已保留"
 
 
 def _delete_model(app, model_name):

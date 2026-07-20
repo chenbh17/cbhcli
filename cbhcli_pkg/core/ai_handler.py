@@ -75,7 +75,7 @@ class AIHandler:
     #  主流程
     # ==================================================================
 
-    def process_request(self, user_input: str, images: list[str] = None) -> str:
+    def process_request(self, user_input: str) -> str:
         """处理用户请求
 
         流程:
@@ -85,7 +85,6 @@ class AIHandler:
 
         Args:
             user_input: 用户输入
-            images: 图片列表（base64编码的图片数据）
 
         Returns:
             最终的AI响应
@@ -95,7 +94,6 @@ class AIHandler:
             role="user",
             content=user_input,
             token_count=self.token_counter.count_tokens(user_input),
-            images=images if images else None
         )
         self.session.messages.append(user_msg)
 
@@ -463,6 +461,21 @@ class AIHandler:
             )
             tool_msg.metadata = {"tool_name": tc["tool"], "success": getattr(result, 'success', False)}
             self.session.messages.append(tool_msg)
+
+            # 工具结果携带图片（image 工具直发模式）：追加带图用户消息，
+            # 使支持视觉的主模型直接在当前会话中查看图片（共享上下文）
+            if result.success and getattr(result, "images", None):
+                vision_prompt = (result.metadata or {}).get("vision_prompt", "")
+                note = f"[image 工具传入 {len(result.images)} 张图片]"
+                if vision_prompt:
+                    note += f" 识别需求: {vision_prompt}"
+                img_msg = Message(
+                    role="user",
+                    content=note,
+                    token_count=self.token_counter.count_tokens(note),
+                    images=result.images
+                )
+                self.session.messages.append(img_msg)
 
     def _resolve_tool_name(self, name: str) -> Optional[str]:
         """模糊匹配工具名，返回注册名或 None"""

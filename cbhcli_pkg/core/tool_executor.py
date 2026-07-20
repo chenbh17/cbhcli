@@ -236,6 +236,58 @@ class ToolExecutor:
     # 最多显示的行数
     _EDIT_MAX_DISPLAY = 200
 
+    def _edit_inline_marks(self, old_lines, new_lines):
+        """计算行内字符级差异区间
+
+        公共前缀/后缀行不标记；中间变更区行数一致时逐行对比，
+        仅差异字符段返回标记；行数不一致时变更行整行标记。
+
+        Returns:
+            (old_marks, new_marks): 每行的 [(start, end), ...] 字符区间列表
+        """
+        n_old, n_new = len(old_lines), len(new_lines)
+        old_marks = [[] for _ in old_lines]
+        new_marks = [[] for _ in new_lines]
+
+        # 公共前缀行 / 后缀行（完全相同，不标记）
+        pre = 0
+        max_pre = min(n_old, n_new)
+        while pre < max_pre and old_lines[pre] == new_lines[pre]:
+            pre += 1
+        suf = 0
+        while suf < max_pre - pre and \
+                old_lines[n_old - 1 - suf] == new_lines[n_new - 1 - suf]:
+            suf += 1
+
+        old_mid = old_lines[pre:n_old - suf]
+        new_mid = new_lines[pre:n_new - suf]
+
+        if len(old_mid) == len(new_mid):
+            # 行数一致：逐行公共前后缀字符对比，仅中段差异标记
+            for k, (a, b) in enumerate(zip(old_mid, new_mid)):
+                if a == b:
+                    continue
+                p = 0
+                m = min(len(a), len(b))
+                while p < m and a[p] == b[p]:
+                    p += 1
+                sa, sb = len(a), len(b)
+                while sa > p and sb > p and a[sa - 1] == b[sb - 1]:
+                    sa -= 1
+                    sb -= 1
+                if sa > p:
+                    old_marks[pre + k].append((p, sa))
+                if sb > p:
+                    new_marks[pre + k].append((p, sb))
+        else:
+            # 行数不一致：变更行整行标记（至少标1字符保证空行可见）
+            for k in range(len(old_mid)):
+                old_marks[pre + k].append((0, max(1, len(old_mid[k]))))
+            for k in range(len(new_mid)):
+                new_marks[pre + k].append((0, max(1, len(new_mid[k]))))
+
+        return old_marks, new_marks
+
     def _render_edit_preview(self, old_lines, new_lines, start_line, file_path=""):
         """用 rich.Table 渲染编辑差异预览
 
@@ -243,6 +295,7 @@ class ToolExecutor:
         窄屏(<110列)：上下堆叠两个表格（先原内容，后新内容）
         长行自动折行显示（不截断），行号黄色标识。
         代码区域按文件类型做 Pygments 语法高亮（monokai 主题）。
+        行内字符级对比：仅差异字符段加亮底色，未变更部分保持列底色。
 
         Args:
             old_lines: 原内容行列表
@@ -255,6 +308,10 @@ class ToolExecutor:
         from rich.text import Text
         from rich import box
 
+        # 差异段高亮样式（比列底色更亮一档，且文字加粗）
+        DEL_SEG_STYLE = "bold on #7a2626"
+        ADD_SEG_STYLE = "bold on #267a26"
+
         # 显式传入 ioctl 实时宽度（Console 默认读 COLUMNS 环境变量，可能过期）
         term_w = _term_width()
         console = Console(width=term_w)
@@ -266,17 +323,26 @@ class ToolExecutor:
         old_hl = self._highlight_code_lines('\n'.join(old_lines), lexer)
         new_hl = self._highlight_code_lines('\n'.join(new_lines), lexer)
 
-        def _cell(hl_lines, i):
-            """构造一个单元格：黄色行号 + 语法高亮内容"""
+        # 行内字符级差异区间
+        old_marks, new_marks = self._edit_inline_marks(old_lines, new_lines)
+
+        def _cell(hl_lines, i, marks, seg_style):
+            """构造一个单元格：黄色行号 + 语法高亮内容 + 差异段底色"""
             if i >= len(hl_lines):
                 return Text("")
-            content = hl_lines[i]
+            content = hl_lines[i].copy()
             if not content.plain:
                 content = Text(" ")  # 空行占位，保持行高
+            for (s, e) in marks:
+                content.stylize(seg_style, s, e)
             return Text.assemble(
                 (f"{start_line + i:>4} ", "bold yellow"),
                 content,
             )
+
+        def _marks(marks, i):
+            """宽屏并排时新旧行数可能不一致，越界返回空标记"""
+            return marks[i] if i < len(marks) else []
 
         print()
         if term_w >= self._EDIT_SIDE_BY_SIDE_MIN:
@@ -294,7 +360,10 @@ class ToolExecutor:
                 header_style="bold white on #226622", style="on #0e2a0e",
             )
             for i in range(min(max_lines, max_display)):
-                table.add_row(_cell(old_hl, i), _cell(new_hl, i))
+                table.add_row(
+                    _cell(old_hl, i, _marks(old_marks, i), DEL_SEG_STYLE),
+                    _cell(new_hl, i, _marks(new_marks, i), ADD_SEG_STYLE),
+                )
             console.print(table)
         else:
             # ---- 窄屏：上下堆叠 ----
@@ -307,7 +376,7 @@ class ToolExecutor:
                 header_style="bold white on #8b2222", style="on #2a0e0e",
             )
             for i in range(min(len(old_lines), max_display)):
-                old_table.add_row(_cell(old_hl, i))
+                old_table.add_row(_cell(old_hl, i, _marks(old_marks, i), DEL_SEG_STYLE))
             console.print(old_table)
 
             new_table = Table(
@@ -319,7 +388,7 @@ class ToolExecutor:
                 header_style="bold white on #226622", style="on #0e2a0e",
             )
             for i in range(min(len(new_lines), max_display)):
-                new_table.add_row(_cell(new_hl, i))
+                new_table.add_row(_cell(new_hl, i, _marks(new_marks, i), ADD_SEG_STYLE))
             console.print(new_table)
 
         if max_lines > max_display:

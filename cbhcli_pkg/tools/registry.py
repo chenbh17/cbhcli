@@ -12,6 +12,7 @@ class ToolResult:
     error: Optional[str] = None
     metadata: Optional[dict] = None
     display_output: Optional[str] = None  # 终端显示内容（None则显示output）
+    images: Optional[list] = None  # 图片列表（base64），由 ai_handler/web 追加为带图用户消息直发主模型
 
 
 class BaseTool(ABC):

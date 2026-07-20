@@ -33,10 +33,53 @@ if TYPE_CHECKING:
     from cbhcli_pkg.commands.parser import SlashCommandParser
 
 
+def install_toolbar_display_fix():
+    """安装底部工具栏即时显示补丁（幂等）
+
+    问题根因：prompt_toolkit 的 bottom_toolbar 容器过滤条件含
+    renderer_height_is_known —— 高度要等 CPR（光标位置查询）往返
+    完成后才"已知"。若 prompt 启动时输入队列非空（典型场景：AI 回答
+    期间用户按了键，type-ahead 残留），
+    Application._request_absolute_cursor_position 会跳过 CPR 请求，
+    高度永远未知 → 状态栏整轮不显示，直到用户提交/取消进入下一轮
+    prompt（新 Application、队列已空、CPR 正常往返）才恢复显示。
+
+    修复思路：将 prompt_toolkit.shortcuts.prompt 模块命名空间中的
+    renderer_height_is_known 引用替换为恒真 Condition，使工具栏在
+    首轮渲染即显示。安全性：renderer.render() 在高度未知时按
+    height = max(0, last_height, preferred_height) 绘制，布局按优选
+    高度分配行（提示符行 + 工具栏行），绘制位置正确；CPR 响应到达
+    后的高度校正逻辑与原生完全一致（仅少一次"工具栏闪现"延迟）。
+    对 CPR 不支持的终端反而修复了工具栏永不显示的问题。
+
+    注意：必须通过 sys.modules 获取真实模块对象！
+    `import prompt_toolkit.shortcuts.prompt as m` 会因为 shortcuts
+    包 `from .prompt import prompt` 把导出的 prompt() 函数绑定为包
+    属性（遮蔽子模块），使 m 绑定到函数而非模块，补丁无效。
+    """
+    import sys
+    from prompt_toolkit.filters import Condition
+
+    # from prompt_toolkit import PromptSession（本文件顶部）已确保
+    # prompt_toolkit.shortcuts.prompt 真实模块加载到 sys.modules
+    real_pm = sys.modules.get('prompt_toolkit.shortcuts.prompt')
+    if real_pm is None:
+        import prompt_toolkit.shortcuts.prompt  # noqa: F401
+        real_pm = sys.modules['prompt_toolkit.shortcuts.prompt']
+
+    if getattr(real_pm, '_cbhcli_toolbar_fix_patched', False):
+        return
+
+    real_pm.renderer_height_is_known = Condition(lambda: True)
+    real_pm._cbhcli_toolbar_fix_patched = True
+
+
 # 模块导入时立即安装字素簇宽度补丁（必须在任何 prompt_toolkit 渲染之前）
 install_prompt_toolkit_patch()
 # 安装 resize 防抖补丁（修复窗口大小连续变化时输入框重复显示）
 install_resize_fix()
+# 安装底部工具栏即时显示补丁（修复状态栏偶尔不显示）
+install_toolbar_display_fix()
 
 
 class SlashCommandCompleter(Completer):

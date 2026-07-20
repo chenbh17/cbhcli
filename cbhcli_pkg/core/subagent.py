@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from cbhcli_pkg.context.token_counter import TokenCounter
 
 # 并行子Agent最大并发数（超过时按波次执行）
-MAX_PARALLEL_SUBAGENTS = 10
+MAX_PARALLEL_SUBAGENTS = 100
 
 
 class SubAgentStatus(Enum):

@@ -1,4 +1,4 @@
-"""图片识别工具 - 调用视觉模型识别图片内容"""
+"""图片识别工具 - 主模型支持视觉时直发主模型，否则调用其他视觉模型"""
 import base64
 import mimetypes
 from pathlib import Path
@@ -8,8 +8,9 @@ from cbhcli_pkg.tools.registry import BaseTool, ToolResult
 class ImageTool(BaseTool):
     """图片识别工具
 
-    当主模型不支持视觉功能时，通过此工具调用已配置的视觉模型识别图片内容。
-    支持同时识别多张图片，返回视觉模型的识别结果给主模型。
+    两种识别模式：
+    1. 当前主模型支持视觉 → 图片作为多模态消息直发主模型（共享当前会话上下文）
+    2. 当前主模型不支持视觉 → 调用其他已配置的视觉模型识别，返回文本结果
     """
 
     def __init__(self, app):
@@ -26,10 +27,11 @@ class ImageTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "使用视觉模型识别图片内容并返回识别结果。"
+            "识别图片内容。"
             "当需要分析、识别、描述图片时调用此工具。"
             "支持同时传入多张图片路径。"
-            "工具会自动选择已配置的视觉模型进行识别。"
+            "若当前主模型支持视觉，图片将直接发送到当前会话由主模型查看识别；"
+            "否则自动选择其他已配置的视觉模型进行识别并返回文本结果。"
         )
 
     @property
@@ -58,7 +60,7 @@ class ImageTool(BaseTool):
             prompt: 识别需求描述
 
         Returns:
-            ToolResult: 视觉模型的识别结果
+            ToolResult: 识别结果；主模型直发模式下 images 字段携带图片
         """
         if not image_paths:
             return ToolResult(
@@ -67,58 +69,49 @@ class ImageTool(BaseTool):
                 error="未提供图片路径"
             )
 
-        # 查找已配置的视觉模型（按优先级排序的列表）
+        # 加载图片为 base64
+        base64_images, loaded_paths, load_error = self._load_images(image_paths)
+        if load_error:
+            return ToolResult(
+                success=False,
+                output="",
+                error=load_error
+            )
+
+        # 模式1: 当前主模型支持视觉 → 图片直发主模型，共享当前会话上下文
+        # （ai_handler/web 会将 images 追加为带图用户消息，无需额外调用模型）
+        if self._main_model_supports_vision():
+            model_id = getattr(self._app.llm_client, 'model_name', '?')
+            output_lines = [
+                f"📷 已加载 {len(base64_images)} 张图片。当前主模型 '{model_id}' 支持视觉，"
+                f"图片已作为多模态消息直接发送到当前会话（见紧随其后的用户消息），"
+                f"请直接查看图片内容并完成识别需求。",
+                f"📋 识别需求: {prompt}",
+                f"🖼️  图片列表: {', '.join(loaded_paths)}",
+            ]
+            display_lines = [
+                f"📷 {len(base64_images)} 张图片已直接发送给主模型 '{model_id}'",
+            ]
+            return ToolResult(
+                success=True,
+                output="\n".join(output_lines),
+                display_output="\n".join(display_lines),
+                images=[b64 for b64, _ in base64_images],
+                metadata={"vision_prompt": prompt},
+            )
+
+        # 模式2: 主模型不支持视觉 → 调用其他已配置的视觉模型
         vision_models = self._find_vision_models()
         if not vision_models:
             return ToolResult(
                 success=False,
                 output="",
                 error=(
-                    "未找到已配置的视觉模型。"
+                    "当前主模型不支持视觉，且未找到其他已配置的视觉模型。"
                     "请先使用 /model add 添加一个支持视觉功能的模型"
                     "（添加时选择支持视觉为 y），然后重试。"
                 )
             )
-
-        # 加载图片为 base64
-        base64_images = []
-        loaded_paths = []
-        for path in image_paths:
-            expanded = Path(path).expanduser()
-            if not expanded.exists():
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"图片文件不存在: {path}"
-                )
-            if not expanded.is_file():
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"不是文件: {path}"
-                )
-
-            # 检测图片类型
-            mime_type, _ = mimetypes.guess_type(str(expanded))
-            if not mime_type or not mime_type.startswith('image/'):
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"不是图片文件: {path}"
-                )
-
-            try:
-                with open(expanded, 'rb') as f:
-                    image_data = f.read()
-                    base64_data = base64.b64encode(image_data).decode('utf-8')
-                    base64_images.append((base64_data, mime_type))
-                    loaded_paths.append(str(expanded))
-            except Exception as e:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"加载图片失败 {path}: {str(e)}"
-                )
 
         # 依次尝试视觉模型，直到成功或全部失败
         last_error = None
@@ -175,13 +168,54 @@ class ImageTool(BaseTool):
             display_output="\n".join(display_lines)
         )
 
+    def _main_model_supports_vision(self) -> bool:
+        """当前主模型是否支持视觉"""
+        return bool(self._app and getattr(self._app.llm_client, 'supports_vision', False))
+
+    def _load_images(self, image_paths: list) -> tuple:
+        """加载图片文件为 base64 编码
+
+        Args:
+            image_paths: 图片文件路径列表
+
+        Returns:
+            (base64_images, loaded_paths, error):
+                base64_images 为 [(base64_data, mime_type), ...]；
+                error 非空表示加载失败
+        """
+        base64_images = []
+        loaded_paths = []
+        for path in image_paths:
+            expanded = Path(path).expanduser()
+            if not expanded.exists():
+                return [], [], f"图片文件不存在: {path}"
+            if not expanded.is_file():
+                return [], [], f"不是文件: {path}"
+
+            # 检测图片类型
+            mime_type, _ = mimetypes.guess_type(str(expanded))
+            if not mime_type or not mime_type.startswith('image/'):
+                return [], [], f"不是图片文件: {path}"
+
+            try:
+                with open(expanded, 'rb') as f:
+                    image_data = f.read()
+                    base64_data = base64.b64encode(image_data).decode('utf-8')
+                    base64_images.append((base64_data, mime_type))
+                    loaded_paths.append(str(expanded))
+            except Exception as e:
+                return [], [], f"加载图片失败 {path}: {str(e)}"
+
+        return base64_images, loaded_paths, None
+
     def _find_vision_models(self) -> list:
-        """从全局配置中查找支持视觉的模型，按优先级排序
+        """从全局配置中查找支持视觉的模型（不含当前主模型），按优先级排序
+
+        仅在当前主模型不支持视觉时调用（支持视觉时图片直发主模型）。
 
         优先级顺序：
-        1. 当前Agent使用的模型（如果支持视觉）
-        2. /fallback vision 配置的备用视觉模型（按顺序）
-        3. 其他已配置的支持视觉的模型
+        1. /fallback vision 配置的备用视觉模型（按顺序）
+        2. 其他已配置的支持视觉的模型
 
         Returns:
             模型配置字典列表（按优先级排序），空列表表示无可用视觉模型
@@ -196,27 +230,7 @@ class ImageTool(BaseTool):
         result = []
         seen_names = set()
 
-        # 1. 优先：当前Agent使用的模型是否支持视觉
-        if self._app and self._app.llm_client:
-            if getattr(self._app.llm_client, 'supports_vision', False):
-                current_name = self._app.llm_client.model_name
-                for m in models:
-                    if m.get('name') == current_name:
-                        result.append(m)
-                        seen_names.add(current_name)
-                        break
-                else:
-                    # 找不到配置但支持视觉，用当前client信息构建
-                    result.append({
-                        'name': current_name,
-                        'apiKey': self._app.llm_client.api_key,
-                        'url': self._app.llm_client.base_url,
-                        'model': self._app.llm_client.model_name,
-                        'vision': True
-                    })
-                    seen_names.add(current_name)
-
-        # 2. 备用视觉模型（按 /fallback vision 配置的顺序）
+        # 1. 备用视觉模型（按 /fallback vision 配置的顺序）
         fallback_vision = config.get_fallback_vision_models()
         for name in fallback_vision:
             if name in seen_names:
@@ -226,7 +240,7 @@ class ImageTool(BaseTool):
                 result.append(model)
                 seen_names.add(name)
 
-        # 3. 其他已配置的支持视觉的模型
+        # 2. 其他已配置的支持视觉的模型
         for m in models:
             name = m.get('name', '')
             if name in seen_names:

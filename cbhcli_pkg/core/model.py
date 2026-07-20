@@ -36,18 +36,25 @@ class LLMClient:
         })
     
     def _clean_messages(self, messages: list[dict]) -> list[dict]:
-        """清理消息，根据模型是否支持思考模式处理 reasoning_content 字段
-        
+        """清理消息，根据模型能力处理特殊字段
+
+        - 非视觉模型：多模态消息降级为纯文本（图片替换为占位说明），
+          避免 fallback 到非视觉模型时 API 报"不是视觉模型"错误
         - supports_reasoning=True: 确保所有 assistant 消息都有 reasoning_content
           （旧历史消息可能缺失该字段，补为空字符串）
         - supports_reasoning=False: 剥离所有 reasoning_content 字段
         - 自动检测：消息历史中存在 reasoning_content 时，自动标记
         """
+        # 非视觉模型：剥除图片内容（视觉主模型 fallback 到非视觉模型时，
+        # 会话历史中的带图消息原样发送会被 API 拒绝）
+        if not self.supports_vision:
+            messages = [self._strip_images(msg) for msg in messages]
+
         # 自动检测：消息历史中存在 reasoning_content，说明模型支持思考模式
         if not self.supports_reasoning:
             if any(msg.get("reasoning_content") for msg in messages):
                 self.supports_reasoning = True
-        
+
         if self.supports_reasoning:
             # 思考模式：确保所有 assistant 消息都有 reasoning_content 字段
             # 旧版本保存的历史消息可能缺失该字段，DeepSeek 要求必须传回
@@ -57,7 +64,7 @@ class LLMClient:
                     msg = {**msg, "reasoning_content": ""}
                 result.append(msg)
             return result
-        
+
         # 非思考模式：剥离 reasoning_content
         cleaned = []
         for msg in messages:
@@ -65,6 +72,29 @@ class LLMClient:
                 msg = {k: v for k, v in msg.items() if k != "reasoning_content"}
             cleaned.append(msg)
         return cleaned
+
+    @staticmethod
+    def _strip_images(msg: dict) -> dict:
+        """将单条多模态消息降级为纯文本（图片替换为占位说明）
+
+        content 为字符串时原样返回；为列表（多模态格式）时，
+        保留文本部分，image_url 部分替换为 "[已省略 N 张图片]"。
+        """
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return msg
+
+        texts = []
+        img_count = 0
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    img_count += 1
+        if img_count:
+            texts.append(f"[已省略 {img_count} 张图片：当前模型不支持视觉]")
+        return {**msg, "content": "\n".join(t for t in texts if t)}
     
     def _get_temperature(self, temperature: float) -> float:
         """获取温度参数：优先使用模型配置，否则使用传入值"""
@@ -87,7 +117,7 @@ class LLMClient:
         payload = {
             "model": self.model_name,
             "messages": self._clean_messages(messages),
-            "temperature": temperature,
+            "temperature": self._get_temperature(temperature),
             **kwargs
         }
         
