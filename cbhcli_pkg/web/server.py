@@ -63,7 +63,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.9.7")
+app = FastAPI(title="CBHCLI Web", version="4.9.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1802,6 +1802,72 @@ async def reset_chat(req: Request):
     # 释放 python 会话（含 cbhpacks 工具缓存），与 CLI /new 行为一致
     remove_python_session("default")
     return {"message": "会话已重置"}
+
+
+@app.post("/api/chat/switch_model")
+async def chat_switch_model(req: Request):
+    """原地切换模型，保留当前会话全部内容（对齐 CLI /model use → switch_model）。
+
+    仅替换 LLM 客户端及关联组件（token计数/压缩器/上下文窗口限制），
+    会话消息原样保留，系统提示原地更新（模型名称、视觉能力描述可能变化）。
+    会话在 _chat_sessions 中从旧 (agent, model) 键迁移到新键。
+    """
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    old_model = body.get("old_model", "")
+    new_model = body.get("new_model", "")
+
+    if not agent_name or not new_model:
+        raise HTTPException(400, "缺少 agent_name / new_model")
+
+    config = get_config()
+    model_config = config.get_model(new_model)
+    if not model_config:
+        raise HTTPException(404, f"模型 '{new_model}' 不存在")
+    config.set_last_selected_model(new_model)
+
+    old_key = _get_session_key(agent_name, old_model or new_model)
+    new_key = _get_session_key(agent_name, new_model)
+
+    cs = _chat_sessions.get(old_key)
+    if cs is None or old_key == new_key:
+        # 无活动会话（或新旧模型相同），仅更新选择，无需迁移
+        return {"switched": False, "message": f"已选择模型 '{new_model}'"}
+
+    # 新键位若已有旧会话：保存到历史后让位（与 chat_load 行为一致）
+    existing = _chat_sessions.pop(new_key, None)
+    if existing is not None and existing is not cs:
+        existing.abort = True
+        if existing.session and len(existing.session.messages) > 1:
+            try:
+                agent_config = _get_agent_config(agent_name)
+                if agent_config:
+                    SessionHistoryManager(agent_config.workspace_path).save_session(
+                        existing.session.get_context_messages(), existing.session.id)
+            except Exception:
+                pass
+
+    # 原地替换模型组件（会话消息原样保留）
+    cs.llm_client = LLMClient(model_config)
+    cs.token_counter = get_token_counter(model_config.get("model"))
+    cs.context_compressor = ContextCompressor(cs.llm_client, cs.token_counter)
+    if cs.context_window:
+        cs.context_window.model_limit = cs.llm_client.context_limit
+    if cs.app_proxy:
+        cs.app_proxy.llm_client = cs.llm_client
+        cs.app_proxy.token_counter = cs.token_counter
+        cs.app_proxy.context_compressor = cs.context_compressor
+    cs.model_name = new_model
+    cs.session_key = new_key
+    cs._rebuild_system_prompt()  # 原地更新首条 system 消息
+
+    # 会话键迁移: (agent, old_model) → (agent, new_model)
+    _chat_sessions.pop(old_key, None)
+    _chat_sessions[new_key] = cs
+
+    return {"switched": True,
+            "message": f"已切换到模型 '{new_model}'（会话及上下文已保留）",
+            "usage": cs.usage_stats()}
 
 
 @app.post("/api/chat/abort")

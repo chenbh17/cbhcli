@@ -1,4 +1,4 @@
-# CBHCLI v4.9.7 - AI驱动的终端助手
+# CBHCLI v4.9.8 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -127,7 +127,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.9.7-py3-none-any.whl
+pip install dist/cbhcli-4.9.8-py3-none-any.whl
 ```
 
 ### 可选依赖

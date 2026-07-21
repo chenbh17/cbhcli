@@ -21,7 +21,6 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
-from prompt_toolkit.formatted_text import HTML
 from typing import TYPE_CHECKING
 
 from cbhcli_pkg.core.text_width import (
@@ -154,6 +153,7 @@ class ChatInputBox:
         self._style = Style.from_dict({
             'prompt': 'bold #00d7ff',
             'bottom-toolbar': 'noinherit bg:#1c1e24 #999999',
+            'bottom-toolbar.label': 'bold #ffffff bg:#1c1e24',
             'bottom-toolbar.model': 'bold #00d7ff bg:#1c1e24',
             'bottom-toolbar.ctx': '#ffd75f bg:#1c1e24',
             'bottom-toolbar.agent': '#ff87d7 bg:#1c1e24',
@@ -249,23 +249,32 @@ class ChatInputBox:
             if active_names:
                 skills_str = ','.join(active_names)
 
-        # 构建 HTML 格式化文本（文字标签+独立配色，清晰标识每项信息）
-        sep = '<style class="bottom-toolbar.sep"> │ </style>'
-        parts = []
-        parts.append(f'<style class="bottom-toolbar.model">模型: {model_name}</style>')
+        # 构建格式化文本（标签亮白加粗+值独立配色，清晰标识每项信息）
+        # 注意：不能用 HTML('<style class="...">')！prompt_toolkit 的 HTML
+        # 解析器会丢弃 <style> 标签的 class 属性（html.py 中 "style" 被排除
+        # 在 name_stack 之外，仅解析 fg/bg/color 属性），class 永远不会生效。
+        # 必须使用 (style, text) 元组列表显式指定 class。
+        sep = ("class:bottom-toolbar.sep", " │ ")
+        parts: list[tuple[str, str]] = []
+        parts.append(("class:bottom-toolbar.label", "模型: "))
+        parts.append(("class:bottom-toolbar.model", model_name))
         if ctx_info:
             parts.append(sep)
-            parts.append(f'<style class="bottom-toolbar.ctx">上下文: {ctx_info}</style>')
+            parts.append(("class:bottom-toolbar.label", "上下文: "))
+            parts.append(("class:bottom-toolbar.ctx", ctx_info))
         if agent:
             parts.append(sep)
-            parts.append(f'<style class="bottom-toolbar.agent">Agent: {agent}</style>')
+            parts.append(("class:bottom-toolbar.label", "Agent: "))
+            parts.append(("class:bottom-toolbar.agent", agent))
         if skills_str:
             parts.append(sep)
-            parts.append(f'<style class="bottom-toolbar.skills">技能: {skills_str}</style>')
+            parts.append(("class:bottom-toolbar.label", "技能: "))
+            parts.append(("class:bottom-toolbar.skills", skills_str))
         parts.append(sep)
-        parts.append(f'<style class="bottom-toolbar.cwd">路径: {cwd}</style>')
+        parts.append(("class:bottom-toolbar.label", "路径: "))
+        parts.append(("class:bottom-toolbar.cwd", cwd))
 
-        return HTML(''.join(parts))
+        return parts
 
     def prompt(self) -> str:
         """显示提示符并获取用户输入
@@ -273,12 +282,13 @@ class ChatInputBox:
         Returns:
             用户输入文本（已 strip），EOFError 时返回 "quit"，KeyboardInterrupt 时返回 ""
         """
-        prompt_text = HTML('<style class="prompt">❯ </style>')
+        # 同样使用元组列表而非 HTML（<style class> 会被解析器丢弃）
+        prompt_text = [("class:prompt", "❯ ")]
 
         try:
             user_input = self._session.prompt(
                 prompt_text,
-                prompt_continuation=HTML('<style class="bottom-toolbar">  </style>'),
+                prompt_continuation=[("class:prompt", "  ")],
                 bottom_toolbar=self._build_toolbar,
             )
             return user_input.strip()

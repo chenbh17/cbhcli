@@ -117,6 +117,8 @@ const api = {
     request("/chat/respond", { method: "POST", body: JSON.stringify({ agent_name, model_name, response }) }),
   chatReset: (agent_name, model_name) =>
     request("/chat/reset", { method: "POST", body: JSON.stringify({ agent_name, model_name }) }),
+  chatSwitchModel: (agent_name, old_model, new_model) =>
+    request("/chat/switch_model", { method: "POST", body: JSON.stringify({ agent_name, old_model, new_model }) }),
   chatAbort: (agent_name, model_name) =>
     request("/chat/abort", { method: "POST", body: JSON.stringify({ agent_name, model_name }) }),
   chatStatus: (a, m) => request(`/chat/status?agent_name=${enc(a)}&model_name=${enc(m)}`),
@@ -799,10 +801,20 @@ async function onAgentChange() {
 
 async function onModelChange() {
   const name = chatUI.modelSelect.value;
+  const old = state.selectedModel;
+  if (name === old) return;
   state.selectedModel = name;
-  api.selectModel(name).catch(() => {});
-  clearMessages();
-  await restoreMessages();
+  try {
+    // 原地切换模型：保留当前会话及上下文（对齐 CLI /model use）
+    const r = await api.chatSwitchModel(currentAgent(), old, name);
+    toast(r.message || `已切换到模型 '${name}'`, "success");
+  } catch (e) {
+    state.selectedModel = old;
+    chatUI.modelSelect.value = old;
+    toast(e.message, "error");
+    return;
+  }
+  // 会话消息未变，无需清空重渲染；仅刷新上下文用量（新模型限额可能不同）
   refreshStatus();
 }
 
@@ -1399,9 +1411,13 @@ function requireAgent() {
 async function showQuickTools() {
   const agent = requireAgent();
   if (!agent) return;
-  let data;
+  let data, mcpServers = [];
   try { data = await api.getTools(agent); }
   catch (e) { toast(e.message, "error"); return; }
+  try {
+    const mcpData = await api.getMCP(agent);
+    mcpServers = mcpData.servers || [];
+  } catch (e) { mcpServers = []; }
 
   const body = el("div", { class: "quick-list" });
   const groups = {};
@@ -1427,6 +1443,55 @@ async function showQuickTools() {
     }
   };
   for (const [cat, tools] of Object.entries(groups)) renderGroup(cat, tools);
+
+  /* ---- MCP 工具开关（与 MCP 页面"工具"按钮一致） ---- */
+  body.append(el("div", { class: "quick-section" }, "🔌 MCP 工具"));
+  if (!mcpServers.length) {
+    body.append(el("div", { class: "quick-item-desc", style: "padding:2px 2px 8px;" },
+      "暂无 MCP 服务器，可在「MCP」页面添加"));
+  } else {
+    // 并行拉取各服务器的完整工具列表（含禁用状态）
+    const perServer = await Promise.all(mcpServers.map(async (s) => {
+      try {
+        const t = await api.getMCPTools(agent, s.name);
+        return { server: s, tools: t.tools || [], error: null };
+      } catch (e) { return { server: s, tools: [], error: e.message }; }
+    }));
+    for (const { server: s, tools, error } of perServer) {
+      body.append(el("div", { class: "quick-item" },
+        el("div", { class: "quick-item-info" },
+          el("div", { class: "quick-item-name" },
+            "🔌 " + s.name, " ",
+            el("span", { class: `dot ${s.connected ? "green" : "red"}` }), " ",
+            el("span", { class: "tag" }, `${tools.length} 工具`)),
+          el("div", { class: "quick-item-desc" }, s.url || ""))));
+      if (error) {
+        body.append(el("div", { class: "quick-item-desc", style: "padding:0 2px 6px;" },
+          `工具列表加载失败: ${error}`));
+        continue;
+      }
+      if (!tools.length) {
+        body.append(el("div", { class: "quick-item-desc", style: "padding:0 2px 6px;" },
+          s.connected ? "无可用工具" : "未连接，请先在「MCP」页面刷新连接"));
+        continue;
+      }
+      for (const tool of tools) {
+        const sw = el("input", { type: "checkbox" });
+        sw.checked = tool.enabled;
+        sw.addEventListener("change", async () => {
+          try {
+            await api.toggleMCPTool(agent, s.name, tool.name, sw.checked);
+            toast(`MCP 工具 '${tool.name}' 已${sw.checked ? "启用" : "禁用"}`, "success");
+          } catch (e) { toast(e.message, "error"); sw.checked = !sw.checked; }
+        });
+        body.append(el("div", { class: "quick-item" },
+          el("div", { class: "quick-item-info" },
+            el("div", { class: "quick-item-name" }, toolIcon("mcp_" + s.name), tool.name),
+            el("div", { class: "quick-item-desc" }, tool.description || "")),
+          el("label", { class: "switch" }, sw, el("span", { class: "track" }))));
+      }
+    }
+  }
 
   openModal({
     title: `🔧 工具开关 — ${agent}`,
@@ -1502,14 +1567,14 @@ async function showQuickModel() {
       el("span", { style: "color:var(--text-dim);font-size:16px;" }, "›"));
     item.addEventListener("click", async () => {
       if (m.name === currentModel()) { $("#modal-root").innerHTML = ""; return; }
+      const old = currentModel();
       try {
-        await api.selectModel(m.name);
+        // 原地切换模型：保留当前会话及上下文（对齐 CLI /model use）
+        const r = await api.chatSwitchModel(currentAgent(), old, m.name);
         state.selectedModel = m.name;
         refreshSelectors();
         $("#modal-root").innerHTML = "";
-        toast(`已切换到模型 '${m.name}'`, "success");
-        clearMessages();
-        await restoreMessages();
+        toast(r.message || `已切换到模型 '${m.name}'`, "success");
         refreshStatus();
       } catch (e) { toast(e.message, "error"); }
     });
@@ -1782,7 +1847,14 @@ async function loadModelsView() {
           !isSel ? el("button", {
             class: "btn btn-sm",
             onclick: async () => {
-              await api.selectModel(m.name);
+              try {
+                if (state.activeAgent) {
+                  // 原地切换模型：保留当前会话及上下文（对齐 CLI /model use）
+                  await api.chatSwitchModel(state.activeAgent, state.selectedModel, m.name);
+                } else {
+                  await api.selectModel(m.name);
+                }
+              } catch (e) { toast(e.message, "error"); return; }
               state.selectedModel = m.name;
               refreshSelectors();
               toast(`已切换到 '${m.name}'`, "success");
