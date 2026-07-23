@@ -1,24 +1,35 @@
-"""思考内容滚动显示模块
+"""思考内容滚动显示模块（手动 ANSI 区域重绘，resize 安全）
 
-resize 免疫方案:
-- auto_refresh=False: 禁用后台线程, 避免与手动 update 竞态导致重复渲染
-- resize 时重新创建 Console(刷新缓存宽度) + 彻底重启 Live
-- transient=True 在重启时先 stop 旧 Live 清除旧内容, 再 start 新 Live
+为什么放弃 rich.Live（v4.9.9 重写）：
+    Live 按"自然行数"上移光标擦除。终端变窄后，已打印的长行被终端
+    reflow（1 行软换成 N 行），物理行数 > 自然行数，擦除不足 →
+    每来一个 chunk 就残留一行 💭 思考中...（连续重复）。
 
-soft-wrap 修复:
-- _truncate_text 按屏幕行数（而非自然行数）截断，避免长行 soft wrap
-  后实际显示行数超出 max_lines，导致 Live 清除行数不足产生重叠
+本方案的精确性来自三点：
+1. 区域每行都硬换行到 region_width（≤ 终端宽度），自然行数=物理行数，
+   光标上移 \\033[{n}A + 擦除到屏幕尾 \\033[J 的数学完全精确；
+2. region_width 在区域建立时固定为 min(终端宽度, 100)。终端宽度不变
+   或变宽时，已打印行绝不会被 reflow（长度 ≤ region_width ≤ 当前宽度），
+   原地重绘永远安全；
+3. 仅当终端变得比 region_width 更窄（内容可能已被 reflow，强行擦除
+   可能误删上方 AI 回答），放弃擦除：旧区域作为一次性快照留存，光标
+   已在区域下方，直接以新宽度重建区域。每次收窄最多 1 个快照，
+   不会出现连续重复。
+
+无后台线程：重绘由流式 chunk 驱动，头行实时显示已思考秒数。
 """
 import sys
 import os
+import time
 import unicodedata
-from typing import Optional, List
-
-from rich.console import Console
-from rich.live import Live
-from rich.text import Text
+from typing import List
 
 from cbhcli_pkg.core.constants import C_DIM, C_RESET
+
+# 区域换行宽度上限（越小越抗 reflow，100 是可读性与安全性的平衡）
+_MAX_REGION_WIDTH = 100
+# 区域换行宽度下限（极端窄终端兜底）
+_MIN_REGION_WIDTH = 20
 
 
 def _display_width(text: str) -> int:
@@ -26,7 +37,7 @@ def _display_width(text: str) -> int:
     width = 0
     for ch in text:
         if ch == '\t':
-            width = (width + 4) & ~3  # tab 对齐到4的倍数
+            width = (width + 4) & ~3
         elif unicodedata.east_asian_width(ch) in ('W', 'F'):
             width += 2
         else:
@@ -35,11 +46,10 @@ def _display_width(text: str) -> int:
 
 
 def _hard_wrap_line(text: str, max_width: int) -> List[str]:
-    """将一行文本按终端宽度硬换行（手动插入换行），返回拆分为恰好一屏宽的行列表。
-    
-    这是解决重叠问题的核心：Rich 的 Live 组件通过自然行数来计算清除行数，
-    但长行会因为 soft-wrap 导致实际屏幕行数 > 自然行数，清除不足产生重叠。
-    先 hard-wrap 后，每个自然行 = 一个屏幕行，Rich 的计算就完全精确。
+    """将一行文本按终端宽度硬换行，返回每行恰好 ≤ max_width 的行列表。
+
+    这是精确擦除的核心：每个自然行 = 一个物理屏幕行，
+    光标移动/区域擦除的行数计算不再受 soft-wrap 干扰。
     """
     if max_width <= 0:
         return [text]
@@ -53,7 +63,6 @@ def _hard_wrap_line(text: str, max_width: int) -> List[str]:
         elif unicodedata.east_asian_width(ch) in ('W', 'F'):
             ch_w = 2
         elif ch == '\n':
-            # 原始换行符：结束当前行，开始新行
             result.append(current_line)
             current_line = ""
             current_width = 0
@@ -73,26 +82,46 @@ def _hard_wrap_line(text: str, max_width: int) -> List[str]:
     return result
 
 
-class ThinkingDisplay:
-    """思考内容滚动显示管理器
+def _truncate_to_width(text: str, max_width: int) -> str:
+    """按显示宽度截断（防头行超长破坏行数不变量）"""
+    if _display_width(text) <= max_width:
+        return text
+    out = ""
+    w = 0
+    for ch in text:
+        ch_w = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+        if w + ch_w > max_width - 1:
+            break
+        out += ch
+        w += ch_w
+    return out + "…"
 
-    使用 rich.Live 实现原地刷新，transient=False 保留最终内容。
-    通过检测终端宽度变化并自动重启 Live 来免疫 resize 导致的
-    行数偏移问题（窗口变窄后旧内容换行增多，光标上移行数不足）。
-    不用 Panel（无框），与正常输出等宽。
+
+class ThinkingDisplay:
+    """思考内容滚动显示管理器（手动 ANSI 区域重绘）
+
+    区域结构：
+        💭 思考中... 12s        ← 头行（1 物理行，实时秒数）
+        <最近 max_lines 行思考内容>  ← 每行硬换行到 region_width
+
+    不变量：区域每行 ≤ region_width ≤ 当前终端宽度 → 无 soft-wrap →
+    打印 N 行后光标恰在区域下方 N 行处，\\033[{N}A + \\033[J 精确擦除。
     """
 
     def __init__(self, max_lines: int = 8, label: str = ""):
-        self.console = Console()
         self.max_lines = max_lines
         self.label = label
         self.full_text = ""
-        self.live: Optional[Live] = None
         self.is_thinking = False
-        self._term_width: int = 0
-        # 并行子Agent等输出被捕获的场景下设为 False：
-        # 禁用 rich.Live 原地刷新（其光标控制序列在回放时会产生乱码）
+        # 并行子Agent等输出被捕获的场景下设为 False（禁用原地重绘）
         self.enabled: bool = True
+        self._region_lines: int = 0   # 当前区域物理行数（0=无活动区域）
+        self._region_width: int = 0   # 区域建立时固定的换行宽度
+        self._start: float = 0.0
+
+    # ------------------------------------------------------------------
+    #  基础工具
+    # ------------------------------------------------------------------
 
     def _get_term_width(self) -> int:
         try:
@@ -100,124 +129,113 @@ class ThinkingDisplay:
         except (ValueError, OSError):
             return 80
 
-    def _live_start(self):
-        """创建并启动 Live，同时记录当前终端宽度。
+    @staticmethod
+    def _out(s: str):
+        sys.stdout.write(s)
+        sys.stdout.flush()
 
-        使用 auto_refresh=False 禁用后台刷新线程，避免与手动 update 竞态
-        导致 resize 时渲染重叠。
-        """
-        self._term_width = self._get_term_width()
-        self.live = Live(
-            self._render(),
-            console=self.console,
-            refresh_per_second=20,
-            transient=False,
-            auto_refresh=False,
-        )
-        self.live.start()
+    def _new_region_width(self) -> int:
+        w = self._get_term_width()
+        return max(_MIN_REGION_WIDTH, min(w, _MAX_REGION_WIDTH))
 
-    def _live_restart_if_resized(self) -> bool:
-        """检测终端宽度是否变化，若变化则彻底重启 Live。返回 True 表示已重启。"""
-        new_width = self._get_term_width()
-        if new_width != self._term_width:
-            # Step 1: 先停止旧 Live 并清除其输出
-            if self.live:
-                # 临时设置 transient=True，stop 时会调用 restore_cursor 清除内容
-                self.live.transient = True
-                self.live.stop()
-                self.live = None
+    # ------------------------------------------------------------------
+    #  渲染
+    # ------------------------------------------------------------------
 
-            # Step 2: 重新创建 Console（刷新缓存的终端宽度）
-            self.console = Console()
+    def _header(self, final: bool = False) -> str:
+        elapsed = int(time.monotonic() - self._start) if self._start else 0
+        state = "思考完毕" if final else "思考中..."
+        suffix = f" {elapsed}s" if self._start else ""
+        text = f"💭 {self.label}{state}{suffix}"
+        return _truncate_to_width(text, self._region_width)
 
-            # Step 3: 启动新 Live（新 Console + 新宽度）
-            self._live_start()
-            return True
-        return False
+    def _content_lines(self) -> List[str]:
+        """窗口化内容：硬换行后取最后 max_lines 行"""
+        if not self.full_text:
+            return ["..."]
+        text = self.full_text.strip("\n")
+        if not text:
+            return ["..."]
+        lines: List[str] = []
+        for natural_line in text.split("\n"):
+            lines.extend(_hard_wrap_line(natural_line, self._region_width))
+        return lines[-self.max_lines:]
+
+    def _draw(self, final: bool = False):
+        """重绘区域：先上移擦除旧区域，再逐行打印新区域"""
+        if self._region_lines:
+            self._out(f"\033[{self._region_lines}A\033[J")
+        lines = [self._header(final=final)] + self._content_lines()
+        buf = "".join(f"{C_DIM}{line}{C_RESET}\n" for line in lines)
+        self._out(buf)
+        self._region_lines = len(lines)
+
+    # ------------------------------------------------------------------
+    #  生命周期
+    # ------------------------------------------------------------------
 
     def start_thinking(self):
         if not self.enabled or self.is_thinking:
             return
         self.is_thinking = True
         self.full_text = ""
-        self._live_start()
+        self._start = time.monotonic()
+        self._region_width = self._new_region_width()
+        self._region_lines = 0
+        self._draw()
 
     def add_content(self, content: str):
-        if not self.enabled or not self.is_thinking or not self.live:
+        if not self.enabled or not self.is_thinking:
             return
         self.full_text += content
-        # 先检测 resize，若已重启则跳过 update（_live_start 已渲染新内容）
-        if self._live_restart_if_resized():
-            return
-        # auto_refresh=False，需要手动 refresh 让内容实时显示
-        self.live.update(self._render(), refresh=True)
+
+        current_width = self._get_term_width()
+        if current_width < self._region_width:
+            # 终端窄于区域宽度：已打印行可能已被 reflow，强行擦除可能
+            # 误删上方内容。放弃擦除，旧区域留作快照（每次收窄最多一次），
+            # 以新宽度在下方重建区域。
+            self._region_lines = 0
+            self._region_width = max(_MIN_REGION_WIDTH,
+                                     min(current_width, _MAX_REGION_WIDTH))
+        self._draw()
 
     def finish_thinking(self):
         if not self.is_thinking:
             return
         self.is_thinking = False
-        if self.live:
-            self.live.update(self._render_finished())
-            self.live.stop()
-            self.live = None
+
+        current_width = self._get_term_width()
+        if current_width < self._region_width:
+            # 同 add_content 的收窄处理：放弃擦除，快照留存
+            self._region_lines = 0
+            self._region_width = max(_MIN_REGION_WIDTH,
+                                     min(current_width, _MAX_REGION_WIDTH))
+        # 最终重绘（头行变为"思考完毕"）
+        if self._region_lines:
+            self._out(f"\033[{self._region_lines}A\033[J")
+        lines = [self._header(final=True)] + self._content_lines()
+        self._out("".join(f"{C_DIM}{line}{C_RESET}\n" for line in lines))
+        # 区域转为静态历史，不再管理
+        self._region_lines = 0
+        self._start = 0.0
 
     def cleanup(self):
-        """强制清理终端状态（用于 Ctrl+C 中断等异常场景）"""
+        """强制清理终端状态（Ctrl+C 中断等异常场景）"""
         self.is_thinking = False
-        if self.live:
+        if self._region_lines:
             try:
-                self.live.stop()
+                self._out(f"\033[{self._region_lines}A\033[J")
             except Exception:
                 pass
-            self.live = None
-        # 强制刷新终端，确保光标可见
-        sys.stdout.write("\033[?25h")  # 显示光标
+            self._region_lines = 0
+        self._start = 0.0
+        # 确保光标可见
+        sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 
-    def _truncate_text(self, text: str) -> str:
-        """去除首尾空行，按屏幕行数（hard-wrap 后）截断，只保留最后 max_lines 行。
-        
-        核心修复：先将文本按终端宽度 hard-wrap（手动插入换行），使每个"自然行"
-        恰好等于一个"屏幕行"。然后再取最后 max_lines 行。这样 Rich 的 Live 组件
-        统计到的自然行数 = 屏幕行数，清除行数完全精确，不会产生重叠。
-        """
-        text = text.strip("\n")
-        if not text:
-            return ""
-
-        term_width = max(10, self._get_term_width())
-
-        # Step 1: 先 hard-wrap 所有内容，确保每行宽度 ≤ term_width
-        all_lines: List[str] = []
-        for natural_line in text.split("\n"):
-            wrapped = _hard_wrap_line(natural_line, term_width)
-            all_lines.extend(wrapped)
-
-        # Step 2: 只保留最后 max_lines 行
-        if len(all_lines) > self.max_lines:
-            all_lines = all_lines[-self.max_lines:]
-
-        return "\n".join(all_lines)
-
-    def _render(self) -> Text:
-        text = Text()
-        text.append(f"💭 {self.label}思考中...\n", style="dim")
-        if not self.full_text:
-            text.append("...", style="dim")
-        else:
-            display = self._truncate_text(self.full_text)
-            text.append(f"{display}", style="dim")
-        return text
-
-    def _render_finished(self) -> Text:
-        text = Text()
-        text.append(f"💭 {self.label}思考完毕\n", style="dim")
-        if not self.full_text:
-            text.append("（无内容）", style="dim")
-        else:
-            display = self._truncate_text(self.full_text)
-            text.append(f"{display}", style="dim")
-        return text
+    # ------------------------------------------------------------------
+    #  信息查询
+    # ------------------------------------------------------------------
 
     def get_total_content_length(self) -> int:
         return len(self.full_text)

@@ -44,8 +44,16 @@ class ContextCompressor:
         self.llm_client = llm_client
         self.token_counter = token_counter
 
-    def compress(self, session: Session, target_tokens: int) -> bool:
-        """压缩会话上下文到目标token数"""
+    def compress(self, session: Session, target_tokens: int,
+                 instructions: str = None) -> bool:
+        """压缩会话上下文到目标token数
+
+        Args:
+            session: 会话对象
+            target_tokens: 目标 token 数
+            instructions: 可选压缩指令（如 "保留迁移方案，丢弃调试过程"），
+                          透传给摘要模型引导保留/丢弃重点
+        """
         system_messages = [msg for msg in session.messages if msg.role == "system"]
         conversation_messages = [msg for msg in session.messages
                                 if msg.role in ["user", "assistant", "tool"]]
@@ -67,7 +75,7 @@ class ContextCompressor:
             if msg.content  # 跳过空内容的 assistant（tool_calls 消息 content 可能为空）
         ])
 
-        summary = self._generate_summary(middle_text)
+        summary = self._generate_summary(middle_text, instructions)
 
         # 构建新的消息列表
         new_messages = system_messages.copy()
@@ -83,7 +91,7 @@ class ContextCompressor:
         session.replace_messages(new_messages)
         return True
 
-    def _generate_summary(self, text: str) -> str:
+    def _generate_summary(self, text: str, instructions: str = None) -> str:
         system_prompt = """你是一个对话摘要专家。请总结以下对话的关键信息:
 - 用户的需求和目标
 - 执行的重要操作
@@ -92,6 +100,14 @@ class ContextCompressor:
 - 当前的任务状态
 
 请保持简洁,但要保留所有重要的技术细节(如文件路径、命令、错误信息等)。"""
+
+        # 用户压缩指令（保留/丢弃重点），优先级最高
+        if instructions:
+            system_prompt += (
+                f"\n\n【用户的压缩要求（必须严格遵守）】\n{instructions}\n"
+                f"用户明确要求保留的信息必须完整保留在摘要中，"
+                f"用户明确要求丢弃的信息一律不得出现在摘要中。"
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},

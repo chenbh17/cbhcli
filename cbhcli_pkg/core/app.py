@@ -15,6 +15,10 @@ from cbhcli_pkg.core.subagent import SubAgentScheduler
 from cbhcli_pkg.core.tool_executor import ToolExecutor
 from cbhcli_pkg.core.ai_handler import AIHandler
 from cbhcli_pkg.core.mcp_manager import MCPManager
+from cbhcli_pkg.core.permissions import PermissionEngine, MODE_META
+from cbhcli_pkg.core.hooks import HookManager
+from cbhcli_pkg.core.checkpoint import CheckpointManager
+from cbhcli_pkg.core.tracer import Tracer
 from cbhcli_pkg.core.constants import (
     C_RESET, C_DIM, C_USER_BG, C_USER_FG, C_AI_HINT, C_SEP,
     DEFAULT_CONTEXT_LIMIT, DEFAULT_COMPRESSION_RATIO
@@ -69,6 +73,7 @@ from cbhcli_pkg.commands.mcp_cmd import register_mcp_commands
 from cbhcli_pkg.commands.skills_cmd import register_skills_commands
 from cbhcli_pkg.commands.tools_cmd import register_tools_commands
 from cbhcli_pkg.commands.fallback_cmd import register_fallback_commands
+from cbhcli_pkg.commands.harness_cmd import register_harness_commands
 
 
 class SlashCommandHelper:
@@ -160,6 +165,26 @@ class SlashCommandHelper:
         'fallback clear': [
             ('main', '清空主模型备用'),
             ('vision', '清空视觉模型备用'),
+        ],
+        'mode': [
+            ('readonly', '只读模式：AI 只能查看不能修改'),
+            ('standard', '标准模式：危险操作逐个确认（默认）'),
+            ('auto', '自动模式：工作区内写操作自动放行'),
+            ('yolo', '最高权限：全部直接执行零确认'),
+            ('list', '查看当前模式与所有模式说明'),
+        ],
+        'permissions': [
+            ('list', '查看权限规则'),
+            ('add', '添加规则: /permissions add <allow|ask|deny> <规则>'),
+            ('rm', '删除规则: /permissions rm <allow|ask|deny> <规则>'),
+        ],
+        'hooks': [
+            ('list', '查看已配置钩子'),
+            ('reload', '重新加载 hooks.json'),
+            ('test', '测试触发钩子: /hooks test <事件名>'),
+        ],
+        'undo': [
+            ('list', '查看可回滚的文件备份'),
         ],
     }
     
@@ -306,6 +331,10 @@ class CBHCLIApp:
         
         # 工具执行器（延迟初始化vector_store后添加memory_search）
         self.tool_executor = ToolExecutor(self.tool_registry)
+
+        # 权限规则引擎（Harness 治理层，全局单例，Shift+Tab 热切换模式）
+        self.permission_engine = PermissionEngine()
+        self.tool_executor.permission_engine = self.permission_engine
     
     def _init_vector_store(self):
         """初始化向量存储（可选）"""
@@ -374,6 +403,7 @@ class CBHCLIApp:
         register_skills_commands(self.command_parser, self)
         register_tools_commands(self.command_parser, self)
         register_fallback_commands(self.command_parser, self)
+        register_harness_commands(self.command_parser, self)
         
         # 注册help命令
         def help_handler(args):
@@ -469,6 +499,12 @@ class CBHCLIApp:
         # 初始化技能管理器（每个 Agent 独立）
         self.skill_manager = SkillManager(config.workspace_path)
 
+        # Harness 组件（每个 Agent 独立，挂到工具执行器）
+        self.hook_manager = HookManager(config.workspace_path, agent_name)
+        self.checkpoint_manager = CheckpointManager(config.workspace_path)
+        self.tool_executor.hook_manager = self.hook_manager
+        self.tool_executor.checkpoint_manager = self.checkpoint_manager
+
         # 应用 Agent 工具开关设置
         self.tool_registry.set_disabled_tools(config.disabled_tools or [])
         
@@ -485,6 +521,16 @@ class CBHCLIApp:
                 print(f"⚠️  索引工作空间失败: {e}")
         
         self._reset_session()
+
+        # SessionStart 钩子（stdout 打印给用户）
+        if self.hook_manager and self.hook_manager.has_hooks("SessionStart"):
+            decision = self.hook_manager.run_simple(
+                "SessionStart",
+                session_id=self.session.id if self.session else "")
+            for line in decision.outputs:
+                print(f"{C_DIM}[hook:SessionStart] {line}{C_RESET}")
+            for warn in decision.warnings:
+                print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
         return True
 
     def switch_model(self, model_config: dict):
@@ -529,24 +575,35 @@ class CBHCLIApp:
         
         # 重置 Python 会话（清空变量记忆）
         remove_python_session("default")
-        
+
         self.session = Session(agent_name=self.current_agent_name)
-        
+
+        # 可观测性 tracer（每会话一个 JSONL 文件，挂到工具执行器）
+        self.tracer = Tracer(self.current_agent_config.workspace_path,
+                             self.session.id)
+        self.tool_executor.tracer = self.tracer
+        self.tool_executor.session_id = self.session.id
+
+        # 权限模式回落默认 + 确认状态随新会话重置
+        if self.permission_engine:
+            self.permission_engine.reset_to_default()
+        self.tool_executor.no_more_confirmations = False
+
         # 获取模型名称
         model_name = ""
         if self.llm_client and hasattr(self.llm_client, 'model_name'):
             model_name = self.llm_client.model_name
         elif self.current_agent_config.primary_model:
             model_name = self.current_agent_config.primary_model
-        
+
         # 读取 memory.md 内容，始终包含在系统提示中
         memory_content = self._load_memory_md()
-        
+
         # 获取已激活技能的提示内容
         active_skills_prompt = ""
         if self.skill_manager:
             active_skills_prompt = self.skill_manager.build_skills_prompt()
-        
+
         supports_vision = self.llm_client.supports_vision if self.llm_client else False
         system_prompt = self.current_persona.build_system_prompt(
             agent_name=self.current_agent_name or "",
@@ -556,6 +613,8 @@ class CBHCLIApp:
             cwd=os.getcwd(),
             supports_vision=supports_vision
         )
+        # 注入当前权限模式说明（readonly/auto/yolo 时告知模型行为边界）
+        system_prompt += self._permission_mode_note()
         system_token_count = self.token_counter.count_tokens(system_prompt)
         self.session.add_message("system", system_prompt, token_count=system_token_count)
         
@@ -608,7 +667,9 @@ class CBHCLIApp:
             cwd=os.getcwd(),
             supports_vision=supports_vision
         )
-        
+        # 注入当前权限模式说明（与 _reset_session 保持一致）
+        system_prompt += self._permission_mode_note()
+
         # 原地替换 system 消息
         if self.session.messages and self.session.messages[0].role == "system":
             self.session.messages[0].content = system_prompt
@@ -632,6 +693,42 @@ class CBHCLIApp:
             else:
                 self.context_window.tools_schema_tokens = 0
     
+    # ==================================================================
+    #  权限模式管理（Harness 治理层）
+    # ==================================================================
+
+    def cycle_permission_mode(self) -> str:
+        """Shift+Tab 循环切换权限模式（由输入框快捷键调用）
+
+        Returns:
+            切换后的新模式名
+        """
+        old_mode = self.permission_engine.mode
+        new_mode = self.permission_engine.cycle_mode()
+        if getattr(self, "tracer", None):
+            self.tracer.log_mode_change(old_mode, new_mode)
+        # 模式说明注入系统提示（原地更新，不影响会话）
+        self._update_system_prompt()
+        return new_mode
+
+    def set_permission_mode(self, mode: str) -> bool:
+        """/mode 命令设置权限模式"""
+        if not self.permission_engine or mode not in MODE_META:
+            return False
+        old_mode = self.permission_engine.mode
+        self.permission_engine.set_mode(mode)
+        if getattr(self, "tracer", None):
+            self.tracer.log_mode_change(old_mode, mode)
+        self._update_system_prompt()
+        return True
+
+    def _permission_mode_note(self) -> str:
+        """根据当前权限模式生成注入系统提示的说明文本"""
+        if not getattr(self, "permission_engine", None):
+            return ""
+        from cbhcli_pkg.core.permissions import build_mode_note
+        return build_mode_note(self.permission_engine.mode)
+
     def _load_memory_md(self) -> str:
         """读取 memory.md 文件内容
         
@@ -661,12 +758,22 @@ class CBHCLIApp:
                 pass
         return ""
     
-    def _compress_context(self) -> bool:
-        """压缩上下文"""
+    def _compress_context(self, instructions: str = "") -> bool:
+        """压缩上下文
+
+        Args:
+            instructions: 可选的压缩指令（保留/丢弃重点），透传给摘要模型
+        """
         if not self.context_compressor or not self.session:
             return False
+        before = self.session.get_total_tokens(self.token_counter)
         target_tokens = self.context_window.trigger_threshold()
-        return self.context_compressor.compress(self.session, target_tokens)
+        success = self.context_compressor.compress(
+            self.session, target_tokens, instructions=instructions or None)
+        if getattr(self, "tracer", None):
+            after = self.session.get_total_tokens(self.token_counter)
+            self.tracer.log_compress(success, before, after)
+        return success
     
     def _check_and_compress_context(self):
         """检查并自动压缩上下文"""
@@ -737,7 +844,20 @@ class CBHCLIApp:
         """处理AI请求 - 委托给AIHandler"""
         # 检查上下文压缩
         self._check_and_compress_context()
-        
+
+        # UserPromptSubmit 钩子：stdout 追加为用户上下文（如 git 分支状态）
+        if getattr(self, "hook_manager", None) and \
+                self.hook_manager.has_hooks("UserPromptSubmit"):
+            decision = self.hook_manager.run_simple(
+                "UserPromptSubmit",
+                extra_args={"prompt": user_input},
+                session_id=self.session.id if self.session else "")
+            extra = decision.merged_output()
+            if extra:
+                user_input = f"{user_input}\n\n[钩子补充上下文]\n{extra}"
+            for warn in decision.warnings:
+                print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
+
         # 创建AI处理器
         handler = AIHandler(
             self.llm_client,
@@ -745,16 +865,16 @@ class CBHCLIApp:
             self.tool_executor,
             self.token_counter
         )
-        
+
         # 注入子Agent调度器
         handler.subagent_scheduler = self.subagent_scheduler
         handler.agent_name = self.current_agent_name or "main"
-        
+
         # 注入备用主模型列表
         from cbhcli_pkg.config.global_config import GlobalConfig
         gc = GlobalConfig()
         handler.fallback_models = gc.get_fallback_models()
-        
+
         # 注入上下文压缩相关组件（用于 ReAct 循环内自动压缩）
         handler.context_compressor = self.context_compressor
         handler.context_window = self.context_window
@@ -762,12 +882,22 @@ class CBHCLIApp:
             self.current_agent_config.auto_compress
             if self.current_agent_config else True
         )
-        
+
         # 设置记忆更新回调
         handler.on_memory_update(self._update_memory)
-        
+
         # 处理请求
         handler.process_request(user_input)
+
+        # Stop 钩子：AI 回复完成后触发（通知/自动保存等）
+        if getattr(self, "hook_manager", None) and \
+                self.hook_manager.has_hooks("Stop"):
+            decision = self.hook_manager.run_simple(
+                "Stop", session_id=self.session.id if self.session else "")
+            for line in decision.outputs:
+                print(f"{C_DIM}[hook:Stop] {line}{C_RESET}")
+            for warn in decision.warnings:
+                print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
     
     def _update_memory(self, user_input: str, ai_response: str):
         """更新记忆回调 - 仅用于保存会话历史
@@ -777,16 +907,82 @@ class CBHCLIApp:
         """
         pass  # 会话历史在 _reset_session 时自动保存
     
+    # 权限模式在欢迎面板中的圆点颜色（ANSI）
+    _MODE_ANSI = {
+        "readonly": "\033[94m",   # 亮蓝
+        "standard": "\033[92m",   # 亮绿
+        "auto": "\033[93m",       # 亮黄
+        "yolo": "\033[91m",       # 亮红
+    }
+
     def _show_welcome(self):
-        """显示欢迎信息"""
+        """显示欢迎信息（ASCII 艺术字 + 信息面板）
+
+        全部使用宽度安全的字符（█/╗/● 等宽1字符），动态内容用
+        text_width.display_width（字素簇感知）计算补齐，杜绝 emoji
+        宽度歧义导致的边框错位。
+        """
         from cbhcli_pkg import __version__
-        tw = self._get_terminal_width()
-        print(f"\n{C_SEP}{'═' * tw}{C_RESET}")
-        print(f"  CBHCLI v{__version__} - AI命令行助手")
-        print(f"{C_DIM}  输入 'quit' 退出 | /help 查看帮助{C_RESET}")
-        if self.current_agent_name:
-            print(f"{C_DIM}  当前Agent: {self.current_agent_name}{C_RESET}")
-        print(f"{C_SEP}{'═' * tw}{C_RESET}\n")
+        from cbhcli_pkg.core.text_width import display_width as _dw
+
+        # CBHCLI 艺术字（46 列宽，纯宽1字符）
+        art = [
+            " ██████╗██████╗ ██╗  ██╗ ██████╗██╗     ██╗",
+            "██╔════╝██╔══██╗██║  ██║██╔════╝██║     ██║",
+            "██║     ██████╔╝███████║██║     ██║     ██║",
+            "██║     ██╔══██╗██╔══██║██║     ██║     ██║",
+            "╚██████╗██████╔╝██║  ██║╚██████╗███████╗██║",
+            " ╚═════╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝",
+        ]
+        C_ART = "\033[96m"      # 亮青
+        C_TXT = "\033[97m"      # 亮白
+        C_VAL = "\033[36m"      # 青
+
+        agent = self.current_agent_name or "main"
+        model_name = ""
+        if self.llm_client and hasattr(self.llm_client, 'model_name'):
+            model_name = self.llm_client.model_name
+        elif self.current_agent_config and self.current_agent_config.primary_model:
+            model_name = self.current_agent_config.primary_model
+        mode = self.permission_engine.mode \
+            if getattr(self, "permission_engine", None) else "standard"
+        mode_meta = MODE_META[mode]
+        mode_ansi = self._MODE_ANSI.get(mode, "")
+
+        # 信息行（分段着色；纯文本部分用于宽度计算）
+        info1 = [(f"v{__version__} · AI 驱动的终端助手", C_DIM)]
+        info2 = [("Agent ", C_DIM), (agent, C_VAL),
+                 ("  │  模型 ", C_DIM), (model_name or "未配置", C_VAL),
+                 ("  │  权限 ", C_DIM), ("●", mode_ansi),
+                 (f" {mode_meta['label']}", C_TXT)]
+        info3 = [("quit 退出 · /help 帮助 · Shift+Tab 切换权限模式", C_DIM)]
+
+        # 内容宽度 = 艺术字、信息行中最宽者
+        def _segs_width(segs):
+            return _dw("".join(t for t, _ in segs))
+
+        content_w = max(
+            max(_dw(line) for line in art),
+            _segs_width(info1), _segs_width(info2), _segs_width(info3),
+        )
+        content_w = min(content_w, self._get_terminal_width() - 6)
+
+        def _row(segments, color: str = "") -> str:
+            body_plain = "".join(t for t, _ in segments)
+            pad = max(0, content_w - _dw(body_plain))
+            body = "".join(
+                f"{c}{t}{C_RESET}" if c else t for t, c in segments)
+            return f"{C_SEP}│{C_RESET} {body}{' ' * pad} {C_SEP}│{C_RESET}"
+
+        border = "─" * (content_w + 2)
+        print(f"\n{C_SEP}╭{border}╮{C_RESET}")
+        for line in art:
+            print(_row([(line, C_ART)]))
+        print(_row([("", "")]))  # 空行
+        print(_row(info1))
+        print(_row(info2))
+        print(_row(info3))
+        print(f"{C_SEP}╰{border}╯{C_RESET}\n")
     
     @staticmethod
     def _get_terminal_width() -> int:

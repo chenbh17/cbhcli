@@ -335,6 +335,69 @@ html, body {
 .ctx-meter-fill.danger { background: var(--danger); }
 .ctx-meter-text { font-size: 11.5px; color: var(--text-2); font-family: var(--font-mono); min-width: 40px; }
 
+/* 权限模式徽标（点击循环切换，按模式着色） */
+.mode-badge {
+  display: flex; align-items: center;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid var(--border, #333);
+  background: var(--bg-2, #1c1e24);
+  transition: background 0.2s, border-color 0.2s;
+}
+.mode-badge:hover { filter: brightness(1.25); }
+.mode-badge[data-mode="readonly"] { color: #87afff; border-color: #87afff55; }
+.mode-badge[data-mode="standard"] { color: #87ff87; border-color: #87ff8755; }
+.mode-badge[data-mode="auto"] { color: #ffd75f; border-color: #ffd75f55; }
+.mode-badge[data-mode="yolo"] {
+  color: #ff5f5f; border-color: #ff5f5f88;
+  animation: mode-yolo-pulse 1.6s ease-in-out infinite;
+}
+@keyframes mode-yolo-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 95, 95, 0.35); }
+  50% { box-shadow: 0 0 8px 2px rgba(255, 95, 95, 0.25); }
+}
+
+/* ===== 安全视图：权限模式卡片 ===== */
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.mode-card {
+  border: 1px solid var(--border, #333);
+  border-radius: 8px;
+  padding: 12px;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  background: var(--bg-2, #1c1e24);
+  position: relative;
+}
+.mode-card:hover { filter: brightness(1.2); }
+.mode-card.active { border-width: 2px; }
+.mode-card.blue.active { border-color: #87afff; }
+.mode-card.green.active { border-color: #87ff87; }
+.mode-card.yellow.active { border-color: #ffd75f; }
+.mode-card.red.active { border-color: #ff5f5f; }
+.mode-card-icon { font-size: 20px; margin-bottom: 6px; }
+.mode-card-name { font-weight: 600; font-size: 13.5px; font-family: var(--font-mono); margin-bottom: 4px; }
+.mode-card-desc { font-size: 11.5px; color: var(--text-2); line-height: 1.5; }
+.mode-card .tag { position: absolute; top: 8px; right: 8px; }
+
+/* 规则添加行 */
+.rule-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+/* Hooks 事件分组 */
+.hook-event { margin-top: 8px; font-weight: 600; font-size: 12.5px; }
+
 .chat-messages {
   flex: 1;
   overflow-y: auto;

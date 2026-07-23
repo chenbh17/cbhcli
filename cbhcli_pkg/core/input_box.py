@@ -160,6 +160,11 @@ class ChatInputBox:
             'bottom-toolbar.skills': '#87ff87 bg:#1c1e24',
             'bottom-toolbar.cwd': '#87afff bg:#1c1e24',
             'bottom-toolbar.sep': '#444444 bg:#1c1e24',
+            # 权限模式指示（Shift+Tab 切换）
+            'bottom-toolbar.mode-readonly': 'bold #87afff bg:#1c1e24',
+            'bottom-toolbar.mode-standard': 'bold #87ff87 bg:#1c1e24',
+            'bottom-toolbar.mode-auto': 'bold #ffd75f bg:#1c1e24',
+            'bottom-toolbar.mode-yolo': 'bold #ff5f5f bg:#1c1e24',
             'completion-menu': 'bg:#333333',
             'completion-menu.completion': 'bg:#333333 #cccccc',
             'completion-menu.completion.current': 'bold bg:#00bcd4 #000000',
@@ -209,6 +214,51 @@ class ChatInputBox:
             mode = "详细" if self._app.tool_verbose else "简洁"
             print(f"\n{C_SEP}工具显示: {mode}{C_RESET}")
 
+        @self._bindings.add('s-tab')
+        def _cycle_permission_mode(event):
+            """Shift+Tab 循环切换权限模式（readonly→standard→auto→yolo）
+
+            进入 yolo 需 3 秒内再按一次 Shift+Tab 确认（防误触）。
+            """
+            import time as _time
+            from prompt_toolkit.application import run_in_terminal
+            from cbhcli_pkg.core.permissions import MODES, MODE_META
+
+            app = self._app
+            engine = getattr(app, "permission_engine", None)
+            if engine is None:
+                return
+
+            old_mode = engine.mode
+            next_mode = MODES[(MODES.index(old_mode) + 1) % len(MODES)]
+
+            # yolo 二次确认：第一次落入只显示警告并暂存，3 秒内再按确认
+            if next_mode == "yolo":
+                pending = getattr(self, "_yolo_pending_at", 0)
+                if _time.monotonic() - pending > 3:
+                    self._yolo_pending_at = _time.monotonic()
+
+                    def _warn():
+                        print(f"\n\033[41;97m ⚠️  YOLO 模式将无确认执行一切操作"
+                              f"（含 rm/git push），deny 红线降级为警告。 \033[0m")
+                        print(f"\033[2m   3 秒内再按一次 Shift+Tab 确认进入 YOLO，"
+                              f"否则保持在 {old_mode} 模式\033[0m")
+                    run_in_terminal(_warn)
+                    event.app.invalidate()
+                    return
+                self._yolo_pending_at = 0  # 确认，清除暂存
+            else:
+                self._yolo_pending_at = 0
+
+            new_mode = app.cycle_permission_mode()
+            meta = MODE_META[new_mode]
+
+            def _notice():
+                print(f"\n{meta['icon']} 权限模式: {old_mode} → {new_mode}"
+                      f" — {meta['desc']}")
+            run_in_terminal(_notice)
+            event.app.invalidate()
+
     def _build_toolbar(self):
         """构建底部状态栏（单行，图标+亮色标识，完整路径）"""
         app = self._app
@@ -256,6 +306,17 @@ class ChatInputBox:
         # 必须使用 (style, text) 元组列表显式指定 class。
         sep = ("class:bottom-toolbar.sep", " │ ")
         parts: list[tuple[str, str]] = []
+
+        # 权限模式（Shift+Tab 切换，按模式着色）
+        # 用 ●（宽1全兼容）代替 emoji 圆点：🟢🟡🔴 等新版 emoji 在部分
+        # 终端字体下宽度表缺失/字形缺失，导致后续文字被覆盖或显示豆腐块
+        if getattr(app, "permission_engine", None):
+            mode = app.permission_engine.mode
+            meta = app.permission_engine.mode_meta()
+            parts.append((f"class:bottom-toolbar.mode-{mode}",
+                          f"● {meta['label']}"))
+            parts.append(sep)
+
         parts.append(("class:bottom-toolbar.label", "模型: "))
         parts.append(("class:bottom-toolbar.model", model_name))
         if ctx_info:

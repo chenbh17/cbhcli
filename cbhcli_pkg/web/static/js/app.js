@@ -47,6 +47,22 @@ const api = {
   reorderFallback: (cat, order) =>
     request(`/fallback/${cat}/reorder`, { method: "PUT", body: JSON.stringify({ order }) }),
 
+  // Harness 权限
+  getPermissions: () => request("/permissions"),
+  setPermissionMode: (mode) =>
+    request("/permissions/mode", { method: "POST", body: JSON.stringify({ mode }) }),
+  updatePermissionRule: (action, category, rule) =>
+    request("/permissions/rules", { method: "POST", body: JSON.stringify({ action, category, rule }) }),
+
+  // Harness 钩子
+  getHooks: (agent) => request(`/hooks/${enc(agent)}`),
+  reloadHooks: (agent) => request(`/hooks/${enc(agent)}/reload`, { method: "POST" }),
+
+  // Harness 检查点回滚
+  getBackups: (agent) => request(`/agents/${enc(agent)}/backups`),
+  undoBackup: (agent, backup_id) =>
+    request(`/agents/${enc(agent)}/undo`, { method: "POST", body: JSON.stringify({ backup_id: backup_id || null }) }),
+
   // Agent
   getAgents: () => request("/agents"),
   createAgent: (d) => request("/agents", { method: "POST", body: JSON.stringify(d) }),
@@ -125,8 +141,8 @@ const api = {
   chatMessages: (a, m) => request(`/chat/messages?agent_name=${enc(a)}&model_name=${enc(m)}`),
   chatLoad: (agent_name, model_name, filename) =>
     request("/chat/load", { method: "POST", body: JSON.stringify({ agent_name, model_name, filename }) }),
-  chatCompress: (agent_name, model_name) =>
-    request("/chat/compress", { method: "POST", body: JSON.stringify({ agent_name, model_name }) }),
+  chatCompress: (agent_name, model_name, instructions) =>
+    request("/chat/compress", { method: "POST", body: JSON.stringify({ agent_name, model_name, instructions: instructions || "" }) }),
   chatUpload: (file, a, m) => {
     const fd = new FormData();
     fd.append("file", file);
@@ -690,6 +706,7 @@ const VIEW_LOADERS = {
   mcp: loadMCPView,
   knowledge: loadKnowledgeView,
   tools: loadToolsView,
+  security: loadSecurityView,
   embedding: loadEmbeddingView,
   history: loadHistoryView,
   settings: loadSettingsView,
@@ -749,6 +766,8 @@ function initChatView() {
   chatUI.ctxText = $("#ctx-meter-text");
   chatUI.ctxMeter = $("#ctx-meter");
   chatUI.hint = $("#composer-hint");
+  chatUI.modeBadge = $("#mode-badge");
+  chatUI.modeBadgeText = $("#mode-badge-text");
 
   chatUI.agentSelect.addEventListener("change", onAgentChange);
   chatUI.modelSelect.addEventListener("change", onModelChange);
@@ -758,9 +777,12 @@ function initChatView() {
   chatUI.fileInput.addEventListener("change", handleFiles);
   $("#btn-new-session").addEventListener("click", newSession);
   $("#btn-compress").addEventListener("click", manualCompress);
+  $("#btn-undo").addEventListener("click", showUndoModal);
   $("#btn-quick-tools").addEventListener("click", showQuickTools);
   $("#btn-quick-skills").addEventListener("click", showQuickSkills);
   $("#btn-quick-model").addEventListener("click", showQuickModel);
+  chatUI.modeBadge.addEventListener("click", cyclePermissionMode);
+  loadPermissionMode();
 
   chatUI.input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && e.altKey && !e.isComposing) {
@@ -788,6 +810,45 @@ function autoGrow() {
   const ta = chatUI.input;
   ta.style.height = "auto";
   ta.style.height = Math.min(ta.scrollHeight, 180) + "px";
+}
+
+/* ---- 权限模式徽标（Harness 治理层） ---- */
+const MODE_ORDER = ["readonly", "standard", "auto", "yolo"];
+
+async function loadPermissionMode() {
+  try {
+    const p = await api.getPermissions();
+    renderModeBadge(p.mode, p.modes);
+  } catch { /* 权限引擎不可用时静默 */ }
+}
+
+function renderModeBadge(mode, modes) {
+  if (!chatUI.modeBadge) return;
+  const meta = (modes || []).find(m => m.id === mode);
+  chatUI.modeBadgeText.textContent = meta ? `${meta.icon} ${meta.label}` : mode;
+  chatUI.modeBadge.dataset.mode = mode;
+  chatUI.modeBadge.title = meta ? `权限模式: ${meta.desc}（点击切换）` : "权限模式";
+}
+
+async function cyclePermissionMode() {
+  try {
+    const p = await api.getPermissions();
+    const next = MODE_ORDER[(MODE_ORDER.indexOf(p.mode) + 1) % MODE_ORDER.length];
+    if (next === "yolo") {
+      const ok = await confirmDialog(
+        "开启 YOLO 模式?",
+        "YOLO 模式将无确认执行一切操作（含 rm / git push 等），deny 红线降级为警告。\n\n确认开启？",
+        { danger: true, okText: "开启 YOLO" });
+      if (!ok) return;
+    }
+    const r = await api.setPermissionMode(next);
+    renderModeBadge(r.mode, r.modes);
+    const meta = (r.modes || []).find(m => m.id === r.mode);
+    toast(`权限模式: ${meta ? meta.icon + " " + meta.label : r.mode}`,
+          r.mode === "yolo" ? "warn" : "success");
+  } catch (e) {
+    toast(e.message, "error");
+  }
 }
 
 async function onAgentChange() {
@@ -1123,6 +1184,7 @@ async function runStream(userContent, images) {
       el("div", { class: "confirm-actions" },
         el("button", { class: "btn btn-sm btn-success", "data-r": "y" }, "✓ 允许"),
         el("button", { class: "btn btn-sm btn-danger", "data-r": "n" }, "✕ 拒绝"),
+        el("button", { class: "btn btn-sm", "data-r": "always" }, "始终允许"),
         el("button", { class: "btn btn-sm", "data-r": "all" }, "全部允许")));
     rec.confirmEl = confirmEl;
     aiBody.append(confirmEl);
@@ -1244,6 +1306,32 @@ async function runStream(userContent, images) {
       const rec = ensureToolCard(d.tool_id, d.tool_name);
       setToolStatus(rec, "已拒绝", "red");
       rec.confirmEl?.remove();
+    },
+    tool_denied(d) {
+      // 权限规则 / PreToolUse 钩子拦截（Harness 治理层）
+      const rec = ensureToolCard(d.tool_id, d.tool_name);
+      setToolStatus(rec, "已拦截", "red");
+      rec.confirmEl?.remove();
+      addSysEvent(`🚫 ${d.reason || "操作被拦截"}`, "error", "🚫");
+    },
+    tool_yolo_warn(d) {
+      const rec = ensureToolCard(d.tool_id, d.tool_name);
+      setToolStatus(rec, "红线警告", "red");
+      addSysEvent(`⚠️ [YOLO] ${d.tool_name} 命中红线规则 ${d.rule}，已放行`, "warn", "⚠️");
+    },
+    loop_detected(d) {
+      const text = d.verdict === "block"
+        ? `🛑 死循环熔断: 已阻止 ${d.tool_name} 重复调用，告知模型换策略`
+        : d.verdict === "abort"
+          ? `🛑 模型多次陷入死循环，已熔断本轮任务`
+          : `⚠️ 检测到疑似死循环（${d.tool_name} 重复调用），已提醒模型`;
+      addSysEvent(text, "warn", "🔁");
+    },
+    rule_added(d) {
+      addSysEvent(`✅ 已添加永久放行规则: ${d.rule}`, "success", "🛡️");
+    },
+    hook_output(d) {
+      addSysEvent(`[hook:${d.event}] ${d.content}`, "info", "🪝");
     },
     ask_user: handleAskUser,
     reflection(d) {
@@ -1390,11 +1478,64 @@ async function newSession() {
 }
 
 async function manualCompress() {
+  // 可选压缩指令（保留/丢弃重点），对应 CLI /comp <指令>
+  const instructions = await promptDialog(
+    "手动压缩上下文",
+    [{ key: "instructions", label: "压缩指令（可选）", value: "",
+       placeholder: "例如：保留迁移方案，丢弃调试过程。留空则默认压缩",
+       type: "text", hint: "指令将指导摘要模型保留/丢弃特定内容" }],
+    "压缩");
+  if (instructions === null) return;  // 用户取消
   try {
-    const r = await api.chatCompress(currentAgent(), currentModel());
+    const r = await api.chatCompress(currentAgent(), currentModel(),
+                                     (instructions.instructions || "").trim());
     toast(r.message, r.compressed ? "success" : "info");
     if (r.usage) updateCtxMeter(r.usage);
   } catch (e) { toast(e.message, "error"); }
+}
+
+/* ---- 文件回滚（/undo） ---- */
+async function showUndoModal() {
+  const agent = requireAgent();
+  if (!agent) return;
+  let data;
+  try { data = await api.getBackups(agent); }
+  catch (e) { toast(e.message, "error"); return; }
+  const backups = data.backups || [];
+
+  const body = el("div");
+  if (!backups.length) {
+    body.append(el("p", { style: "color:var(--text-2);" },
+      "暂无可回滚的备份。write/edit 工具执行前会自动备份目标文件。"));
+  } else {
+    body.append(el("p", { style: "color:var(--text-2);font-size:12.5px;margin-bottom:10px;" },
+      `共 ${backups.length} 份备份（write/edit 前自动创建），点击恢复对应文件。`));
+    const list = el("div", { class: "reorder-list" });
+    for (const b of backups) {
+      const kind = b.existed ? "修改" : "新建";
+      list.append(el("div", { class: "reorder-item" },
+        el("span", { class: "tag " + (b.existed ? "blue" : "green") }, kind),
+        el("span", { class: "reorder-name", style: "font-size:12px;",
+                     title: b.path }, `${(b.ts || "").slice(5, 16).replace("T", " ")}  ${b.path}`),
+        el("button", {
+          class: "btn btn-sm",
+          onclick: async (e) => {
+            e.target.disabled = true;
+            try {
+              const r = await api.undoBackup(agent, b.id);
+              toast(r.message, "success");
+              m.close();
+            } catch (err) {
+              toast(err.message, "error");
+              e.target.disabled = false;
+            }
+          },
+        }, "恢复")));
+    }
+    body.append(list);
+  }
+
+  const m = openModal({ title: "↩️ 回滚文件修改", body, width: "640px" });
 }
 
 /* ===================================================================
@@ -2029,6 +2170,157 @@ function showModelForm(m) {
 /* ===================================================================
    9. 备用模型视图
    =================================================================== */
+
+/* ===================================================================
+   安全视图（权限模式 + 权限规则 + Hooks 管理）
+   =================================================================== */
+
+const SEC_MODE_COLORS = { readonly: "blue", standard: "green", auto: "yellow", yolo: "red" };
+
+async function loadSecurityView() {
+  const root = $("#view-security");
+  root.innerHTML = "";
+  const [perm, hooksData] = await Promise.all([
+    api.getPermissions(),
+    currentAgent() ? api.getHooks(currentAgent()).catch(() => ({ hooks: {} })) : { hooks: {} },
+  ]);
+
+  const inner = pageShell("安全与钩子",
+    "权限模式决定 AI 操作的放行策略；Hooks 是生命周期事件上自动执行的自定义命令（硬规则）");
+  root.append(el("div", { class: "page" }, inner));
+
+  /* ---- 权限模式（4 卡片） ---- */
+  inner.append(el("div", { class: "section-title" }, "权限模式"));
+  const modeGrid = el("div", { class: "mode-grid" });
+  for (const m of perm.modes || []) {
+    const color = SEC_MODE_COLORS[m.id] || "blue";
+    const card = el("div", {
+      class: `mode-card ${color}` + (m.current ? " active" : ""),
+      title: "点击切换到此模式",
+      onclick: async () => {
+        if (m.current) return;
+        if (m.id === "yolo") {
+          const ok = await confirmDialog("开启 YOLO 模式?",
+            "YOLO 模式将无确认执行一切操作（含 rm / git push 等），deny 红线降级为警告。\n\n确认开启？",
+            { danger: true, okText: "开启 YOLO" });
+          if (!ok) return;
+        }
+        try {
+          await api.setPermissionMode(m.id);
+          toast(`权限模式已切换: ${m.icon} ${m.label}`, m.id === "yolo" ? "warn" : "success");
+          loadSecurityView();
+          loadPermissionMode();  // 同步聊天头部徽标
+        } catch (e) { toast(e.message, "error"); }
+      },
+    },
+      el("div", { class: "mode-card-icon" }, m.icon),
+      el("div", { class: "mode-card-name" }, m.id),
+      el("div", { class: "mode-card-desc" }, m.desc),
+      m.current ? el("div", { class: "tag " + color }, "当前") : null);
+    modeGrid.append(card);
+  }
+  inner.append(modeGrid);
+  inner.append(el("div", { class: "card-sub", style: "margin:6px 0 4px;" },
+    `默认模式: ${perm.default_mode} · yolo_keep_deny: ${perm.yolo_keep_deny}（配置文件 ~/.cbhcli/permissions.json）`));
+
+  /* ---- 权限规则管理 ---- */
+  inner.append(el("div", { class: "section-title", style: "margin-top:18px;" }, "权限规则（用户自定义）"));
+
+  const addRow = el("div", { class: "rule-add-row" });
+  const catSel = el("select", { class: "select", style: "width:110px;" },
+    el("option", { value: "allow" }, "✅ allow"),
+    el("option", { value: "ask" }, "❓ ask"),
+    el("option", { value: "deny" }, "🚫 deny"));
+  const ruleInput = el("input", {
+    class: "input", style: "flex:1;",
+    placeholder: "规则，如 terminal(pytest:*) · edit(/project/**) · python(*)",
+  });
+  const addBtn = el("button", { class: "btn btn-primary btn-sm" }, "添加");
+  const doAdd = async () => {
+    const rule = ruleInput.value.trim();
+    if (!rule) return;
+    try {
+      await api.updatePermissionRule("add", catSel.value, rule);
+      toast(`已添加 ${catSel.value} 规则`, "success");
+      loadSecurityView();
+    } catch (e) { toast(e.message, "error"); }
+  };
+  addBtn.addEventListener("click", doAdd);
+  ruleInput.addEventListener("keydown", (e) => { if (e.key === "Enter") doAdd(); });
+  addRow.append(catSel, ruleInput, addBtn);
+  inner.append(addRow);
+
+  const ruleCats = [
+    ["deny", "🚫 deny（红线，硬拦截）", "red"],
+    ["ask", "❓ ask（人工确认）", "amber"],
+    ["allow", "✅ allow（免确认放行）", "green"],
+  ];
+  for (const [cat, title, color] of ruleCats) {
+    const rules = (perm.rules && perm.rules[cat]) || [];
+    const card = el("div", { class: "card", style: "margin-top:10px;" });
+    card.append(el("div", { class: "card-title" }, title));
+    if (!rules.length) {
+      card.append(el("div", { class: "card-sub" }, "（无自定义规则）"));
+    } else {
+      const list = el("div", { class: "reorder-list" });
+      for (const r of rules) {
+        list.append(el("div", { class: "reorder-item" },
+          el("span", { class: "reorder-name", style: "font-family:var(--font-mono);font-size:12px;" }, r),
+          el("span", { class: `tag ${color}` }, cat),
+          el("button", {
+            class: "btn btn-sm btn-danger",
+            onclick: async () => {
+              try {
+                await api.updatePermissionRule("rm", cat, r);
+                toast("已删除", "success");
+                loadSecurityView();
+              } catch (e) { toast(e.message, "error"); }
+            },
+          }, "删除")));
+      }
+      card.append(list);
+    }
+    inner.append(card);
+  }
+  inner.append(el("div", { class: "card-sub", style: "margin-top:6px;" },
+    "内置规则：deny 红线 14 条（rm -rf /、写 .env/.git 等）+ ask 危险操作 15 条 + allow 只读命令若干，随模式自动生效。优先级: deny > ask > allow"));
+
+  /* ---- Hooks 管理 ---- */
+  inner.append(el("div", { class: "section-title", style: "margin-top:18px;" },
+    `Hooks 钩子（Agent: ${currentAgent() || "未选择"}）`));
+  const hooksCard = el("div", { class: "card" });
+  const hooks = hooksData.hooks || {};
+  const events = Object.keys(hooks);
+  if (!events.length) {
+    hooksCard.append(el("div", { class: "card-sub" },
+      "未配置钩子。配置文件: ~/.cbhcli/hooks.json（全局）或 <agent工作空间>/hooks.json"));
+    hooksCard.append(el("pre", { class: "code-block", style: "margin-top:8px;font-size:11.5px;" },
+      '示例:\n{\n  "PreToolUse": [\n    {"matcher": "terminal", "command": "python3 ~/guard.py"}\n  ]\n}'));
+  } else {
+    for (const ev of events) {
+      hooksCard.append(el("div", { class: "hook-event" },
+        el("span", { class: "tag blue" }, ev)));
+      const list = el("div", { class: "reorder-list", style: "margin:4px 0 10px;" });
+      for (const h of hooks[ev]) {
+        list.append(el("div", { class: "reorder-item" },
+          el("span", { class: "tag" }, h.matcher || "*"),
+          el("span", { class: "reorder-name", style: "font-family:var(--font-mono);font-size:12px;" }, h.command)));
+      }
+      hooksCard.append(list);
+    }
+  }
+  const reloadBtn = el("button", { class: "btn btn-sm" }, "🔄 重新加载 hooks.json");
+  reloadBtn.addEventListener("click", async () => {
+    if (!currentAgent()) { toast("请先选择 Agent", "warn"); return; }
+    try {
+      const r = await api.reloadHooks(currentAgent());
+      toast(r.message, "success");
+      loadSecurityView();
+    } catch (e) { toast(e.message, "error"); }
+  });
+  hooksCard.append(el("div", { style: "margin-top:10px;" }, reloadBtn));
+  inner.append(hooksCard);
+}
 
 async function loadFallbackView() {
   const root = $("#view-fallback");

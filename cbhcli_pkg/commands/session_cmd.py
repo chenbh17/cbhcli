@@ -134,27 +134,31 @@ def register_session_commands(parser, app):
         requires_agent=True
     ))
     
-    # /comp 命令 - 手动压缩上下文
+    # /comp 命令 - 手动压缩上下文（支持带指令：/comp 保留迁移方案，丢弃调试过程）
     def compress_handler(args):
-        """手动压缩上下文"""
+        """手动压缩上下文，可携带保留/丢弃指令"""
         if not app.current_agent_name:
             return "❌ 请先选择Agent"
-        
+
         if app.session is None:
             return "❌ 当前没有活动会话"
-        
+
+        instructions = args.strip()
+
         # 执行压缩
-        success = app._compress_context()
-        
+        success = app._compress_context(instructions=instructions)
+
         if success:
+            if instructions:
+                return f"✅ 上下文已压缩（按指令: {instructions}）"
             return "✅ 上下文已压缩"
         else:
             return "ℹ️  上下文较短,无需压缩"
-    
+
     parser.register(SlashCommand(
         name="comp",
-        description="手动压缩上下文",
-        usage="",
+        description="手动压缩上下文（可带指令: /comp 保留X 丢弃Y）",
+        usage="[压缩指令]",
         handler=compress_handler,
         requires_agent=True
     ))

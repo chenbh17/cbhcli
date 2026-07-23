@@ -10,6 +10,7 @@ from cbhcli_pkg.core.tool_executor import ToolExecutor
 from cbhcli_pkg.tools.registry import ToolResult
 from cbhcli_pkg.core.thinking_display import ThinkingDisplay
 from cbhcli_pkg.core.markdown_renderer import MarkdownStreamRenderer
+from cbhcli_pkg.core.loop_detector import ToolCallTracker, TextLoopDetector
 from cbhcli_pkg.core.constants import (
     MAX_TOOL_ROUNDS, MAX_TOOL_OUTPUT_LENGTH, API_TEMPERATURE,
     MAX_REFLECTION_RETRIES, THINKING_MAX_LINES,
@@ -100,6 +101,10 @@ class AIHandler:
         # 重置失败计数
         self._failure_counts.clear()
 
+        # 死循环检测器（每个用户请求独立）
+        self._loop_tracker = ToolCallTracker()
+        self._loop_aborted = False
+
         # --- ReAct 循环 ---
         for round_idx in range(MAX_TOOL_ROUNDS):
             # 检查上下文是否接近上限，自动压缩
@@ -114,6 +119,11 @@ class AIHandler:
             if tool_calls:
                 self._execute_tools(tool_calls, ai_response, reasoning_tokens,
                                     reasoning_content)
+                # 死循环熔断：干预次数达上限，终止本轮任务
+                if self._loop_aborted:
+                    print(f"\n{C_ERROR}🛑 检测到模型多次陷入死循环，已熔断本轮任务。"
+                          f"建议：换一种任务描述 / /new 重开会话 / 切换模型{C_RESET}")
+                    return "（任务因死循环熔断而终止）"
             else:
                 # 没有工具调用 → 结束
                 content_tokens = self.token_counter.count_tokens(ai_response)
@@ -211,6 +221,10 @@ class AIHandler:
         md_renderer = MarkdownStreamRenderer()  # Markdown 流式渲染器
         # 设置前缀（含 ANSI 颜色码），feed() 首次调用时输出
         md_renderer.set_prefix(f"\n{self._c_text}{self._label}AI: {C_RESET}")
+        # 文本复读检测（思考流 / 正文流各一个）
+        reasoning_loop = TextLoopDetector()
+        content_loop = TextLoopDetector()
+        text_loop_hit = False
 
         try:
             openai_tools = self.tool_executor.tool_registry.get_openai_tools()
@@ -219,7 +233,8 @@ class AIHandler:
                 stream_kwargs["tools"] = openai_tools
                 stream_kwargs["tool_choice"] = "auto"
 
-            for chunk_type, content in client.chat_stream(messages, **stream_kwargs):
+            stream = client.chat_stream(messages, **stream_kwargs)
+            for chunk_type, content in stream:
                 if chunk_type == "reasoning":
                     if not is_reasoning:
                         is_reasoning = True
@@ -228,6 +243,12 @@ class AIHandler:
                     reasoning_buffer += content
                     # 将思考内容添加到滚动显示区域
                     self.thinking_display.add_content(content)
+                    # 思考内容复读检测
+                    if reasoning_loop.feed(content):
+                        text_loop_hit = True
+                        print(f"\n{self._c_dim}⚠️ 检测到思考过程陷入重复，已截断{C_RESET}")
+                        stream.close()
+                        break
 
                 elif chunk_type == "tool_calls":
                     # 收集 Function Calling 增量数据
@@ -256,6 +277,13 @@ class AIHandler:
                     # 通过 Markdown 流式渲染器处理内容
                     raw_content = md_renderer.feed(content)
                     ai_response += raw_content
+                    # 正文复读检测
+                    if content_loop.feed(content):
+                        text_loop_hit = True
+                        ai_response = content_loop.truncated_text()
+                        print(f"\n{self._c_dim}⚠️ 检测到回复内容陷入重复，已截断{C_RESET}")
+                        stream.close()
+                        break
 
             # 流式结束 — 完成 Markdown 渲染（清除纯文本+前缀，重新渲染）
             md_renderer.flush()
@@ -277,6 +305,15 @@ class AIHandler:
                             "arguments": args,
                         })
                         print(f"\n{self._c_dim}🔧 {tc['name']}({tc['arguments'][:100]}){C_RESET}")
+
+            # 文本复读截断：若本轮还有工具调用，提示附在回复里让模型下轮看到
+            if text_loop_hit and tool_calls:
+                note = ("\n\n[系统提示] 上一条输出陷入重复循环，已被系统截断。"
+                        "请避免重复内容，简明扼要地继续任务。")
+                ai_response = (ai_response or "") + note
+                if self.tool_executor.tracer:
+                    self.tool_executor.tracer.log_loop(
+                        "text_loop", detail="流式输出复读截断")
 
             # 确保在流式结束时关闭思考显示（如果仍在思考中）
             if is_reasoning and self.thinking_display.is_thinking:
@@ -411,29 +448,63 @@ class AIHandler:
 
         # 逐个执行（每个 tool_call 必须产生对应的 tool 消息，否则 API 会报错）
         for tc in valid_calls:
-            try:
-                result = self.tool_executor.execute_with_display(
-                    tc["tool"],
-                    tc["arguments"],
-                    tc["id"]
-                )
+            # ---- 死循环检测（同参数重复 / 周期震荡）----
+            verdict, loop_msg = "ok", None
+            if getattr(self, "_loop_tracker", None) is not None:
+                verdict, loop_msg = self._loop_tracker.check(
+                    tc["tool"], tc["arguments"])
 
-                if result.success:
-                    output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
-                else:
-                    # 失败时：优先使用 output（包含完整 traceback），其次用 error
-                    if result.output:
+            if verdict == "abort":
+                self._loop_aborted = True
+                if self.tool_executor.tracer:
+                    self.tool_executor.tracer.log_loop("abort", tc["tool"])
+                result = ToolResult(
+                    success=False,
+                    output="🛑 [系统熔断] 多次陷入死循环，本轮任务已终止。",
+                    error="loop abort")
+                output = result.output
+            elif verdict == "block":
+                print(f"\n{self._c_dim}🛑 死循环熔断: 已阻止重复调用 "
+                      f"{tc['tool']}（同参数第4+次），已告知模型换策略{C_RESET}")
+                if self.tool_executor.tracer:
+                    self.tool_executor.tracer.log_loop("block", tc["tool"])
+                result = ToolResult(success=False, output=loop_msg,
+                                    error="loop blocked")
+                output = loop_msg
+            else:
+                if verdict == "warn":
+                    print(f"\n{self._c_dim}⚠️ 检测到疑似死循环（{tc['tool']} "
+                          f"重复调用），已在结果中提醒模型{C_RESET}")
+                    if self.tool_executor.tracer:
+                        self.tool_executor.tracer.log_loop("warn", tc["tool"])
+                try:
+                    result = self.tool_executor.execute_with_display(
+                        tc["tool"],
+                        tc["arguments"],
+                        tc["id"]
+                    )
+
+                    if result.success:
                         output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
                     else:
-                        output = f"错误: {result.error}"
-            except Exception as e:
-                # 兜底：确保即使 execute_with_display 异常也能产生 tool 消息
-                output = f"工具执行异常: {str(e)}"
-                result = ToolResult(success=False, output=output, error=str(e))
+                        # 失败时：优先使用 output（包含完整 traceback），其次用 error
+                        if result.output:
+                            output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
+                        else:
+                            output = f"错误: {result.error}"
+                except Exception as e:
+                    # 兜底：确保即使 execute_with_display 异常也能产生 tool 消息
+                    output = f"工具执行异常: {str(e)}"
+                    result = ToolResult(success=False, output=output, error=str(e))
+
+                # 软警告附加到工具结果尾部（模型最重视的信息通道）
+                if verdict == "warn" and loop_msg:
+                    output = f"{output}\n\n{loop_msg}"
 
             # 工具失败时：将反思提示附着在 tool 输出中（而非注入 system 消息）
             # 保持标准 OAI 消息序列不变，有利于 LLM 前缀缓存命中
-            if not result.success:
+            # （死循环熔断的失败不进入反思重试，避免雪上加霜）
+            if not result.success and verdict == "ok":
                 fail_key = tc["tool"]
                 self._failure_counts[fail_key] = self._failure_counts.get(fail_key, 0) + 1
                 if self._failure_counts[fail_key] <= MAX_REFLECTION_RETRIES:

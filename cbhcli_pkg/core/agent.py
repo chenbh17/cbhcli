@@ -117,7 +117,11 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /resume [编号] - 列出或恢复历史会话
 - /history - 查看历史会话列表
 - /ctx - 查看上下文使用情况
-- /comp - 手动压缩上下文
+- /comp [指令] - 手动压缩上下文（可带保留/丢弃指令）
+- /mode [readonly|standard|auto|yolo] - 权限模式切换（Shift+Tab循环切换）
+- /permissions [list|add|rm] - 权限规则管理
+- /hooks [list|reload|test] - 生命周期钩子管理
+- /undo [ID|list] - 回滚write/edit的文件修改
 - /embedding [index|status|clear|reindex] - 向量索引管理
 - /kb [add|list|rm|reindex|status] - 知识库管理
 - /skills [list|add|use|off|rm] - 技能管理
@@ -125,6 +129,14 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /fallback [add|list|rm|reorder|clear] - 备用模型管理
 - /mcp [add|list|rm|refresh|tools|on|off] - MCP服务器管理
 - quit - 退出程序
+
+## 权限模式（Harness 治理层）
+cbhcli 有四档权限模式，用户按 Shift+Tab 循环切换，或用 /mode 命令直接设置：
+- readonly 只读模式：你只能查看/分析，一切修改操作被系统拒绝
+- standard 标准模式（默认）：危险操作逐个确认，红线操作（rm -rf /、写 .env 等）被禁止
+- auto 自动模式：工作目录内写操作和常见开发命令自动放行，红线仍禁止
+- yolo 最高权限：全部操作零确认直接执行（红线仅警告）
+工具调用被权限规则拒绝时，错误信息会说明原因，请换其他方式完成任务或请用户切换模式，不要反复重试同一被拒绝的操作。
 
 ## 工作空间
 位于: ~/.cbhcli/agents/<agent_name>/

@@ -1,4 +1,4 @@
-# CBHCLI v4.9.8 - AI驱动的终端助手
+# CBHCLI v4.9.9 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -25,6 +25,12 @@
 - **图片识别双模式（v4.9.5）** - 识图统一走 image 工具：主模型支持视觉时图片作为多模态消息直发主模型（共享会话上下文，零额外API调用）；主模型无视觉时自动调用其他已配置视觉模型识别（fallback链），识别能力不被主模型限制
 - **会话内热切换模型（v4.9.6）** - `/model use` 切换模型不再重建会话，当前对话内容完整保留，仅替换LLM客户端并原地更新系统提示；视觉主模型 fallback 到非视觉模型时自动将历史带图消息降级为纯文本，不再报"不是视觉模型"错误
 - **状态栏即时显示（v4.9.7）** - 修复输入框下方状态栏（模型/上下文/Agent/技能/路径）偶尔不显示的问题：AI 回答期间按键产生 type-ahead 残留时，prompt_toolkit 跳过 CPR 光标查询导致高度永远未知、工具栏被过滤器隐藏，现改为首轮渲染即显示
+- **权限模式（v4.9.9 Harness 治理层）** - 四档权限模板 Shift+Tab 循环热切换：🔒readonly 只读（AI 只能看）/ 🟢standard 标准（危险操作逐个确认，默认）/ 🟡auto 自动（工作区内写操作自动放行）/ 🔴yolo 最高权限（零确认直接执行，deny 红线降级警告）；内置 deny 红线规则（rm -rf /、写 .env/.git 等物理禁止）+ ask 危险操作（git push/sudo/rm 等）+ allow 只读命令；确认框新增 always 选项自动提炼永久放行规则；/mode /permissions 命令管理
+- **Hooks 钩子系统（v4.9.9）** - 生命周期 6 事件（SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/SubagentStop/Stop）自动执行自定义 shell 命令：PreToolUse 可拦截危险操作（退出码2+stderr 反馈模型）、PostToolUse 可自动跑测试/格式化并反馈、Stop 可自动通知/保存；配置于 ~/.cbhcli/hooks.json 或 Agent 工作空间，/hooks 命令管理
+- **死循环熔断（v4.9.9）** - 自动检测两类死循环：工具同参数重复调用（3次警告附加结果、4次熔断并告知模型换策略、3次干预仍无效则终止任务）与 A→B→A→B 周期震荡；流式输出文本复读（150字符块出现3次）自动截断；全程不中断任务，只有彻底没救才告知用户
+- **文件检查点回滚（v4.9.9）** - write/edit 执行前自动备份目标文件（Agent 工作空间 backups/，保留最近50份），/undo 一键回滚最近一次修改或按 ID 回滚指定备份
+- **调用链追踪（v4.9.9 可观测性）** - 每次工具调用（名称/参数摘要/权限判定/耗时/成败）、模式切换、循环熔断、压缩等事件自动落盘 JSONL（工作空间 history/traces/），可追溯可审计
+- **工具调用显示升级（v4.9.9）** - Claude Code 风格：⏺ 工具头 + braille 旋转动画实时显示执行耗时 + ✓/✗ 状态行 + ⎿ 树形结果引导线（超出12行折叠提示 Ctrl+R 查看全部）
 
 ### 16大内置工具
 | 工具 | 功能 |
@@ -127,7 +133,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.9.8-py3-none-any.whl
+pip install dist/cbhcli-4.9.9-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -202,8 +208,25 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 /resume 1         # 恢复第1个历史会话
 /history          # 查看历史会话列表
 /comp             # 手动压缩上下文
+/comp 保留迁移方案，丢弃调试过程   # 带指令压缩
 /ctx              # 查看上下文使用情况
 ```
+
+### 权限与安全（Harness）
+
+```
+/mode                      # 查看权限模式（readonly/standard/auto/yolo）
+/mode auto                 # 切换到自动模式（yolo 需二次确认）
+/permissions list          # 查看权限规则
+/permissions add allow terminal(pytest:*)   # 添加永久放行规则
+/hooks list                # 查看生命周期钩子
+/hooks reload              # 重载 hooks.json
+/undo                      # 回滚最近一次 write/edit
+/undo list                 # 查看可回滚备份
+/undo <ID>                 # 回滚指定备份
+```
+
+**快捷键**: `Shift+Tab` 循环切换权限模式（YOLO 需 3 秒内再按一次确认）；`Ctrl+R` 切换工具显示详细/简洁
 
 ### 7. 技能系统
 技能是可复用的提示词+可选脚本，用于增强Agent在特定领域的能力。
@@ -429,8 +452,12 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/reset` 或 `/new` | 创建新会话（自动保存当前会话） |
 | `/resume [编号]` | 列出或恢复历史会话 |
 | `/history` | 查看历史会话列表 |
-| `/comp` | 压缩上下文 |
+| `/comp [指令]` | 压缩上下文（可带保留/丢弃指令） |
 | `/ctx` | 查看上下文使用 |
+| `/mode [模式]` | 权限模式切换（readonly/standard/auto/yolo） |
+| `/permissions [list\|add\|rm]` | 权限规则管理 |
+| `/hooks [list\|reload\|test]` | 生命周期钩子管理 |
+| `/undo [ID\|list]` | 回滚 write/edit 文件修改 |
 | `/kb add <file>` | 添加文件到知识库 |
 | `/kb list` | 列出知识库文件 |
 | `/kb rm [file]` | 删除知识文件 |
@@ -499,6 +526,12 @@ cbhcli_pkg/
 │   ├── mcp_client.py       # MCP协议客户端
 │   ├── mcp_manager.py      # MCP服务器管理
 │   ├── mcp_tool_adapter.py # MCP工具适配器
+│   ├── permissions.py      # 权限规则引擎（4模式，Harness 治理层）
+│   ├── loop_detector.py    # 死循环检测（工具重复/文本复读）
+│   ├── hooks.py            # Hooks 钩子系统（生命周期6事件）
+│   ├── tracer.py           # 调用链追踪（JSONL 落盘）
+│   ├── checkpoint.py       # 文件检查点（write/edit 自动备份/回滚）
+│   ├── spinner.py          # 终端加载动画（工具执行spinner）
 │   ├── constants.py        # 常量定义
 │   └── errors.py           # 异常类型
 ├── tools/             # 工具实现
@@ -528,7 +561,8 @@ cbhcli_pkg/
 │   ├── mcp_cmd.py      # MCP管理命令
 │   ├── skills_cmd.py   # 技能管理命令
 │   ├── tools_cmd.py    # 工具开关管理命令
-│   └── fallback_cmd.py # 备用模型管理命令
+│   ├── fallback_cmd.py # 备用模型管理命令
+│   └── harness_cmd.py  # Harness命令（/mode /permissions /hooks /undo）
 ├── web/               # Web界面
 │   ├── server.py       # FastAPI 后端（SSE 流式 + 全量管理 API）
 │   └── static/         # 原生前端 SPA（index.html + css + js + vendor/marked，零构建）

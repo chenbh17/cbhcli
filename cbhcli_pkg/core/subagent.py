@@ -235,6 +235,25 @@ class SubAgentScheduler:
             result = f"子Agent执行失败: {error_msg}"
             print(f"\n{C_ERROR}[SubAgent:{sub_agent.name}] 执行失败: {error_msg}{C_RESET}")
 
+        # SubagentStop 钩子（v4.9.9：子Agent结束时触发，stdout 打印给用户）
+        try:
+            hook_manager = getattr(tool_executor, 'hook_manager', None)
+            if hook_manager and hook_manager.has_hooks("SubagentStop"):
+                decision = hook_manager.run_simple(
+                    "SubagentStop",
+                    extra_args={
+                        "subagent_name": sub_agent.name,
+                        "task": sub_agent.task[:500],
+                        "success": sub_agent.status.value == "completed",
+                        "result": (result or "")[:1000],
+                    },
+                    session_id=getattr(tool_executor, 'session_id', ""))
+                from cbhcli_pkg.core.constants import C_DIM as _C_DIM
+                for line in decision.outputs:
+                    print(f"{_C_DIM}[hook:SubagentStop] {line}{C_RESET}")
+        except Exception:
+            pass  # 钩子异常绝不影响子Agent结果
+
         return result
 
     # ==================================================================
@@ -313,6 +332,10 @@ class SubAgentScheduler:
 
         if tool_executor:
             tool_executor._on_tool_execute = _status_hook
+            # 并行模式禁用 spinner 动画（stdout 已被 _ThreadStdoutProxy 按行
+            # 捕获回放，spinner 的 \r/ANSI 序列会被打散成乱码）
+            old_animations = getattr(tool_executor, 'animations_enabled', True)
+            tool_executor.animations_enabled = False
 
         # rich.Live 实时状态板（仅CLI）
         live = None
@@ -382,6 +405,7 @@ class SubAgentScheduler:
             sys.stdout = old_stdout
             if tool_executor:
                 tool_executor._on_tool_execute = old_callback
+                tool_executor.animations_enabled = old_animations
 
         # 静态总结（状态板为 transient 模式，停止后自动清除）
         ok_count = sum(1 for r in results if r and r["success"])

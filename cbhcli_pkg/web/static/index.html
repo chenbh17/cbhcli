@@ -27,6 +27,7 @@
         <a class="nav-item" data-view="mcp"><span class="nav-icon">🔌</span><span class="nav-label">MCP</span></a>
         <a class="nav-item" data-view="knowledge"><span class="nav-icon">📚</span><span class="nav-label">知识库</span></a>
         <a class="nav-item" data-view="tools"><span class="nav-icon">🔧</span><span class="nav-label">工具</span></a>
+        <a class="nav-item" data-view="security"><span class="nav-icon">🛡️</span><span class="nav-label">安全</span></a>
         <a class="nav-item" data-view="embedding"><span class="nav-icon">🧭</span><span class="nav-label">索引</span></a>
         <a class="nav-item" data-view="history"><span class="nav-icon">🕘</span><span class="nav-label">历史</span></a>
         <a class="nav-item" data-view="settings"><span class="nav-icon">⚙️</span><span class="nav-label">设置</span></a>
@@ -46,6 +47,9 @@
             <select id="chat-model-select" class="select"></select>
           </div>
           <div class="chat-header-right">
+            <div class="mode-badge" id="mode-badge" title="权限模式（点击切换）">
+              <span id="mode-badge-text">🟢 标准</span>
+            </div>
             <div class="ctx-meter" id="ctx-meter" title="上下文使用情况">
               <div class="ctx-meter-bar"><div class="ctx-meter-fill" id="ctx-meter-fill"></div></div>
               <span class="ctx-meter-text" id="ctx-meter-text">0%</span>
@@ -53,6 +57,7 @@
             <button class="btn btn-ghost" id="btn-quick-tools" title="快捷配置：工具开关">🔧</button>
             <button class="btn btn-ghost" id="btn-quick-skills" title="快捷配置：技能管理">⚡</button>
             <button class="btn btn-ghost" id="btn-quick-model" title="快捷配置：切换模型">🧠</button>
+            <button class="btn btn-ghost" id="btn-undo" title="回滚文件修改 (/undo)">↩️</button>
             <button class="btn btn-ghost" id="btn-compress" title="手动压缩上下文 (/comp)">📦</button>
             <button class="btn btn-ghost" id="btn-new-session" title="新建会话 (/new)">✚ 新会话</button>
           </div>
@@ -95,6 +100,7 @@
       <section class="view" id="view-mcp"></section>
       <section class="view" id="view-knowledge"></section>
       <section class="view" id="view-tools"></section>
+      <section class="view" id="view-security"></section>
       <section class="view" id="view-embedding"></section>
       <section class="view" id="view-history"></section>
       <section class="view" id="view-settings"></section>

@@ -2,6 +2,7 @@
 import json
 import shutil
 import sys
+import time
 from typing import Optional, Callable
 
 from cbhcli_pkg.tools.registry import ToolRegistry, ToolResult
@@ -11,6 +12,7 @@ from cbhcli_pkg.core.constants import (
     C_DIM, C_SEP, C_AI_HINT, C_ERROR, C_RESET
 )
 from cbhcli_pkg.core.errors import ToolExecutionError
+from cbhcli_pkg.core.spinner import Spinner
 from cbhcli_pkg.core.text_width import (
     display_width as _display_width,
     pad_to_width as _pad_to_width,
@@ -69,7 +71,16 @@ class ToolExecutor:
         self.tool_registry = tool_registry
         self.no_more_confirmations = False
         self.verbose = False
+        # 动画开关：并行子Agent时禁用（stdout 被 _ThreadStdoutProxy 按行
+        # 捕获回放，spinner 的 \r/ANSI 序列会被打散成乱码）
+        self.animations_enabled = True
         self._on_tool_execute: Optional[Callable] = None
+        # Harness 组件（由 app.py 注入，均为可选）
+        self.permission_engine = None   # PermissionEngine
+        self.hook_manager = None        # HookManager
+        self.checkpoint_manager = None  # CheckpointManager
+        self.tracer = None              # Tracer
+        self.session_id: str = ""       # 当前会话 ID（hooks payload 用）
 
     def set_verbose(self, verbose: bool):
         """设置详细输出模式"""
@@ -93,6 +104,10 @@ class ToolExecutor:
 
     # 自带显示的工具（跳过 executor 的头部和结果显示）
     _SELF_DISPLAY_TOOLS = {"Todo"}
+
+    # 执行期间有自身实时输出/交互的工具（不显示 spinner 动画，避免输出打架）
+    _NO_SPIN_TOOLS = {"ask_user", "process", "delegate_task", "image",
+                      "skills_create"}
 
     def execute_with_display(
         self,
@@ -120,20 +135,123 @@ class ToolExecutor:
         if not self_display:
             self._display_preview(tool_name, arguments)
 
-        # 执行前确认
-        if not self._confirm_execution(tool_name):
+        permission_action = ""
+
+        # ① PreToolUse 钩子（可拦截）
+        if self.hook_manager and self.hook_manager.has_hooks("PreToolUse"):
+            decision = self.hook_manager.run_pre_tool_use(
+                tool_name, arguments, session_id=self.session_id
+            )
+            for warn in decision.warnings:
+                print(f"{C_YELLOW}   ⚠️ 钩子: {warn}{C_RESET}")
+            if decision.blocked:
+                print(f"{C_ERROR}   ✗ 被 PreToolUse 钩子拦截: "
+                      f"{decision.block_reason}{C_RESET}")
+                if self.tracer:
+                    self.tracer.log_tool_blocked(
+                        tool_name, arguments, decision.block_reason, "hook")
+                result = ToolResult(
+                    success=False,
+                    output="",
+                    error=f"被 PreToolUse 钩子拦截: {decision.block_reason}"
+                )
+                self._display_result(result)
+                if self._on_tool_execute:
+                    self._on_tool_execute(tool_name, arguments, result, tool_call_id)
+                return result
+
+        # ② 权限规则引擎
+        if self.permission_engine is not None:
+            action, rule = self.permission_engine.check(tool_name, arguments)
+            permission_action = action
+            from cbhcli_pkg.core import permissions as _perm
+
+            if action == _perm.DENY:
+                print(f"{C_ERROR}   ✗ 被权限规则拦截: {rule}{C_RESET}")
+                if self.tracer:
+                    self.tracer.log_tool_blocked(
+                        tool_name, arguments, str(rule), "permission")
+                result = ToolResult(
+                    success=False,
+                    output="",
+                    error=(f"操作被权限规则禁止: {rule}\n"
+                           f"当前权限模式: {self.permission_engine.mode}。"
+                           f"请改用其他方式完成任务，或请用户切换权限模式/调整规则。")
+                )
+                self._display_result(result)
+                if self._on_tool_execute:
+                    self._on_tool_execute(tool_name, arguments, result, tool_call_id)
+                return result
+
+            if action == _perm.WARN:
+                print(f"{C_ERROR}   ⚠️ [YOLO] 命中红线规则 {rule}，已放行{C_RESET}")
+
+            confirmed = True
+            if action == _perm.ASK:
+                confirmed = self._confirm_execution(tool_name, arguments)
+            # ALLOW / WARN → 跳过人工确认
+        else:
+            # 无权限引擎（兼容路径）：走原有人工确认
+            confirmed = self._confirm_execution(tool_name, arguments)
+
+        # ③ 人工确认未通过
+        if not confirmed:
+            if self.tracer:
+                self.tracer.log_tool_blocked(
+                    tool_name, arguments, "用户取消了执行", "user")
             result = ToolResult(
                 success=False,
                 output="",
                 error="用户取消了执行"
             )
         else:
-            # 执行工具
-            result = self.execute(tool_name, arguments)
+            # ④ 写操作前备份检查点
+            if (self.checkpoint_manager and
+                    tool_name in ("write", "edit")):
+                file_path = arguments.get("file_path", "")
+                if file_path:
+                    self.checkpoint_manager.backup(file_path, tool_name)
+
+            # ⑤ 执行工具（带 spinner 动画 + 计时）
+            start = time.monotonic()
+            use_spinner = (self.animations_enabled
+                           and not self_display
+                           and tool_name not in self._NO_SPIN_TOOLS)
+            if use_spinner:
+                with Spinner(f"执行中 {tool_name}", color=C_TOOL_GREEN,
+                             dim=C_DIM, reset=C_RESET):
+                    result = self.execute(tool_name, arguments)
+            else:
+                result = self.execute(tool_name, arguments)
+            result.duration_ms = int((time.monotonic() - start) * 1000)
+
+            # ⑥ PostToolUse 钩子（反馈追加给模型）
+            if self.hook_manager and self.hook_manager.has_hooks("PostToolUse"):
+                decision = self.hook_manager.run_post_tool_use(
+                    tool_name, arguments,
+                    result.output or result.error or "",
+                    session_id=self.session_id
+                )
+                for warn in decision.warnings:
+                    print(f"{C_YELLOW}   ⚠️ 钩子: {warn}{C_RESET}")
+                feedback = decision.merged_output()
+                if feedback:
+                    result.output = (result.output or "") + \
+                        f"\n\n[PostToolUse 钩子反馈]\n{feedback}"
 
         # 显示结果（自带显示的工具跳过）
         if not self_display:
             self._display_result(result)
+
+        # 可观测性 trace
+        if self.tracer:
+            self.tracer.log_tool_call(
+                tool_name, arguments,
+                permission=permission_action,
+                duration_ms=getattr(result, "duration_ms", 0),
+                success=result.success,
+                error=result.error or ""
+            )
 
         # 回调
         if self._on_tool_execute:
@@ -142,14 +260,20 @@ class ToolExecutor:
         return result
 
     def _display_tool_call(self, tool_name: str, arguments: dict):
-        """显示工具调用信息"""
+        """显示工具调用信息
+
+        状态指示：○ 待执行（暗） → ⠋ 执行中（braille动画，见 Spinner）
+        → ● 完成（绿/红，见 _display_result）。
+        注：不使用 ⏺（U+23FA），部分终端字体无此字形会显示为豆腐方块。
+        """
         cmd_preview = self._get_tool_preview(tool_name, arguments)
 
         print(f"\n{C_SEP}{'─' * _separator_width()}")
         if cmd_preview:
-            print(f"{C_TOOL_DOT}● {C_TOOL_GREEN}{tool_name}{C_RESET}  {C_TOOL_CMD}{cmd_preview}{C_RESET}")
+            print(f"{C_TOOL_GREEN}○ {C_BOLD}{tool_name}{C_RESET}"
+                  f"  {C_TOOL_CMD}{cmd_preview}{C_RESET}")
         else:
-            print(f"{C_TOOL_DOT}● {C_TOOL_GREEN}{tool_name}{C_RESET}")
+            print(f"{C_TOOL_GREEN}○ {C_BOLD}{tool_name}{C_RESET}")
 
         if self.verbose:
             print(f"{C_SEP}   完整参数: {json.dumps(arguments, ensure_ascii=False)}{C_RESET}")
@@ -571,8 +695,16 @@ class ToolExecutor:
             return ", ".join(preview_parts) if preview_parts else ""
         return ""
 
-    def _confirm_execution(self, tool_name: str) -> bool:
-        """确认是否执行工具"""
+    def _confirm_execution(self, tool_name: str,
+                           arguments: Optional[dict] = None) -> bool:
+        """确认是否执行工具
+
+        [Y/n/all/always]:
+          Y      本次放行
+          n      本次拒绝
+          all    本会话内不再确认（deny 红线除外）
+          always 本次放行，并提炼一条 allow 规则永久生效（写入 permissions.json）
+        """
         if self.no_more_confirmations:
             return True
 
@@ -583,7 +715,8 @@ class ToolExecutor:
 
         from cbhcli_pkg.core.prompt_utils import ask_text_or_none
         print()  # 与预览内容间隔一行
-        confirm = ask_text_or_none(f"确认执行 {tool_name}? [Y/n/all]: ")
+        confirm = ask_text_or_none(
+            f"确认执行 {tool_name}? [Y/n/all/always]: ")
         if confirm is None:
             return False  # EOF / Ctrl+C 视为取消
 
@@ -592,14 +725,26 @@ class ToolExecutor:
         if confirm == "all":
             self.no_more_confirmations = True
             return True
+        elif confirm == "always":
+            if self.permission_engine is not None and arguments is not None:
+                from cbhcli_pkg.core.permissions import PermissionEngine
+                rule = PermissionEngine.suggest_allow_rule(tool_name, arguments)
+                self.permission_engine.add_rule("allow", rule)
+                print(f"{C_TOOL_GREEN}   ✓ 已添加永久放行规则: {rule}{C_RESET}")
+            return True
         elif confirm in ("n", "no"):
             return False
 
         return True
 
     def _display_result(self, result: ToolResult):
-        """显示执行结果"""
+        """显示执行结果（✓/✗ 状态行 + 耗时 + ⎿ 树形结果）"""
+        duration = getattr(result, "duration_ms", 0)
+        duration_str = f" {C_DIM}· {duration / 1000:.1f}s{C_RESET}" \
+            if duration >= 100 else ""
+
         if result.success:
+            print(f"{C_TOOL_GREEN}  ● 完成{C_RESET}{duration_str}")
             # 优先使用 display_output，否则使用 output
             display = result.display_output if result.display_output is not None else result.output
             output = display[:MAX_TOOL_OUTPUT_LENGTH] if display else ""
@@ -611,10 +756,26 @@ class ToolExecutor:
                 if len(output) > TOOL_PREVIEW_LENGTH:
                     output_preview += "..."
 
-            print(f"{C_TOOL_RESULT}   → {output_preview}{C_RESET}")
+            if output_preview:
+                # ⎿ 树形引导线 + 后续行缩进对齐
+                lines = output_preview.split('\n')
+                max_lines = len(lines) if self.verbose else 12
+                shown = lines[:max_lines]
+                for i, line in enumerate(shown):
+                    prefix = "  ⎿  " if i == 0 else "     "
+                    print(f"{C_TOOL_RESULT}{prefix}{line}{C_RESET}")
+                if len(lines) > max_lines:
+                    print(f"{C_DIM}     … 共 {len(lines)} 行"
+                          f"（Ctrl+R 详细模式查看全部）{C_RESET}")
         else:
             error_msg = result.error or "未知错误"
-            print(f"{C_ERROR}   → 失败: {error_msg}{C_RESET}")
+            print(f"{C_ERROR}  ● 失败{C_RESET}{duration_str}")
+            err_lines = error_msg.split('\n')
+            for i, line in enumerate(err_lines[:8]):
+                prefix = "  ⎿  " if i == 0 else "     "
+                print(f"{C_ERROR}{prefix}{line}{C_RESET}")
+            if len(err_lines) > 8:
+                print(f"{C_DIM}     … 共 {len(err_lines)} 行{C_RESET}")
 
         print(f"{C_SEP}{'─' * _separator_width()}{C_RESET}")
 

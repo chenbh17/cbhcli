@@ -90,3 +90,25 @@ if _meipass:
 # 4. matplotlib 无 GUI 后端
 # ---------------------------------------------------------------------------
 os.environ.setdefault('MPLBACKEND', 'Agg')
+
+# ---------------------------------------------------------------------------
+# 5. 禁用 chromadb 遥测（注入假 posthog 模块）
+#    背景: chromadb 0.6.3 调用 posthog.capture(user_id, event, properties)
+#    3 个位置参数，与 posthog 6.x 新签名 capture(event, **kwargs) 不兼容，
+#    导致每次启动打印 "Failed to send telemetry event ClientStartEvent"。
+#    cbhcli 本地 CLI 无需遥测，直接用 no-op 假模块替换，一劳永逸。
+# ---------------------------------------------------------------------------
+class _NoopPosthog(types.ModuleType):
+    """任意属性访问都返回 no-op 函数，兼容 posthog 的所有调用方式"""
+
+    def __getattr__(self, _name):
+        return self._noop
+
+    @staticmethod
+    def _noop(*_args, **_kwargs):
+        return None
+
+
+_fake_posthog = _NoopPosthog('posthog')
+_fake_posthog.disabled = True
+sys.modules['posthog'] = _fake_posthog

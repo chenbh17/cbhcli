@@ -34,8 +34,14 @@ def print_help():
     print("")
     print("  会话管理:")
     print("    /reset 或 /new        重置/新建会话")
-    print("    /comp                 压缩上下文")
+    print("    /comp [指令]          压缩上下文（可带保留/丢弃指令）")
     print("    /ctx                  查看上下文使用")
+    print("")
+    print("  权限与安全 (Harness):")
+    print("    /mode [模式]          权限模式: readonly/standard/auto/yolo")
+    print("    /permissions [list|add|rm]  权限规则管理")
+    print("    /hooks [list|reload|test]   生命周期钩子管理")
+    print("    /undo [ID|list]       回滚 write/edit 的文件修改")
     print("")
     print("  知识库管理:")
     print("    /kb add <file>        添加文件到知识库")
@@ -104,6 +110,7 @@ def print_help():
     print("")
     print("快捷键:")
     print("  Ctrl+R          切换工具显示详细/简洁模式")
+    print("  Shift+Tab       循环切换权限模式（YOLO 需再按一次确认）")
 
 
 def main():

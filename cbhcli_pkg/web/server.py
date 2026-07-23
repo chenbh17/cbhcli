@@ -53,6 +53,15 @@ from cbhcli_pkg.core.embedding_client import EmbeddingClient
 from cbhcli_pkg.core.rerank_client import RerankClient
 from cbhcli_pkg.core.subagent import SubAgentScheduler
 from cbhcli_pkg.core.tool_executor import ToolExecutor
+from cbhcli_pkg.core.permissions import (
+    PermissionEngine, MODE_META, MODES, build_mode_note,
+    ALLOW as PERM_ALLOW, ASK as PERM_ASK, DENY as PERM_DENY,
+    WARN as PERM_WARN,
+)
+from cbhcli_pkg.core.hooks import HookManager
+from cbhcli_pkg.core.checkpoint import CheckpointManager
+from cbhcli_pkg.core.tracer import Tracer
+from cbhcli_pkg.core.loop_detector import ToolCallTracker, TextLoopDetector
 from cbhcli_pkg.vector.store import VectorStore
 from cbhcli_pkg.vector.indexer import MemoryIndexer
 from cbhcli_pkg.context.token_counter import get_token_counter
@@ -63,7 +72,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.9.8")
+app = FastAPI(title="CBHCLI Web", version="4.9.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -85,6 +94,15 @@ _memory_indexer: Optional[MemoryIndexer] = None
 _embedding_client = None
 _rerank_client = None
 _vector_init_attempted = False
+_permission_engine: Optional[PermissionEngine] = None
+
+
+def get_permission_engine() -> PermissionEngine:
+    """权限规则引擎（Harness 治理层，全局单例，CLI/Web 共享配置文件）"""
+    global _permission_engine
+    if _permission_engine is None:
+        _permission_engine = PermissionEngine()
+    return _permission_engine
 
 # 活跃聊天会话: session_key(agent:model) -> WebChatSession
 _chat_sessions: dict[str, 'WebChatSession'] = {}
@@ -276,6 +294,13 @@ class WebChatSession:
         self.no_more_confirmations = False
         self.abort = False
 
+        # Harness 组件
+        self.permission_engine: Optional[PermissionEngine] = None
+        self.hook_manager: Optional[HookManager] = None
+        self.checkpoint_manager: Optional[CheckpointManager] = None
+        self.tracer: Optional[Tracer] = None
+        self.hook_start_outputs: list = []   # SessionStart 钩子输出（待下发）
+
         # asyncio 原语（在首次使用时绑定到运行中的事件循环）
         self.respond_queue: Optional[asyncio.Queue] = None
         self.lock: Optional[asyncio.Lock] = None
@@ -308,6 +333,23 @@ class WebChatSession:
 
         # 工具上下文代理
         cs.app_proxy = _WebAgentContext(agent_name)
+
+        # Harness 组件（权限引擎全局单例 + Agent 级钩子/检查点/追踪）
+        # 注意：必须在 _rebuild_tools 之前创建（rebuild 时会挂载到 executor）
+        cs.permission_engine = get_permission_engine()
+        try:
+            cs.hook_manager = HookManager(agent_config.workspace_path, agent_name)
+        except Exception:
+            cs.hook_manager = None
+        try:
+            cs.checkpoint_manager = CheckpointManager(agent_config.workspace_path)
+        except Exception:
+            cs.checkpoint_manager = None
+        try:
+            cs.tracer = Tracer(agent_config.workspace_path, cs.session.id)
+        except Exception:
+            cs.tracer = None
+
         cs._rebuild_tools()
 
         # 注入 delegate_task 所需引用
@@ -340,12 +382,33 @@ class WebChatSession:
         cs.app_proxy.auto_compress = cs.auto_compress
         cs.app_proxy.current_agent_config = agent_config
 
+        # SessionStart 钩子（输出暂存，首次聊天时通过 SSE 下发）
+        if cs.hook_manager and cs.hook_manager.has_hooks("SessionStart"):
+            try:
+                decision = cs.hook_manager.run_simple(
+                    "SessionStart", session_id=cs.session.id)
+                cs.hook_start_outputs = decision.outputs
+            except Exception:
+                pass
+
         return cs
 
     def _rebuild_tools(self):
         """重建工具注册表和 MCP 管理器（MCP 配置变更后同步调用）。"""
         self.tool_registry = _build_tool_registry(self.agent_name, self.app_proxy)
         self.app_proxy.tool_executor = ToolExecutor(self.tool_registry)
+
+        # Harness 组件挂载（delegate_task 子Agent经 tool_executor 执行工具）
+        # 子Agent在后台线程无法交互确认 → 免确认模式，安全由权限引擎
+        # deny 红线兜底（子Agent与主会话共享同一套规则）
+        executor = self.app_proxy.tool_executor
+        executor.no_more_confirmations = True
+        executor.animations_enabled = False      # Web 无需终端动画
+        executor.permission_engine = get_permission_engine()
+        executor.hook_manager = self.hook_manager
+        executor.checkpoint_manager = self.checkpoint_manager
+        executor.tracer = self.tracer
+        executor.session_id = self.session.id if self.session else ""
 
         self.mcp_manager = None
         try:
@@ -388,6 +451,8 @@ class WebChatSession:
             cwd=os.getcwd(),
             supports_vision=getattr(self.llm_client, "supports_vision", False),
         )
+        # 注入当前权限模式说明（与 CLI 一致）
+        system_prompt += build_mode_note(get_permission_engine().mode)
         # 替换或插入首条 system 消息
         if self.session.messages and self.session.messages[0].role == "system":
             self.session.messages[0].content = system_prompt
@@ -849,6 +914,134 @@ def reorder_fallback(category: str, body: FallbackReorder):
     else:
         config.set_fallback_vision_models(list(body.order))
     return {"message": f"{category} 备用顺序已更新"}
+
+
+# ===================================================================
+#  API: Harness（权限模式 / 权限规则 / 钩子）
+# ===================================================================
+
+class ModeUpdate(BaseModel):
+    mode: str
+
+
+class PermissionRuleUpdate(BaseModel):
+    action: str      # add | rm
+    category: str    # allow | ask | deny
+    rule: str
+
+
+def _permission_state() -> dict:
+    """权限引擎当前状态（供多个端点复用）"""
+    engine = get_permission_engine()
+    rules = engine.get_user_rules()
+    return {
+        "mode": engine.mode,
+        "default_mode": engine._default_mode,
+        "yolo_keep_deny": engine.yolo_keep_deny,
+        "modes": [
+            {"id": m, "label": MODE_META[m]["label"],
+             "icon": MODE_META[m]["icon"], "desc": MODE_META[m]["desc"],
+             "current": m == engine.mode}
+            for m in MODES
+        ],
+        "rules": rules,
+    }
+
+
+@app.get("/api/permissions")
+def get_permissions():
+    """获取权限模式与规则（对应 CLI /mode list + /permissions list）"""
+    return _permission_state()
+
+
+@app.post("/api/permissions/mode")
+def set_permission_mode(body: ModeUpdate):
+    """切换权限模式（对应 CLI /mode <模式>，同步全部活跃会话系统提示）"""
+    engine = get_permission_engine()
+    if body.mode not in MODES:
+        raise HTTPException(400, f"未知模式: {body.mode}，可用: {MODES}")
+    old_mode = engine.mode
+    engine.set_mode(body.mode)
+    # 同步所有活跃会话的系统提示（模式说明注入）
+    for cs in _chat_sessions.values():
+        try:
+            cs._rebuild_system_prompt()
+        except Exception:
+            pass
+        if cs.tracer:
+            cs.tracer.log_mode_change(old_mode, body.mode)
+    return {"message": f"权限模式: {old_mode} → {body.mode}",
+            **_permission_state()}
+
+
+@app.post("/api/permissions/rules")
+def update_permission_rule(body: PermissionRuleUpdate):
+    """添加/删除用户权限规则（对应 CLI /permissions add|rm）"""
+    engine = get_permission_engine()
+    if body.category not in ("allow", "ask", "deny"):
+        raise HTTPException(400, "类别必须是 allow / ask / deny")
+    if body.action == "add":
+        engine.add_rule(body.category, body.rule)
+        return {"message": f"已添加 {body.category} 规则: {body.rule}",
+                **_permission_state()}
+    if body.action == "rm":
+        if engine.remove_rule(body.category, body.rule):
+            return {"message": f"已删除 {body.category} 规则: {body.rule}",
+                    **_permission_state()}
+        raise HTTPException(404, f"规则不存在: {body.rule}")
+    raise HTTPException(400, "action 必须是 add / rm")
+
+
+@app.get("/api/hooks/{agent_name}")
+def get_hooks(agent_name: str):
+    """查看 Agent 钩子配置（对应 CLI /hooks list）"""
+    workspace = _get_agent_workspace(agent_name)
+    hm = HookManager(workspace, agent_name)
+    return {"hooks": hm.get_hooks()}
+
+
+@app.post("/api/hooks/{agent_name}/reload")
+def reload_hooks(agent_name: str):
+    """重载钩子配置并同步到该 Agent 的活跃会话（对应 CLI /hooks reload）"""
+    count = 0
+    for cs in _chat_sessions.values():
+        if cs.agent_name == agent_name and cs.hook_manager:
+            try:
+                cs.hook_manager.reload()
+                count += 1
+            except Exception:
+                pass
+    return {"message": f"钩子配置已重载（同步 {count} 个活跃会话）"}
+
+
+# ===================================================================
+#  API: 检查点回滚（/undo）
+# ===================================================================
+
+class UndoRequest(BaseModel):
+    backup_id: Optional[str] = None
+
+
+@app.get("/api/agents/{agent_name}/backups")
+def list_backups(agent_name: str):
+    """列出可回滚的文件备份（对应 CLI /undo list）"""
+    workspace = _get_agent_workspace(agent_name)
+    cm = CheckpointManager(workspace)
+    return {"backups": cm.list_backups(50)}
+
+
+@app.post("/api/agents/{agent_name}/undo")
+def undo_backup(agent_name: str, body: UndoRequest):
+    """回滚文件修改（对应 CLI /undo [ID]）"""
+    workspace = _get_agent_workspace(agent_name)
+    cm = CheckpointManager(workspace)
+    if body.backup_id:
+        ok, msg = cm.undo_by_id(body.backup_id)
+    else:
+        ok, msg = cm.undo_last()
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"message": msg}
 
 
 # ===================================================================
@@ -1360,14 +1553,29 @@ async def _stream_round(cs: WebChatSession, messages: list, stream_kwargs: dict,
         tc_buffer: dict[int, dict] = {}
         stream_error = None
 
+        # 文本复读检测（与 CLI 一致：尾部块重复 3 次判定复读，截断继续）
+        reasoning_loop = TextLoopDetector()
+        content_loop = TextLoopDetector()
+        text_loop_stop = threading.Event()
+
         chunks_queue: asyncio.Queue = asyncio.Queue()
 
         def stream_worker(client=active_client):
             try:
-                for chunk_type, content in client.chat_stream(messages, **stream_kwargs):
+                stream = client.chat_stream(messages, **stream_kwargs)
+                for chunk_type, content in stream:
                     if cs.abort:
                         asyncio.run_coroutine_threadsafe(
                             chunks_queue.put(("aborted", "")), loop)
+                        return
+                    if text_loop_stop.is_set():
+                        # 文本复读熔断：关闭流并通知消费端
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        asyncio.run_coroutine_threadsafe(
+                            chunks_queue.put(("text_loop", "")), loop)
                         return
                     asyncio.run_coroutine_threadsafe(
                         chunks_queue.put((chunk_type, content)), loop)
@@ -1401,12 +1609,26 @@ async def _stream_round(cs: WebChatSession, messages: list, stream_kwargs: dict,
             elif chunk_type == "aborted":
                 result["aborted"] = True
                 return
+            elif chunk_type == "text_loop":
+                # 文本复读熔断：以当前已收到内容截断结束本轮
+                result["text_loop"] = True
+                if content_loop.triggered:
+                    ai_response = content_loop.truncated_text()
+                yield _sse({"type": "loop_detected", "verdict": "text_loop",
+                            "tool_name": "", "tool_id": ""})
+                stream_done = True
             elif chunk_type == "reasoning":
                 reasoning_buffer += content
-                yield _sse({"type": "reasoning", "content": content})
+                if reasoning_loop.feed(content):
+                    text_loop_stop.set()
+                else:
+                    yield _sse({"type": "reasoning", "content": content})
             elif chunk_type == "content":
                 ai_response += content
-                yield _sse({"type": "content", "content": content})
+                if content_loop.feed(content):
+                    text_loop_stop.set()
+                else:
+                    yield _sse({"type": "content", "content": content})
             elif chunk_type == "tool_calls":
                 try:
                     for tc in json.loads(content):
@@ -1478,6 +1700,11 @@ async def _react_loop(cs: WebChatSession):
         stream_kwargs["tools"] = openai_tools
         stream_kwargs["tool_choice"] = "auto"
 
+    # Harness：死循环检测器（每个用户请求独立）+ 权限引擎
+    loop_tracker = ToolCallTracker()
+    loop_aborted = False
+    engine = cs.permission_engine or get_permission_engine()
+
     for round_idx in range(MAX_TOOL_ROUNDS):
         if cs.abort:
             yield _sse({"type": "aborted"})
@@ -1525,6 +1752,14 @@ async def _react_loop(cs: WebChatSession):
         ai_response = result.get("ai_response", "")
         reasoning_buffer = result.get("reasoning", "")
         tool_calls = result.get("tool_calls", [])
+
+        # 文本复读截断：若本轮还有工具调用，提示附在回复里让模型下轮看到
+        if result.get("text_loop") and tool_calls:
+            ai_response = (ai_response or "") + (
+                "\n\n[系统提示] 上一条输出陷入重复循环，已被系统截断。"
+                "请避免重复内容，简明扼要地继续任务。")
+            if cs.tracer:
+                cs.tracer.log_loop("text_loop", detail="流式输出复读截断")
 
         # ---- 无工具调用 → 结束 ----
         if not tool_calls:
@@ -1609,9 +1844,83 @@ async def _react_loop(cs: WebChatSession):
                 })
                 continue
 
-            # ---- 工具确认 ----
+            # ---- 死循环检测（同参数重复 / 周期震荡）----
+            verdict, loop_msg = loop_tracker.check(tool_name, tool_args)
+            if verdict != "ok":
+                yield _sse({"type": "loop_detected", "verdict": verdict,
+                            "tool_name": tool_name, "tool_id": tool_id})
+                if cs.tracer:
+                    cs.tracer.log_loop(verdict, tool_name)
+
+            if verdict == "abort":
+                loop_aborted = True
+                cs.session.add_message(
+                    "tool", "🛑 [系统熔断] 多次陷入死循环，本轮任务已终止。",
+                    tool_call_id=tool_id,
+                    metadata={"tool_name": tool_name, "success": False})
+                yield _sse({
+                    "type": "tool_result", "tool_name": tool_name,
+                    "tool_id": tool_id, "success": False,
+                    "preview": "🛑 死循环熔断：本轮任务已终止"})
+                break
+
+            if verdict == "block":
+                cs.session.add_message(
+                    "tool", loop_msg, tool_call_id=tool_id,
+                    metadata={"tool_name": tool_name, "success": False})
+                yield _sse({
+                    "type": "tool_result", "tool_name": tool_name,
+                    "tool_id": tool_id, "success": False,
+                    "preview": "🛑 死循环熔断：重复调用已被阻止，已告知模型换策略"})
+                continue
+
+            # ---- 权限规则引擎（Harness 治理层）----
+            action, rule = engine.check(tool_name, tool_args)
+
+            if action == PERM_DENY:
+                reason = (f"操作被权限规则禁止: {rule}"
+                          f"（当前权限模式: {engine.mode}）")
+                yield _sse({
+                    "type": "tool_denied", "tool_name": tool_name,
+                    "tool_id": tool_id, "rule": str(rule), "reason": reason})
+                if cs.tracer:
+                    cs.tracer.log_tool_blocked(
+                        tool_name, tool_args, str(rule), "permission")
+                cs.session.add_message(
+                    "tool",
+                    f"{reason}。请改用其他方式完成任务，"
+                    f"或请用户切换权限模式/调整规则。",
+                    tool_call_id=tool_id,
+                    metadata={"tool_name": tool_name, "success": False})
+                continue
+
+            # ---- PreToolUse 钩子（可拦截）----
+            if cs.hook_manager and cs.hook_manager.has_hooks("PreToolUse"):
+                decision = await asyncio.to_thread(
+                    cs.hook_manager.run_pre_tool_use,
+                    tool_name, tool_args, cs.session.id)
+                if decision.blocked:
+                    reason = f"被 PreToolUse 钩子拦截: {decision.block_reason}"
+                    yield _sse({
+                        "type": "tool_denied", "tool_name": tool_name,
+                        "tool_id": tool_id, "rule": "hook", "reason": reason})
+                    if cs.tracer:
+                        cs.tracer.log_tool_blocked(
+                            tool_name, tool_args, decision.block_reason, "hook")
+                    cs.session.add_message(
+                        "tool", reason, tool_call_id=tool_id,
+                        metadata={"tool_name": tool_name, "success": False})
+                    continue
+
+            if action == PERM_WARN:
+                yield _sse({
+                    "type": "tool_yolo_warn", "tool_name": tool_name,
+                    "tool_id": tool_id, "rule": str(rule)})
+
+            # ---- 工具确认（ASK 规则才需要人工确认）----
             needs_confirm = (
-                tool_name not in _READONLY_TOOLS
+                action == PERM_ASK
+                and tool_name not in _READONLY_TOOLS
                 and not cs.no_more_confirmations
             )
             yield _sse({
@@ -1640,6 +1949,14 @@ async def _react_loop(cs: WebChatSession):
                 cs.no_more_confirmations = True
                 user_response = "y"
 
+            if user_response == "always":
+                # 提炼一条 allow 规则永久生效（与 CLI 一致）
+                rule_s = PermissionEngine.suggest_allow_rule(tool_name, tool_args)
+                engine.add_rule("allow", rule_s)
+                yield _sse({"type": "rule_added", "category": "allow",
+                            "rule": rule_s})
+                user_response = "y"
+
             if user_response in ("n", "no"):
                 yield _sse({"type": "tool_rejected",
                             "tool_name": tool_name, "tool_id": tool_id})
@@ -1648,19 +1965,52 @@ async def _react_loop(cs: WebChatSession):
                     metadata={"tool_name": tool_name, "success": False})
                 continue
 
+            # ---- 写操作前备份检查点（/undo 回滚）----
+            if cs.checkpoint_manager and tool_name in ("write", "edit"):
+                fp = tool_args.get("file_path", "")
+                if fp:
+                    await asyncio.to_thread(
+                        cs.checkpoint_manager.backup, fp, tool_name)
+
             # ---- 执行工具（线程池，避免阻塞事件循环）----
             yield _sse({"type": "tool_executing",
                         "tool_name": tool_name, "tool_id": tool_id})
+            import time as _time
+            _t0 = _time.monotonic()
             try:
                 result = await asyncio.to_thread(
                     cs.tool_registry.execute, tool_name, **tool_args)
             except Exception as e:
                 result = ToolResult(success=False, output="", error=str(e))
+            result.duration_ms = int((_time.monotonic() - _t0) * 1000)
+
+            # ---- PostToolUse 钩子（反馈追加给模型）----
+            if cs.hook_manager and cs.hook_manager.has_hooks("PostToolUse"):
+                decision = await asyncio.to_thread(
+                    cs.hook_manager.run_post_tool_use,
+                    tool_name, tool_args,
+                    (result.output or result.error or "")[:4000],
+                    cs.session.id)
+                feedback = decision.merged_output()
+                if feedback:
+                    result.output = (result.output or "") + \
+                        f"\n\n[PostToolUse 钩子反馈]\n{feedback}"
+
+            # ---- 可观测性 trace ----
+            if cs.tracer:
+                cs.tracer.log_tool_call(
+                    tool_name, tool_args, permission=action,
+                    duration_ms=result.duration_ms,
+                    success=result.success, error=result.error or "")
 
             if result.success:
                 tool_output = (result.output or "")[:MAX_TOOL_OUTPUT_LENGTH]
             else:
                 tool_output = (result.output or f"错误: {result.error}")[:MAX_TOOL_OUTPUT_LENGTH]
+
+            # 死循环软警告附加到工具结果尾部（告知模型换策略）
+            if verdict == "warn" and loop_msg:
+                tool_output = f"{tool_output}\n\n{loop_msg}"
 
             # ---- 自我反思（与 CLI 一致）----
             if not result.success:
@@ -1711,6 +2061,7 @@ async def _react_loop(cs: WebChatSession):
                 "tool_id": tool_id,
                 "success": result.success,
                 "preview": preview,
+                "duration_ms": getattr(result, "duration_ms", 0),
             }
             if preview_data:
                 sse_data["preview_data"] = preview_data
@@ -1729,6 +2080,14 @@ async def _react_loop(cs: WebChatSession):
                     note += f" 识别需求: {vision_prompt}"
                 cs.session.add_message("user", note, images=result.images)
 
+        # ---- 死循环熔断：终止本轮任务 ----
+        if loop_aborted:
+            yield _sse({"type": "error",
+                        "content": "🛑 检测到模型多次陷入死循环，已熔断本轮任务。"
+                                   "建议换一种任务描述或切换模型。"})
+            yield _sse({"type": "done", "usage": cs.usage_stats()})
+            return
+
         # 继续下一轮 ReAct
 
     yield _sse({"type": "content", "content": "\n\n[达到最大工具调用轮数]"})
@@ -1743,15 +2102,48 @@ async def chat(req: ChatRequest):
     if cs.lock.locked():
         raise HTTPException(409, "该会话正在处理中，请等待完成或先中断")
 
-    cs.session.add_message("user", req.message,
+    # UserPromptSubmit 钩子：stdout 追加为用户上下文（与 CLI 一致）
+    user_message = req.message
+    if cs.hook_manager and cs.hook_manager.has_hooks("UserPromptSubmit"):
+        try:
+            decision = await asyncio.to_thread(
+                cs.hook_manager.run_simple, "UserPromptSubmit",
+                session_id=cs.session.id,
+                extra_args={"prompt": req.message})
+            extra = decision.merged_output()
+            if extra:
+                user_message = f"{user_message}\n\n[钩子补充上下文]\n{extra}"
+        except Exception:
+            pass
+
+    cs.session.add_message("user", user_message,
                            images=req.images if req.images else None)
     cs.abort = False
 
     async def event_stream():
         async with cs.lock:
             try:
+                # SessionStart 钩子输出（会话创建时收集，首次聊天时下发）
+                if cs.hook_start_outputs:
+                    for line in cs.hook_start_outputs:
+                        yield _sse({"type": "hook_output",
+                                    "event": "SessionStart", "content": line})
+                    cs.hook_start_outputs = []
+
                 async for ev in _react_loop(cs):
                     yield ev
+
+                # Stop 钩子：AI 回复完成后触发（与 CLI 一致）
+                if cs.hook_manager and cs.hook_manager.has_hooks("Stop"):
+                    try:
+                        decision = await asyncio.to_thread(
+                            cs.hook_manager.run_simple, "Stop",
+                            session_id=cs.session.id)
+                        for line in decision.outputs:
+                            yield _sse({"type": "hook_output",
+                                        "event": "Stop", "content": line})
+                    except Exception:
+                        pass
             except Exception as e:
                 yield _sse({"type": "error", "content": str(e)})
                 yield _sse({"type": "done", "usage": cs.usage_stats()})
@@ -1974,10 +2366,12 @@ async def chat_compress(req: Request):
         raise HTTPException(400, "压缩组件未初始化")
 
     before = cs.session.get_total_tokens(cs.token_counter)
+    instructions = body.get("instructions", "") or None
     try:
         success = await asyncio.to_thread(
             cs.context_compressor.compress,
-            cs.session, cs.context_window.trigger_threshold())
+            cs.session, cs.context_window.trigger_threshold(),
+            instructions)
     except Exception as e:
         raise HTTPException(500, f"压缩失败: {e}")
 
