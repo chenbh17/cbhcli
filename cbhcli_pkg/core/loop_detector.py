@@ -79,8 +79,10 @@ class ToolCallTracker:
                 break
 
         # ---- 周期震荡检测（尾部是否存在周期 p 模式完整重复 ≥2 轮）----
+        # 使用签名序列而非工具名序列，避免参数不同但工具名相同的正常
+        # 交替调用（如 read A → edit A → read B → edit B）被误判为循环
         cycle_detected = False
-        seq = list(self._names)
+        seq = list(self._sigs)
         for p in range(2, LOOP_CYCLE_MAX_PERIOD + 1):
             if len(seq) >= p * 2:
                 tail = seq[-p * 2:]

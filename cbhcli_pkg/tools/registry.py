@@ -14,6 +14,7 @@ class ToolResult:
     display_output: Optional[str] = None  # 终端显示内容（None则显示output）
     images: Optional[list] = None  # 图片列表（base64），由 ai_handler/web 追加为带图用户消息直发主模型
     duration_ms: int = 0  # 执行耗时（毫秒），由 tool_executor 填充
+    display_files: Optional[list] = None  # AI 向用户展示的文件列表 [{path, filename, is_image, url}]，仅 Web 端使用
 
 
 class BaseTool(ABC):

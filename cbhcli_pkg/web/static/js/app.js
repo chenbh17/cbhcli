@@ -944,10 +944,13 @@ async function handleFiles(e) {
 async function handlePaste(e) {
   const items = [...(e.clipboardData?.items || [])];
   for (const item of items) {
-    if (item.type.startsWith("image/")) {
+    if (item.kind === "file") {
       e.preventDefault();
       const file = item.getAsFile();
-      if (file) await uploadAttachment(new File([file], `paste_${Date.now()}.png`, { type: file.type }));
+      if (file) {
+        const fname = file.name || `paste_${Date.now()}.${file.type.split("/")[1] || "bin"}`;
+        await uploadAttachment(new File([file], fname, { type: file.type }));
+      }
     }
   }
 }
@@ -1001,14 +1004,38 @@ async function sendMessage() {
 
   // 渲染用户气泡
   const col = msgColumn();
+  const imageAtts = state.attachments.filter(f => f.is_image);
+  const fileAtts = state.attachments.filter(f => !f.is_image);
+  const bubbleChildren = [];
+  // 显示图片缩略图
+  if (imageAtts.length) {
+    const imgGrid = el("div", { class: "msg-user-images" });
+    for (const img of imageAtts) {
+      const src = img.base64 || img.url;
+      if (src) {
+        const imgEl = el("img", { src, alt: img.filename, class: "msg-user-img", title: img.filename });
+        imgEl.addEventListener("click", () => window.open(img.url || src, "_blank"));
+        imgGrid.append(imgEl);
+      }
+    }
+    bubbleChildren.push(imgGrid);
+  }
+  // 显示文件附件（可下载）
+  if (fileAtts.length) {
+    const fileList = el("div", { class: "msg-user-files" });
+    for (const f of fileAtts) {
+      const dlUrl = f.download_url || `/api/files/download/${f.filename}`;
+      const link = el("a", { href: dlUrl, download: f.filename, class: "file-download-link" },
+        el("span", { class: "file-icon" }, "📄"),
+        el("span", null, f.filename),
+        el("span", { class: "file-size" }, fmtSize(f.size)));
+      fileList.append(link);
+    }
+    bubbleChildren.push(fileList);
+  }
+  bubbleChildren.push(el("div", { class: "msg-user-text" }, userContent));
   const bubble = el("div", { class: "msg-user" },
-    el("div", { class: "msg-user-bubble" },
-      state.attachments.some(f => f.is_image)
-        ? el("div", { class: "msg-user-images" },
-            ...state.attachments.filter(f => f.is_image)
-              .map(f => el("span", { class: "img-chip" }, "🖼 " + f.filename)))
-        : null,
-      userContent));
+    el("div", { class: "msg-user-bubble" }, ...bubbleChildren));
   col.append(bubble);
 
   chatUI.input.value = "";
@@ -1146,8 +1173,61 @@ async function runStream(userContent, images) {
         el("pre", { class: `term-output ${ok ? "" : "fail"}` },
           stripAnsi(simple ? data.preview.split("\n")[0] : data.preview)));
     }
+
+    // AI 发送的文件/图片（display_files）
+    const displayFiles = data.display_files || [];
+    if (displayFiles.length) {
+      const filesArea = el("div", { class: "ai-display-files" });
+      const images = displayFiles.filter(f => f.is_image);
+      const files = displayFiles.filter(f => !f.is_image);
+      // 渲染图片
+      if (images.length) {
+        const imgGrid = el("div", { class: "ai-display-images" });
+        for (const img of images) {
+          const imgUrl = img.url || "";
+          if (imgUrl) {
+            const imgEl = el("img", { src: imgUrl, alt: img.filename, class: "ai-display-img", title: img.filename });
+            imgEl.addEventListener("click", () => window.open(imgUrl, "_blank"));
+            imgGrid.append(imgEl);
+          }
+        }
+        filesArea.append(imgGrid);
+      }
+      // 渲染文件下载链接
+      if (files.length) {
+        const fileList = el("div", { class: "ai-display-file-list" });
+        for (const f of files) {
+          const dlUrl = f.download_url || "";
+          if (dlUrl) {
+            fileList.append(
+              el("a", { href: dlUrl, download: f.filename, class: "file-download-link" },
+                el("span", { class: "file-icon" }, "📥"),
+                el("span", null, f.filename)));
+          }
+        }
+        filesArea.append(fileList);
+      }
+      // 图片也提供下载链接
+      if (images.length) {
+        const imgDlList = el("div", { class: "ai-display-file-list" });
+        for (const img of images) {
+          const dlUrl = img.download_url || "";
+          if (dlUrl) {
+            imgDlList.append(
+              el("a", { href: dlUrl, download: img.filename, class: "file-download-link" },
+                el("span", { class: "file-icon" }, "📥"),
+                el("span", null, img.filename)));
+          }
+        }
+        filesArea.append(imgDlList);
+      }
+      rec.bodyEl.append(filesArea);
+      // 展开工具卡片让用户看到图片
+      rec.cardEl.classList.add("open");
+    }
+
     if (!ok) rec.cardEl.classList.add("open");
-    else rec.cardEl.classList.remove("open");
+    else if (!displayFiles.length) rec.cardEl.classList.remove("open");
     scrollBottom();
   }
 
@@ -1407,13 +1487,34 @@ function renderRestoredMessages(messages) {
   const col = msgColumn();
   for (const msg of messages) {
     if (msg.role === "user") {
+      const children = [];
+      // 恢复图片
+      if (msg.image_urls && msg.image_urls.length) {
+        const imgGrid = el("div", { class: "msg-user-images" });
+        for (const url of msg.image_urls) {
+          const imgEl = el("img", { src: url, alt: "图片", class: "msg-user-img" });
+          imgEl.addEventListener("click", () => window.open(url, "_blank"));
+          imgGrid.append(imgEl);
+        }
+        children.push(imgGrid);
+      } else if (msg.image_count) {
+        children.push(el("div", { class: "msg-user-images" },
+          el("span", { class: "img-chip" }, `🖼 ${msg.image_count} 张图片`)));
+      }
+      // 恢复文件附件
+      if (msg.file_attachments && msg.file_attachments.length) {
+        const fileList = el("div", { class: "msg-user-files" });
+        for (const f of msg.file_attachments) {
+          const link = el("a", { href: f.download_url, download: f.filename, class: "file-download-link" },
+            el("span", { class: "file-icon" }, "📄"),
+            el("span", null, f.filename));
+          fileList.append(link);
+        }
+        children.push(fileList);
+      }
+      children.push(el("div", { class: "msg-user-text" }, msg.content || ""));
       col.append(el("div", { class: "msg-user" },
-        el("div", { class: "msg-user-bubble" },
-          msg.image_count
-            ? el("div", { class: "msg-user-images" },
-                el("span", { class: "img-chip" }, `🖼 ${msg.image_count} 张图片`))
-            : null,
-          msg.content || "")));
+        el("div", { class: "msg-user-bubble" }, ...children)));
     } else if (msg.role === "assistant") {
       const body = el("div", { class: "msg-ai-body" });
       if (msg.reasoning) {
@@ -1445,6 +1546,19 @@ function renderRestoredMessages(messages) {
           bodyEl.append(
             el("div", { class: "tool-section-label" }, "结果"),
             el("pre", { class: `term-output ${tc.success === false ? "fail" : ""}` }, stripAnsi(tc.result)));
+        }
+        // write/edit 成功时添加文件下载链接
+        if (tc.success !== false && (tc.name === "write" || tc.name === "edit")) {
+          const fp = (tc.arguments && tc.arguments.file_path) || "";
+          if (fp) {
+            const fname = fp.split("/").pop().split("\\").pop();
+            const dlUrl = `/api/files/download/${encodeURIComponent(fname)}`;
+            bodyEl.append(
+              el("div", { class: "tool-file-actions" },
+                el("a", { href: dlUrl, download: fname, class: "file-download-link" },
+                  el("span", { class: "file-icon" }, "📥"),
+                  el("span", null, `下载 ${fname}`))));
+          }
         }
         const card = el("div", { class: "tool-card" },
           el("div", { class: "tool-card-header" },

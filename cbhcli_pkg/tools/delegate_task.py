@@ -9,7 +9,7 @@ from cbhcli_pkg.tools.registry import BaseTool, ToolResult
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 # 并行模式单次最多允许的子任务数量
-MAX_TASKS = 10
+MAX_TASKS = 100
 
 
 class DelegateTaskTool(BaseTool):

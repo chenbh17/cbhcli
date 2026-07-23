@@ -435,17 +435,97 @@ html, body {
   border-radius: 14px 14px 4px 14px;
   padding: 10px 14px;
   max-width: 78%;
-  white-space: pre-wrap;
   word-break: break-word;
   font-size: 14px;
 }
-.msg-user-images { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+.msg-user-images { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .msg-user-images .img-chip {
   font-size: 11px;
   background: #4f8cff33;
   padding: 2px 8px;
   border-radius: 6px;
   color: var(--accent-hover);
+}
+.msg-user-img {
+  max-width: 200px;
+  max-height: 200px;
+  border-radius: 8px;
+  cursor: pointer;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.msg-user-img:hover {
+  transform: scale(1.03);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.msg-user-files { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.msg-user-text { white-space: pre-wrap; word-break: break-word; }
+
+/* 文件下载链接 */
+.file-download-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+  font-size: 12.5px;
+  text-decoration: none;
+  transition: background 0.15s, border-color 0.15s;
+}
+.file-download-link:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--text-0);
+  text-decoration: none;
+}
+.file-download-link .file-icon { font-size: 14px; }
+.file-download-link .file-size {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-left: 4px;
+}
+
+/* 工具结果中的文件操作区 */
+.tool-file-actions {
+  margin-top: 6px;
+  display: flex;
+  gap: 8px;
+}
+
+/* AI 发送的图片/文件展示区 */
+.ai-display-files {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ai-display-images {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ai-display-img {
+  max-width: 400px;
+  max-height: 300px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  object-fit: contain;
+  background: var(--bg-1);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.ai-display-img:hover {
+  transform: scale(1.02);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+}
+.ai-display-file-list {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* AI 消息 */

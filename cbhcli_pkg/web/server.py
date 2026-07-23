@@ -17,7 +17,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -72,7 +72,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="4.9.9")
+app = FastAPI(title="CBHCLI Web", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -202,6 +202,82 @@ class _WebAgentContext:
         self.current_agent_config = None
 
 
+class SendFileTool:
+    """Web 端专用：向用户发送文件/图片。
+
+    AI 调用此工具将服务器上的文件/图片发送给用户，
+    用户在 Web 对话中看到图片内联显示或文件下载链接。
+    """
+
+    _IMG_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp'}
+
+    @property
+    def name(self) -> str:
+        return "send_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "向用户发送文件或图片（仅 Web 界面可用）。"
+            "传入文件路径，用户在对话中看到图片内联显示或文件下载链接。\n"
+            "适用场景：\n"
+            "1. 发送已有图片给用户查看（如 matplotlib 生成的图表）\n"
+            "2. 发送文件让用户下载（如配置文件、报告、数据文件等）\n"
+            "支持一次发送多个文件。"
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "file_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "要发送的文件绝对路径列表（如 ['/tmp/chart.png', '/tmp/report.csv']）",
+                },
+            },
+            "required": ["file_paths"],
+        }
+
+    def execute(self, file_paths: list = None, **kwargs) -> ToolResult:
+        if not file_paths:
+            return ToolResult(success=False, output="", error="必须提供 file_paths 参数")
+
+        display_files = []
+        not_found = []
+        for fp_str in file_paths:
+            fp = Path(fp_str)
+            if not fp.exists() or not fp.is_file():
+                not_found.append(fp_str)
+                continue
+            ext = fp.suffix.lower()
+            is_image = ext in self._IMG_EXTS
+            display_files.append({
+                "path": str(fp.resolve()),
+                "filename": fp.name,
+                "is_image": is_image,
+            })
+
+        if not display_files and not_found:
+            return ToolResult(
+                success=False, output="",
+                error=f"文件不存在: {', '.join(not_found)}")
+
+        output_parts = [f"已发送 {len(display_files)} 个文件给用户："]
+        for df in display_files:
+            kind = "图片" if df["is_image"] else "文件"
+            output_parts.append(f"  📎 [{kind}] {df['filename']} ({df['path']})")
+        if not_found:
+            output_parts.append(f"⚠️ 以下文件不存在未发送: {', '.join(not_found)}")
+
+        return ToolResult(
+            success=True,
+            output="\n".join(output_parts),
+            display_files=display_files,
+        )
+
+
 def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext) -> ToolRegistry:
     """构建完整工具注册表（内置工具 + cbhpacks + 知识库/记忆/子Agent）。"""
     _init_vector_store()
@@ -233,6 +309,7 @@ def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext) -> ToolRe
     registry.register(DelegateTaskTool(app_proxy))
     registry.register(SkillsCreateTool(app_proxy))
     registry.register(ImageTool(app_proxy))
+    registry.register(SendFileTool())
 
     # cbhpacks 数据科学工具
     from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
@@ -453,6 +530,28 @@ class WebChatSession:
         )
         # 注入当前权限模式说明（与 CLI 一致）
         system_prompt += build_mode_note(get_permission_engine().mode)
+        # 注入 Web 界面特有功能说明（仅 Web 端，CLI 不注入）
+        system_prompt += (
+            "\n\n## Web 界面功能\n"
+            "你当前运行在 Web 界面中，以下功能仅 Web 端可用：\n"
+            "\n"
+            "### 用户上传文件\n"
+            "- 用户可以通过输入框左侧的 📎 按钮或直接粘贴来上传图片和文件\n"
+            "- 上传的图片会直接以图片形式显示在对话中，你可以用 image 工具识别\n"
+            "- 上传的文件会保存到服务器，你可以用 read 工具读取文件内容\n"
+            "- 当用户要求查看/处理某个文件时，提醒用户可以点击 📎 按钮上传\n"
+            "- 用户发送的文件路径通常在 ~/.cbhcli/web_uploads/ 目录下\n"
+            "\n"
+            "### AI 发送文件/图片给用户\n"
+            "你可以主动向用户发送文件和图片，用户会在对话中看到并可以下载：\n"
+            "- **发送文件/图片**：使用 `send_file` 工具，传入文件绝对路径列表，"
+            "图片会内联显示（点击可放大），文件会显示下载链接。\n"
+            "  示例：send_file(file_paths=['/tmp/chart.png', '/tmp/report.csv'])\n"
+            "- **python 生成图片自动展示**：用 python 工具 matplotlib 等生成图片后，"
+            "系统也会自动检测并展示（无需手动调 send_file）。\n"
+            "- **write/edit 写文件自动下载链接**：write/edit 工具成功后系统自动生成下载链接。\n"
+            "- 当用户要求查看某个文件/图片时，直接用 send_file 发送即可。\n"
+        )
         # 替换或插入首条 system 消息
         if self.session.messages and self.session.messages[0].role == "system":
             self.session.messages[0].content = system_prompt
@@ -508,10 +607,38 @@ class WebChatSession:
             if m.role == "system":
                 continue
             if m.role == "user":
+                # 解析用户消息中的文件信息（[图片: xxx] / [文件: xxx (path)]）
+                image_urls = []
+                file_attachments = []
+                content = m.content or ""
+                import re as _re
+                for match in _re.finditer(r'\[图片: (.+?)\]', content):
+                    fname = match.group(1).strip()
+                    image_urls.append(f"/api/files/serve/{fname}")
+                for match in _re.finditer(r'\[文件: (.+?) \((.+?)\)\]', content):
+                    fname = match.group(1).strip()
+                    fpath = match.group(2).strip()
+                    # 从 web_uploads 目录提取文件名
+                    upload_dir = CBHCLI_DIR / "web_uploads"
+                    try:
+                        rel = str(Path(fpath)).replace(str(upload_dir) + "/", "")
+                        rel = rel.replace(str(upload_dir) + "\\", "")
+                        if rel == str(Path(fpath)):
+                            # 路径不在 web_uploads，使用文件名
+                            rel = Path(fpath).name
+                    except Exception:
+                        rel = Path(fpath).name
+                    file_attachments.append({
+                        "filename": fname,
+                        "download_url": f"/api/files/download/{rel}",
+                        "path": fpath,
+                    })
                 result.append({
                     "role": "user",
-                    "content": m.content or "",
+                    "content": content,
                     "image_count": len(m.images) if m.images else 0,
+                    "image_urls": image_urls,
+                    "file_attachments": file_attachments,
                 })
             elif m.role == "assistant":
                 tool_calls = []
@@ -659,6 +786,7 @@ class ChatRequest(BaseModel):
     agent_name: str
     model_name: str
     images: list[str] = []
+    file_infos: list[dict] = []  # [{filename, url, download_url, is_image, size, content_type}]
 
 
 class ChatRespondRequest(BaseModel):
@@ -1972,6 +2100,18 @@ async def _react_loop(cs: WebChatSession):
                     await asyncio.to_thread(
                         cs.checkpoint_manager.backup, fp, tool_name)
 
+            # ---- python 工具：执行前记录图片文件快照（Web 端检测新生成图片）----
+            _pre_images = set()
+            _img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp'}
+            if tool_name == "python":
+                for _dir in (os.getcwd(), '/tmp'):
+                    try:
+                        for _f in os.listdir(_dir):
+                            if os.path.splitext(_f)[1].lower() in _img_exts:
+                                _pre_images.add(os.path.join(_dir, _f))
+                    except Exception:
+                        pass
+
             # ---- 执行工具（线程池，避免阻塞事件循环）----
             yield _sse({"type": "tool_executing",
                         "tool_name": tool_name, "tool_id": tool_id})
@@ -1983,6 +2123,42 @@ async def _react_loop(cs: WebChatSession):
             except Exception as e:
                 result = ToolResult(success=False, output="", error=str(e))
             result.duration_ms = int((_time.monotonic() - _t0) * 1000)
+
+            # ---- Web 端：python 工具执行后检测新生成的图片文件 ----
+            if tool_name == "python" and result.success:
+                _new_images = []
+                for _dir in (os.getcwd(), '/tmp'):
+                    try:
+                        for _f in os.listdir(_dir):
+                            if os.path.splitext(_f)[1].lower() in _img_exts:
+                                _fp = os.path.join(_dir, _f)
+                                if _fp not in _pre_images:
+                                    _new_images.append({
+                                        "path": _fp,
+                                        "filename": _f,
+                                        "is_image": True,
+                                    })
+                    except Exception:
+                        pass
+                if _new_images:
+                    if not result.display_files:
+                        result.display_files = []
+                    result.display_files.extend(_new_images)
+
+            # ---- Web 端：write/edit 成功后自动添加文件到 display_files ----
+            if result.success and tool_name in ("write", "edit"):
+                _fp = tool_args.get("file_path", "")
+                if _fp:
+                    _fname = os.path.basename(_fp)
+                    _ext = os.path.splitext(_fname)[1].lower()
+                    _is_img = _ext in _img_exts
+                    if not result.display_files:
+                        result.display_files = []
+                    result.display_files.append({
+                        "path": _fp,
+                        "filename": _fname,
+                        "is_image": _is_img,
+                    })
 
             # ---- PostToolUse 钩子（反馈追加给模型）----
             if cs.hook_manager and cs.hook_manager.has_hooks("PostToolUse"):
@@ -2065,6 +2241,20 @@ async def _react_loop(cs: WebChatSession):
             }
             if preview_data:
                 sse_data["preview_data"] = preview_data
+            # Web 端：AI 发送给用户的文件/图片（display_files）
+            if result.display_files:
+                display_files_with_url = []
+                for df in result.display_files:
+                    entry = dict(df)
+                    fp = df.get("path", "")
+                    # 编码路径用于 URL 传参
+                    import urllib.parse
+                    encoded_path = urllib.parse.quote(fp, safe="")
+                    if df.get("is_image"):
+                        entry["url"] = f"/api/files/serve_path?path={encoded_path}"
+                    entry["download_url"] = f"/api/files/download_path?path={encoded_path}"
+                    display_files_with_url.append(entry)
+                sse_data["display_files"] = display_files_with_url
             yield _sse(sse_data)
 
             cs.session.add_message(
@@ -2419,11 +2609,69 @@ async def chat_upload(file: UploadFile = File(...),
         "size": len(content),
         "content_type": content_type,
         "is_image": is_image,
+        "url": f"/api/files/serve/{dest.name}",
+        "download_url": f"/api/files/download/{dest.name}",
     }
     if is_image:
         b64 = base64.b64encode(content).decode("utf-8")
         result["base64"] = f"data:{content_type};base64,{b64}"
     return result
+
+
+# ===================================================================
+#  API: File Serve / Download
+# ===================================================================
+
+@app.get("/api/files/serve/{filename:path}")
+async def serve_file(filename: str):
+    """在浏览器中显示文件（图片内联展示等）。"""
+    upload_dir = CBHCLI_DIR / "web_uploads"
+    # 安全：禁止路径穿越
+    safe_name = filename.replace("..", "").replace("/", "_").replace("\\", "_")
+    fp = upload_dir / safe_name
+    if not fp.exists() or not fp.is_file():
+        raise HTTPException(404, "文件不存在")
+    return FileResponse(str(fp), filename=safe_name)
+
+
+@app.get("/api/files/download/{filename:path}")
+async def download_file(filename: str):
+    """下载文件（触发浏览器下载）。"""
+    upload_dir = CBHCLI_DIR / "web_uploads"
+    safe_name = filename.replace("..", "").replace("/", "_").replace("\\", "_")
+    fp = upload_dir / safe_name
+    if not fp.exists() or not fp.is_file():
+        raise HTTPException(404, "文件不存在")
+    return FileResponse(str(fp), filename=safe_name,
+                        media_type="application/octet-stream")
+
+
+@app.get("/api/files/serve_path")
+async def serve_file_by_path(path: str):
+    """按绝对路径提供文件（图片内联显示等），仅限存在的常规文件。"""
+    fp = Path(path)
+    if not fp.exists() or not fp.is_file():
+        raise HTTPException(404, "文件不存在")
+    # 安全：禁止访问敏感目录
+    resolved = str(fp.resolve())
+    for forbidden in ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/"):
+        if resolved.startswith(forbidden):
+            raise HTTPException(403, "禁止访问该目录")
+    return FileResponse(resolved, filename=fp.name)
+
+
+@app.get("/api/files/download_path")
+async def download_file_by_path(path: str):
+    """按绝对路径下载文件。"""
+    fp = Path(path)
+    if not fp.exists() or not fp.is_file():
+        raise HTTPException(404, "文件不存在")
+    resolved = str(fp.resolve())
+    for forbidden in ("/etc/", "/proc/", "/sys/", "/dev/", "/boot/"):
+        if resolved.startswith(forbidden):
+            raise HTTPException(403, "禁止访问该目录")
+    return FileResponse(resolved, filename=fp.name,
+                        media_type="application/octet-stream")
 
 
 # ===================================================================
