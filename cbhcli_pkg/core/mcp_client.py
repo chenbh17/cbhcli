@@ -199,7 +199,7 @@ class MCPClient:
             "capabilities": {},
             "clientInfo": {
                 "name": "CBHCLI",
-                "version": "5.0.0"
+                "version": "5.0.1"
             }
         })
     

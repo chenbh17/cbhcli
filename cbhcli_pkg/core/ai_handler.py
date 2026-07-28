@@ -415,6 +415,37 @@ class AIHandler:
             })
 
         if not valid_calls:
+            # 所有工具调用都无法解析（工具名错误/重复），必须向会话添加提示
+            # 否则下一轮循环用相同上下文，AI 可能返回相同无效 tool_calls → 无限循环
+            invalid_names = [tc["name"] for tc in tool_calls]
+            error_msg = (
+                f"⚠️ 工具调用失败：以下工具名无法识别或重复调用：{', '.join(invalid_names)}\n"
+                f"可用工具：{', '.join(self.tool_executor.tool_registry.get_available_tools())}\n"
+                f"请使用正确的工具名重新调用。"
+            )
+            print(f"\n{C_ERROR}{error_msg}{C_RESET}")
+            # 添加 assistant 消息（含 tool_calls）和 tool 错误消息，保持 OAI 消息序列完整
+            assistant_msg = Message(
+                role="assistant",
+                content=ai_response if ai_response else "",
+                token_count=self.token_counter.count_tokens(ai_response or ""),
+                tool_calls=[{
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc.get("arguments", {}))}
+                } for tc in tool_calls],
+                reasoning_content=reasoning_content or None
+            )
+            self.session.messages.append(assistant_msg)
+            for tc in tool_calls:
+                tool_msg = Message(
+                    role="tool",
+                    content=error_msg,
+                    token_count=self.token_counter.count_tokens(error_msg),
+                    tool_call_id=tc["id"]
+                )
+                tool_msg.metadata = {"tool_name": tc["name"], "success": False}
+                self.session.messages.append(tool_msg)
             return
 
         # 构建 OpenAI 格式的 tool_calls 记录到会话

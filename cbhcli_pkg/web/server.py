@@ -72,7 +72,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.0.0")
+app = FastAPI(title="CBHCLI Web", version="5.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1916,13 +1916,31 @@ async def _react_loop(cs: WebChatSession):
             })
 
         if not valid_calls:
-            # 所有工具名都无法解析 — 当作普通回复结束
-            if ai_response:
+            # 所有工具调用都无法解析（工具名错误/重复），必须向会话添加提示
+            # 否则下一轮循环用相同上下文，AI 可能返回相同无效 tool_calls → 无限循环
+            # （与 CLI ai_handler._execute_tools 处理模式一致：反馈后继续循环让 AI 自我纠正）
+            invalid_names = [tc["name"] for tc in tool_calls]
+            error_msg = (
+                f"⚠️ 工具调用失败：以下工具名无法识别或重复调用：{', '.join(invalid_names)}\n"
+                f"可用工具：{', '.join(cs.tool_registry.get_available_tools())}\n"
+                f"请使用正确的工具名重新调用。"
+            )
+            # 添加 assistant 消息（含 tool_calls）和 tool 错误消息，保持 OAI 消息序列完整
+            cs.session.add_message(
+                "assistant", ai_response or "",
+                reasoning_content=reasoning_buffer or None,
+                tool_calls=[{
+                    "id": tc["id"], "type": "function",
+                    "function": {"name": tc["name"],
+                                 "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False)},
+                } for tc in tool_calls])
+            for tc in tool_calls:
                 cs.session.add_message(
-                    "assistant", ai_response,
-                    reasoning_content=reasoning_buffer or None)
-            yield _sse({"type": "done", "usage": cs.usage_stats()})
-            return
+                    "tool", error_msg,
+                    metadata={"tool_name": tc["name"], "success": False},
+                    tool_call_id=tc["id"])
+            yield _sse({"type": "error", "content": error_msg})
+            continue
 
         # ---- 记录 assistant 消息（含 tool_calls）----
         openai_tool_calls = [{
