@@ -72,7 +72,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.0.1")
+app = FastAPI(title="CBHCLI Web", version="5.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -511,6 +511,31 @@ class WebChatSession:
         except Exception:
             pass
 
+    def _load_memory_md(self) -> str:
+        """读取 memory.md 文件内容（复刻 CLI app.py _load_memory_md 逻辑）。
+
+        跳过模板说明部分（--- 之前），只保留实际记忆内容。
+        """
+        if not self.agent_config:
+            return ""
+        memory_file = self.agent_config.workspace_path / "memory.md"
+        if memory_file.exists():
+            try:
+                content = memory_file.read_text(encoding='utf-8')
+                lines = content.split('\n')
+                in_content = False
+                content_lines = []
+                for line in lines:
+                    if line.strip() == '---':
+                        in_content = True
+                        continue
+                    if in_content:
+                        content_lines.append(line)
+                return '\n'.join(content_lines).strip()
+            except Exception:
+                pass
+        return ""
+
     def _rebuild_system_prompt(self):
         """重建系统提示（首条 system 消息）。"""
         manager = get_agent_manager()
@@ -521,9 +546,12 @@ class WebChatSession:
                 active_skills_prompt = self.skill_manager.build_skills_prompt()
             except Exception:
                 pass
+        # 读取长期记忆（与 CLI 一致，memory.md 始终包含在系统提示中）
+        memory_content = self._load_memory_md()
         system_prompt = persona.build_system_prompt(
             agent_name=self.agent_name,
             model_name=self.model_name,
+            memory_content=memory_content,
             active_skills_prompt=active_skills_prompt,
             cwd=os.getcwd(),
             supports_vision=getattr(self.llm_client, "supports_vision", False),
