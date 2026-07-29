@@ -2184,7 +2184,7 @@ function showSpecialModelForm(kind, cfg) {
 
   openModal({
     title: `配置${title}`,
-    body: el("div", null, rows),
+    body: el("div", null, ...rows),
     footer: [
       el("button", { class: "btn", onclick: () => $("#modal-root").innerHTML = "" }, "取消"),
       el("button", {
@@ -2228,6 +2228,10 @@ function showModelForm(m) {
   });
   const visionChk = el("input", { type: "checkbox" });
   visionChk.checked = !!m.vision;
+  const maxTokensInput = el("input", {
+    class: "input", type: "number", min: "1",
+    value: m.max_tokens ?? "", placeholder: "留空用API默认值",
+  });
 
   openModal({
     title: isEdit ? `编辑模型 — ${m.name}` : "添加模型",
@@ -2241,6 +2245,9 @@ function showModelForm(m) {
         el("div", { class: "form-row" }, el("label", null, "上下文长度"), limitInput),
         el("div", { class: "form-row" }, el("label", null, "温度 (0-2)"), tempInput,
           el("div", { class: "form-hint" }, "留空用全局值 0.1；部分模型有强制要求（如 kimi-k3 必须为 1）"))),
+        el("div", { class: "form-row" }, el("label", null, "max_tokens"),
+          maxTokensInput,
+          el("div", { class: "form-hint" }, "留空用API默认值；思考模型建议设置（如 8192）")),
         el("div", { class: "form-row" }, el("label", null, " "),
           el("label", { class: "checkbox-row" }, visionChk, " 支持视觉（图片识别）"))),
     footer: [
@@ -2261,6 +2268,12 @@ function showModelForm(m) {
             const t = parseFloat(tempVal);
             if (isNaN(t) || t < 0 || t > 2) { toast("温度需在 0-2 之间", "warn"); return; }
             payload.temperature = t;
+          }
+          const maxTokensVal = maxTokensInput.value.trim();
+          if (maxTokensVal !== "") {
+            const mt = parseInt(maxTokensVal);
+            if (isNaN(mt) || mt <= 0) { toast("max_tokens 需为正整数", "warn"); return; }
+            payload.max_tokens = mt;
           }
           if (!payload.name || !payload.apiKey || !payload.url || !payload.model) {
             toast("名称 / Key / URL / 模型 ID 为必填", "warn"); return;

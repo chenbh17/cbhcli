@@ -26,6 +26,9 @@ class LLMClient:
         # 是否支持视觉（图片输入）
         self.supports_vision = model_config.get("vision", False)
         
+        # 最大输出 token 数（可选，未设置则不传给 API，使用 API 默认值）
+        self.max_tokens = model_config.get("max_tokens")
+        
         # 是否支持思考模式（动态检测：一旦模型返回 reasoning_content 就自动标记）
         self.supports_reasoning = False
         
@@ -120,6 +123,8 @@ class LLMClient:
             "temperature": self._get_temperature(temperature),
             **kwargs
         }
+        if self.max_tokens:
+            payload["max_tokens"] = self.max_tokens
         
         response = self._session.post(
             f"{self.base_url}/chat/completions",
@@ -166,6 +171,8 @@ class LLMClient:
             "stream": True,
             **kwargs
         }
+        if self.max_tokens:
+            payload["max_tokens"] = self.max_tokens
         
         response = self._session.post(
             f"{self.base_url}/chat/completions",

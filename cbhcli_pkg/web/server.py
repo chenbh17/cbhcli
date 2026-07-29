@@ -72,7 +72,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.0.2")
+app = FastAPI(title="CBHCLI Web", version="5.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -774,6 +774,7 @@ class ModelConfig(BaseModel):
     context_limit: int = 128000
     vision: bool = False
     temperature: Optional[float] = None  # 模型专属温度（None 使用全局默认）
+    max_tokens: Optional[int] = None  # 最大输出token数（None 使用API默认值）
 
     def to_config_dict(self) -> dict:
         """转为存储配置（None 字段不写入，避免覆盖已有配置）。"""

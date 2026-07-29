@@ -111,6 +111,16 @@ def _add_model(app):
     vision_str = ask_text("是否支持视觉/图片输入 (y/n, 默认 n): ").strip().lower()
     supports_vision = vision_str == 'y'
 
+    max_tokens_str = ask_text("最大输出token数 (留空用API默认值, 思考模型建议设置如 8192): ").strip()
+    max_tokens = None
+    if max_tokens_str:
+        try:
+            max_tokens = int(max_tokens_str)
+            if max_tokens <= 0:
+                return "❌ max_tokens 必须大于 0"
+        except ValueError:
+            return "❌ max_tokens 必须是数字"
+
     model_config = {
         "name": name,
         "apiKey": api_key,
@@ -121,11 +131,14 @@ def _add_model(app):
     }
     if temperature is not None:
         model_config["temperature"] = temperature
+    if max_tokens is not None:
+        model_config["max_tokens"] = max_tokens
 
     app.global_config.add_model(model_config)
     temp_info = f"   温度: {temperature}" if temperature is not None else "   温度: 使用全局值(0.1)"
     vision_info = "✅ 支持" if supports_vision else "❌ 不支持"
-    return f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens\n{temp_info}\n   视觉: {vision_info}"
+    max_tokens_info = f"   max_tokens: {max_tokens}" if max_tokens is not None else "   max_tokens: 使用API默认值"
+    return f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens\n{temp_info}\n   视觉: {vision_info}\n{max_tokens_info}"
 
 
 def _list_models(app):
@@ -153,6 +166,9 @@ def _list_models(app):
             lines.append(f"    温度: 使用全局值(0.1)")
         vision = m.get('vision', False)
         lines.append(f"    视觉: {'✅ 支持' if vision else '❌ 不支持'}")
+        max_tokens = m.get('max_tokens')
+        if max_tokens is not None:
+            lines.append(f"    max_tokens: {max_tokens}")
         lines.append("")
 
     return "\n".join(lines)
@@ -282,6 +298,11 @@ def _model_info(app):
         lines.append(f"  温度: 使用全局值(0.1)")
     vision = "✅ 支持" if app.llm_client.supports_vision else "❌ 不支持"
     lines.append(f"  视觉: {vision}")
+    max_tokens = app.llm_client.max_tokens
+    if max_tokens is not None:
+        lines.append(f"  max_tokens: {max_tokens}")
+    else:
+        lines.append(f"  max_tokens: 使用API默认值")
 
     if app.context_window:
         total = app.session.get_total_tokens() if app.session else 0
@@ -374,6 +395,23 @@ def _config_model(app, param):
     vision_str = ask_text(f"是否支持视觉/图片输入 (当前: {vision_display}): ").strip().lower()
     if vision_str:
         model_config['vision'] = vision_str == 'y'
+    
+    # max_tokens 参数
+    current_max_tokens = model_config.get('max_tokens')
+    max_tokens_display = str(current_max_tokens) if current_max_tokens is not None else "使用API默认值"
+    max_tokens_str = ask_text(f"最大输出token数 (当前: {max_tokens_display}, 输入 none 清除): ").strip()
+    if max_tokens_str:
+        if max_tokens_str.lower() == 'none' or max_tokens_str == '-':
+            model_config.pop('max_tokens', None)
+            print("  -> 已清除，将使用API默认值")
+        else:
+            try:
+                new_max_tokens = int(max_tokens_str)
+                if new_max_tokens <= 0:
+                    return "❌ max_tokens 必须大于 0"
+                model_config['max_tokens'] = new_max_tokens
+            except ValueError:
+                return "❌ max_tokens 必须是数字（输入 none 可清除）"
 
     # 保存配置
     # global_config 中 models 是列表，需要找到并替换
@@ -394,6 +432,11 @@ def _config_model(app, param):
         lines.append(f"   温度: 使用全局值(0.1)")
     vision = "✅ 支持" if model_config.get('vision', False) else "❌ 不支持"
     lines.append(f"   视觉: {vision}")
+    max_tokens = model_config.get('max_tokens')
+    if max_tokens is not None:
+        lines.append(f"   max_tokens: {max_tokens}")
+    else:
+        lines.append(f"   max_tokens: 使用API默认值")
     
     # 如果当前正在使用这个模型，提示需要重新加载
     if app.llm_client and app.llm_client.model_name == model_config.get('model'):
