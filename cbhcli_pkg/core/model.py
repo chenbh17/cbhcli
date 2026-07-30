@@ -1,0 +1,256 @@
+"""LLM客户端 - 统一API调用封装"""
+import requests
+import json
+from typing import Iterator, Optional
+
+from cbhcli_pkg.core.constants import API_TIMEOUT
+
+
+class LLMClient:
+    """统一的LLM API客户端"""
+    
+    def __init__(self, model_config: dict):
+        """
+        初始化LLM客户端
+        
+        Args:
+            model_config: 模型配置字典 {name, apiKey, url, model, context_limit}
+        """
+        self.base_url = model_config["url"].rstrip('/')
+        self.api_key = model_config["apiKey"]
+        self.model_name = model_config["model"]
+        self.context_limit = model_config.get("context_limit", 128000)
+        # 模型专属温度配置（可选，未设置则使用调用时传入的值或默认值）
+        self.model_temperature = model_config.get("temperature")
+        
+        # 是否支持视觉（图片输入）
+        self.supports_vision = model_config.get("vision", False)
+        
+        # 最大输出 token 数（可选，未设置则不传给 API，使用 API 默认值）
+        self.max_tokens = model_config.get("max_tokens")
+        
+        # 是否支持思考模式（动态检测：一旦模型返回 reasoning_content 就自动标记）
+        self.supports_reasoning = False
+        
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        })
+    
+    def _clean_messages(self, messages: list[dict]) -> list[dict]:
+        """清理消息，根据模型能力处理特殊字段
+
+        - 非视觉模型：多模态消息降级为纯文本（图片替换为占位说明），
+          避免 fallback 到非视觉模型时 API 报"不是视觉模型"错误
+        - supports_reasoning=True: 确保所有 assistant 消息都有 reasoning_content
+          （旧历史消息可能缺失该字段，补为空字符串）
+        - supports_reasoning=False: 剥离所有 reasoning_content 字段
+        - 自动检测：消息历史中存在 reasoning_content 时，自动标记
+        """
+        # 非视觉模型：剥除图片内容（视觉主模型 fallback 到非视觉模型时，
+        # 会话历史中的带图消息原样发送会被 API 拒绝）
+        if not self.supports_vision:
+            messages = [self._strip_images(msg) for msg in messages]
+
+        # 自动检测：消息历史中存在 reasoning_content，说明模型支持思考模式
+        if not self.supports_reasoning:
+            if any(msg.get("reasoning_content") for msg in messages):
+                self.supports_reasoning = True
+
+        if self.supports_reasoning:
+            # 思考模式：确保所有 assistant 消息都有 reasoning_content 字段
+            # 旧版本保存的历史消息可能缺失该字段，DeepSeek 要求必须传回
+            result = []
+            for msg in messages:
+                if msg.get("role") == "assistant" and "reasoning_content" not in msg:
+                    msg = {**msg, "reasoning_content": ""}
+                result.append(msg)
+            return result
+
+        # 非思考模式：剥离 reasoning_content
+        cleaned = []
+        for msg in messages:
+            if "reasoning_content" in msg:
+                msg = {k: v for k, v in msg.items() if k != "reasoning_content"}
+            cleaned.append(msg)
+        return cleaned
+
+    @staticmethod
+    def _strip_images(msg: dict) -> dict:
+        """将单条多模态消息降级为纯文本（图片替换为占位说明）
+
+        content 为字符串时原样返回；为列表（多模态格式）时，
+        保留文本部分，image_url 部分替换为 "[已省略 N 张图片]"。
+        """
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return msg
+
+        texts = []
+        img_count = 0
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    img_count += 1
+        if img_count:
+            texts.append(f"[已省略 {img_count} 张图片：当前模型不支持视觉]")
+        return {**msg, "content": "\n".join(t for t in texts if t)}
+    
+    def _get_temperature(self, temperature: float) -> float:
+        """获取温度参数：优先使用模型配置，否则使用传入值"""
+        if self.model_temperature is not None:
+            return self.model_temperature
+        return temperature
+
+    def chat(self, messages: list[dict], temperature: float = 0.1, **kwargs) -> str:
+        """
+        非流式聊天完成
+        
+        Args:
+            messages: 消息列表 [{role, content}]
+            temperature: 温度参数
+            **kwargs: 其他参数
+            
+        Returns:
+            AI响应文本
+        """
+        payload = {
+            "model": self.model_name,
+            "messages": self._clean_messages(messages),
+            "temperature": self._get_temperature(temperature),
+            **kwargs
+        }
+        if self.max_tokens:
+            payload["max_tokens"] = self.max_tokens
+        
+        response = self._session.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            timeout=API_TIMEOUT
+        )
+        
+        # 自动检测思考模式：400 + reasoning_content 错误时标记并重试
+        if response.status_code == 400 and not self.supports_reasoning:
+            if "reasoning_content" in response.text:
+                self.supports_reasoning = True
+                payload["messages"] = self._clean_messages(messages)
+                response = self._session.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    timeout=API_TIMEOUT
+                )
+        
+        if response.status_code != 200:
+            raise Exception(f"API请求失败: {response.status_code} - {response.text}")
+        
+        result = response.json()
+        return result["choices"][0]["message"]["content"].strip()
+    
+    def chat_stream(self, messages: list[dict], temperature: float = 0.1, **kwargs) -> Iterator[tuple[str, str]]:
+        """
+        流式聊天完成
+        
+        Args:
+            messages: 消息列表 [{role, content}]
+            temperature: 温度参数
+            **kwargs: 其他参数
+            
+        Yields:
+            元组 (类型, 内容):
+            - ("reasoning", content): 思考过程
+            - ("content", content): 正常回答内容
+            - ("tool_calls", json_str): 工具调用（JSON字符串）
+        """
+        payload = {
+            "model": self.model_name,
+            "messages": self._clean_messages(messages),
+            "temperature": self._get_temperature(temperature),
+            "stream": True,
+            **kwargs
+        }
+        if self.max_tokens:
+            payload["max_tokens"] = self.max_tokens
+        
+        response = self._session.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            stream=True,
+            timeout=API_TIMEOUT
+        )
+        
+        # 自动检测思考模式：400 + reasoning_content 错误时标记并重试
+        if response.status_code == 400 and not self.supports_reasoning:
+            error_text = response.text
+            if "reasoning_content" in error_text:
+                self.supports_reasoning = True
+                payload["messages"] = self._clean_messages(messages)
+                response = self._session.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    stream=True,
+                    timeout=API_TIMEOUT
+                )
+        
+        if response.status_code != 200:
+            raise Exception(f"API请求失败: {response.status_code} - {response.text}")
+        
+        for line in response.iter_lines():
+            if line:
+                line_str = line.decode('utf-8')
+                if line_str.startswith('data: '):
+                    data_str = line_str[6:]
+                    if data_str.strip() == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        if 'choices' in chunk and len(chunk['choices']) > 0:
+                            delta = chunk['choices'][0].get('delta', {})
+                            
+                            # 处理思考模型的 reasoning_content 字段
+                            reasoning_delta = delta.get('reasoning_content') or delta.get('reasoning')
+                            if reasoning_delta:
+                                # 动态标记：模型返回了 reasoning_content，后续请求需传回
+                                self.supports_reasoning = True
+                                yield ("reasoning", reasoning_delta)
+                                continue
+                            
+                            # 处理工具调用（某些模型通过 tool_calls 字段返回）
+                            if delta.get('tool_calls'):
+                                yield ("tool_calls", json.dumps(delta['tool_calls']))
+                                continue
+                            
+                            content = delta.get('content', '')
+                            if content:
+                                yield ("content", content)
+                    except json.JSONDecodeError:
+                        continue
+    
+    def embeddings(self, texts: list[str]) -> list[list[float]]:
+        """
+        获取文本的embedding向量
+        
+        Args:
+            texts: 文本列表
+            
+        Returns:
+            embedding向量列表
+        """
+        payload = {
+            "model": self.model_name,
+            "input": texts
+        }
+        
+        response = self._session.post(
+            f"{self.base_url}/embeddings",
+            json=payload,
+            timeout=API_TIMEOUT
+        )
+        
+        if response.status_code != 200:
+            raise Exception(f"Embedding请求失败: {response.status_code} - {response.text}")
+        
+        result = response.json()
+        return [item["embedding"] for item in result["data"]]
