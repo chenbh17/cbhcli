@@ -77,6 +77,7 @@ terminal 命令超过 timeout(默认30秒) 未完成时进程**不会被终止**
 - 出错时提供解决方案
 - **需要识别图片时使用 image 工具**，传入图片路径和识别需求；当前主模型支持视觉时图片会直接发送到会话中由你识别，否则工具自动调用其他视觉模型识别
 - **有多个相互独立的子任务时使用 delegate_task 传入 tasks 列表并行委托**，全部子Agent完成后主Agent再继续，可显著缩短总耗时
+- **当会话激活了 Agent 链条时，使用 call_agent 工具调用下游用户 Agent** 执行跨 Agent 工作流任务。下游 Agent 以自己的完整身份（系统提示、工具、工作空间、记忆、技能）执行任务。仅链条绑定时可用
 """
 
 
@@ -128,6 +129,7 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /tools [list|on|off] - 工具开关管理
 - /fallback [add|list|rm|reorder|clear] - 备用模型管理
 - /mcp [add|list|rm|refresh|tools|on|off] - MCP服务器管理
+- /chain [list|add|rm|use|off|show|config|rename] - Agent链条管理（无参数进入交互引导）
 - quit - 退出程序
 
 ## 权限模式（Harness 治理层）
@@ -193,6 +195,20 @@ MCP (Model Context Protocol) 允许连接外部工具服务器，扩展工具能
 - /fallback reorder [main|vision] - 重新排序备用模型
 - /fallback clear [main|vision] - 清空备用模型列表
 main=主模型备用, vision=视觉模型备用(image工具使用)。
+
+## Agent 链条（多 Agent 协作）
+Agent 链条允许你编排多个用户 Agent 之间的调用关系，实现跨 Agent 工作流。
+所有子命令均支持无参数直接进入交互式引导（从列表选择链条、编号选择 Agent）。
+- /chain list - 列出所有链条
+- /chain add - 交互式创建链条（引导输入名称 → 逐层编号选择 Agent）
+- /chain use - 激活链条（从列表选择）
+- /chain off - 取消链条绑定，恢复单 Agent 模式
+- /chain show - 查看链条详情（从列表选择）
+- /chain rm - 删除链条（从列表选择）
+- /chain config - 编辑链条配置（从列表选择，循环编辑模式）
+- /chain rename - 重命名链条（从列表选择）
+激活链条后，元 Agent 的系统提示中会注入下游 Agent 的描述和调用说明，
+可通过 call_agent 工具调用下游 Agent（以各自完整身份执行任务）。
 
 ## 记录信息
 当用户要求记录信息时：

@@ -157,6 +157,7 @@ class ChatInputBox:
             'bottom-toolbar.model': 'bold #00d7ff bg:#1c1e24',
             'bottom-toolbar.ctx': '#ffd75f bg:#1c1e24',
             'bottom-toolbar.agent': '#ff87d7 bg:#1c1e24',
+            'bottom-toolbar.chain': 'bold #ffaf00 bg:#1c1e24',
             'bottom-toolbar.skills': '#87ff87 bg:#1c1e24',
             'bottom-toolbar.cwd': '#87afff bg:#1c1e24',
             'bottom-toolbar.sep': '#444444 bg:#1c1e24',
@@ -325,8 +326,16 @@ class ChatInputBox:
             parts.append(("class:bottom-toolbar.ctx", ctx_info))
         if agent:
             parts.append(sep)
-            parts.append(("class:bottom-toolbar.label", "Agent: "))
-            parts.append(("class:bottom-toolbar.agent", agent))
+            # 链条绑定时显示链条路径，否则显示普通 Agent 名
+            chain = getattr(app, '_active_chain', None)
+            if chain:
+                path = getattr(app, '_chain_active_path', None) or [agent]
+                chain_str = f"🔗 {chain.name} › {' › '.join(path)}"
+                parts.append(("class:bottom-toolbar.label", "链条: "))
+                parts.append(("class:bottom-toolbar.chain", chain_str))
+            else:
+                parts.append(("class:bottom-toolbar.label", "Agent: "))
+                parts.append(("class:bottom-toolbar.agent", agent))
         if skills_str:
             parts.append(sep)
             parts.append(("class:bottom-toolbar.label", "技能: "))

@@ -150,6 +150,17 @@ const api = {
     fd.append("model_name", m);
     return fetch(`${BASE}/chat/upload`, { method: "POST", body: fd }).then(handleUploadResp);
   },
+
+  // Agent 链条
+  getChains: () => request("/chains"),
+  createChain: (d) => request("/chains", { method: "POST", body: JSON.stringify(d) }),
+  getChain: (n) => request(`/chains/${enc(n)}`),
+  updateChain: (n, d) => request(`/chains/${enc(n)}`, { method: "PUT", body: JSON.stringify(d) }),
+  deleteChain: (n) => request(`/chains/${enc(n)}`, { method: "DELETE" }),
+  useChain: (a, m, chain_name) =>
+    request("/chat/use-chain", { method: "POST", body: JSON.stringify({ agent_name: a, model_name: m, chain_name }) }),
+  offChain: (a, m) =>
+    request("/chat/off-chain", { method: "POST", body: JSON.stringify({ agent_name: a, model_name: m }) }),
 };
 
 function enc(s) { return encodeURIComponent(s); }
@@ -688,6 +699,7 @@ const state = {
   attachments: [],
   currentView: "chat",
   statusTimer: null,
+  activeChain: null,  // 当前激活的链条名称
 };
 
 function currentAgent() { return state.activeAgent; }
@@ -700,6 +712,7 @@ function currentModel() { return state.selectedModel; }
 const VIEW_LOADERS = {
   chat: null,
   agents: loadAgentsView,
+  chains: loadChainsView,
   models: loadModelsView,
   fallback: loadFallbackView,
   skills: loadSkillsView,
@@ -741,6 +754,7 @@ const TOOL_ICONS = {
   terminal: "💻", read: "📄", write: "📝", edit: "✏️", grep: "🔍", glob: "📁",
   python: "🐍", Todo: "📋", ask_user: "❓", memory_search: "🧠", knowledge_base: "📚",
   delegate_task: "🤖", skills_create: "⚡", image: "🖼️", process: "📊", kill_process: "⛔",
+  call_agent: "🔗", send_file: "📎",
 };
 function toolIcon(name) {
   if (TOOL_ICONS[name]) return TOOL_ICONS[name];
@@ -854,10 +868,14 @@ async function cyclePermissionMode() {
 async function onAgentChange() {
   const name = chatUI.agentSelect.value;
   state.activeAgent = name;
+  // 切换 Agent 时清除前端链条状态（等待后端 refreshStatus 重新同步）
+  state.activeChain = null;
+  updateChainIndicator();
   api.selectAgent(name).catch(() => {});
   clearMessages();
   await restoreMessages();
-  refreshStatus();
+  await refreshStatus();
+  updateChainIndicator();
 }
 
 async function onModelChange() {
@@ -921,6 +939,11 @@ async function refreshStatus() {
     if (cwdBar) {
       $("#cwd-bar-text").textContent = s.cwd || "";
       cwdBar.title = s.cwd || "";
+    }
+    // 同步链条激活状态（会话可能在后端已恢复链条）
+    if (s.active_chain !== undefined && s.active_chain !== state.activeChain) {
+      state.activeChain = s.active_chain || null;
+      updateChainIndicator();
     }
   } catch { /* 忽略 */ }
 }
@@ -1259,8 +1282,9 @@ async function runStream(userContent, images) {
     }
 
     // 确认条（参数已在上方工具卡片中高亮展示，此处不再重复）
+    const chainTag = data.chain_agent ? ` [${data.chain_agent}]` : "";
     const confirmEl = el("div", { class: "confirm-card" },
-      el("div", { class: "confirm-title" }, `⚠️ 确认执行 ${data.tool_name} ?`),
+      el("div", { class: "confirm-title" }, `⚠️ 确认执行 ${data.tool_name}${chainTag} ?`),
       el("div", { class: "confirm-actions" },
         el("button", { class: "btn btn-sm btn-success", "data-r": "y" }, "✓ 允许"),
         el("button", { class: "btn btn-sm btn-danger", "data-r": "n" }, "✕ 拒绝"),
@@ -1379,6 +1403,20 @@ async function runStream(userContent, images) {
     tool_result(d) {
       if (d.tool_name === "Todo") return;  // 面板已在 confirm 阶段展示
       const rec = ensureToolCard(d.tool_id, d.tool_name);
+      // call_agent 工具特殊展示：下游 Agent 调用结果以折叠区块显示
+      if (d.tool_name === "call_agent") {
+        setToolStatus(rec, "完成", "green");
+        rec.confirmEl?.remove();
+        const callBlock = el("div", { class: "chain-agent-call" },
+          el("div", { class: "chain-agent-call-header" },
+            el("span", null, `🔗 ${d.preview?.split('\n')[0]?.substring(0, 100) || "Agent 调用完成"}`),
+          ),
+          el("div", { class: "chain-agent-call-content" },
+            el("span", null, d.preview || "")),
+        );
+        rec.cardEl.append(callBlock);
+        return;
+      }
       setToolResult(rec, d);
     },
     tool_rejected(d) {
@@ -1414,6 +1452,73 @@ async function runStream(userContent, images) {
       addSysEvent(`[hook:${d.event}] ${d.content}`, "info", "🪝");
     },
     ask_user: handleAskUser,
+    // ---- 链条下游 Agent 事件 ----
+    chain_call_start(d) {
+      addSysEvent(`📌 调用 Agent: ${d.agent_name}`, "info", "🔗");
+      // 创建下游 Agent 输出区块
+      const block = el("div", { class: "chain-agent-call", id: `chain-block-${d.agent_name}` },
+        el("div", { class: "chain-agent-call-header" },
+          el("span", { class: "chain-agent-tag" }, `🔗 ${d.agent_name}`),
+          el("span", { class: "chain-agent-task" }, d.task || ""),
+        ),
+        el("div", { class: "chain-agent-call-content", id: `chain-content-${d.agent_name}` }),
+      );
+      aiBody.append(block);
+      scrollBottom();
+    },
+    chain_call_content(d) {
+      const contentEl = document.getElementById(`chain-content-${d.agent_name}`);
+      if (!contentEl) return;
+      let textEl = contentEl.querySelector(".chain-agent-text");
+      if (!textEl) {
+        textEl = el("div", { class: "chain-agent-text" });
+        textEl._raw = "";
+        contentEl.append(textEl);
+      }
+      // 累积原始文本，整体重新渲染（避免逐段 renderMd 产生碎片 HTML）
+      textEl._raw = (textEl._raw || "") + (d.content || "");
+      textEl.innerHTML = renderMd(textEl._raw);
+      scrollBottom();
+    },
+    chain_call_reasoning(d) {
+      const contentEl = document.getElementById(`chain-content-${d.agent_name}`);
+      if (!contentEl) return;
+      let rEl = contentEl.querySelector(".chain-agent-reasoning");
+      if (!rEl) {
+        rEl = el("div", { class: "chain-agent-reasoning" });
+        contentEl.append(rEl);
+      }
+      rEl.textContent += d.content || "";
+      scrollBottom();
+    },
+    chain_call_tool(d) {
+      const contentEl = document.getElementById(`chain-content-${d.agent_name}`);
+      if (!contentEl) return;
+      const toolLine = el("div", { class: "chain-agent-tool" },
+        `🔧 ${d.tool_name}(${JSON.stringify(d.arguments || {}).slice(0, 80)})`);
+      contentEl.append(toolLine);
+      scrollBottom();
+    },
+    chain_call_tool_result(d) {
+      const contentEl = document.getElementById(`chain-content-${d.agent_name}`);
+      if (!contentEl) return;
+      const status = d.success ? "✅" : "❌";
+      const output = (d.output || d.error || "").slice(0, 200);
+      const resultLine = el("div", { class: "chain-agent-tool-result" },
+        `${status} ${d.tool_name}: ${output}`);
+      contentEl.append(resultLine);
+      scrollBottom();
+    },
+    chain_call_ask_answered(d) {
+      addSysEvent(`✓ ${d.agent_name} 的提问已回答: ${d.answer}`, "success", "💬");
+    },
+    chain_call_end(d) {
+      const status = d.success ? "✅" : "❌";
+      addSysEvent(`${status} ${d.agent_name} 完成`, d.success ? "success" : "error", "🔗");
+      // 标记区块完成
+      const block = document.getElementById(`chain-block-${d.agent_name}`);
+      if (block) block.classList.add("chain-agent-call-done");
+    },
     reflection(d) {
       addSysEvent(`🔁 ${d.tool_name} 执行失败，正在自我反思 (重试 ${d.retry}/${d.max_retries})…`, "warn", "🔁");
     },
@@ -1882,7 +1987,381 @@ function emptyState(text, icon = "📭") {
 }
 
 /* ===================================================================
-   7. Agent 管理视图
+   7. Agent 链条管理视图
+   =================================================================== */
+
+async function loadChainsView() {
+  const root = $("#view-chains");
+  root.innerHTML = "";
+  const data = await api.getChains();
+  const chains = data.chains || [];
+
+  const addBtn = el("button", { class: "btn btn-primary", onclick: () => showCreateChainModal() }, "✚ 新建链条");
+  const inner = pageShell("Agent 链条", "多 Agent 调用编排，实现跨 Agent 工作流", [addBtn]);
+  root.append(el("div", { class: "page" }, inner));
+
+  if (!chains.length) {
+    inner.append(emptyState("暂无链条，点击右上角创建"));
+    return;
+  }
+
+  for (const c of chains) {
+    const card = el("div", { class: "card chain-card" });
+
+    // 头部
+    const header = el("div", { class: "card-row" },
+      el("div", null,
+        el("div", { class: "card-title" },
+          el("span", { class: "chain-icon" }, "🔗"),
+          el("span", null, c.name),
+          ...(!c.valid ? [el("span", { class: "badge badge-error" }, "⚠️ 无效")] : []),
+        ),
+        c.description ? el("div", { class: "card-desc" }, c.description) : null,
+      ),
+      el("div", { class: "card-actions" },
+        el("button", { class: "btn btn-sm",
+          onclick: () => showChainDetail(c.name) }, "查看"),
+        el("button", { class: "btn btn-sm",
+          onclick: () => showCreateChainModal(c) }, "编辑"),
+        el("button", { class: "btn btn-sm btn-danger",
+          onclick: () => deleteChainConfirm(c.name) }, "删除"),
+      ),
+    );
+    card.append(header);
+
+    // 树形结构
+    const tree = el("div", { class: "chain-tree" });
+    for (let i = 0; i < c.levels.length; i++) {
+      const level = c.levels[i];
+      const indent = "  ".repeat(i);
+      for (let j = 0; j < level.agents.length; j++) {
+        const a = level.agents[j];
+        const isLast = j === level.agents.length - 1;
+        const connector = i === 0 ? "" : (isLast ? "└── " : "├── ");
+        const node = el("div", { class: "chain-tree-node" },
+          el("span", { class: "chain-tree-indent" }, indent),
+          el("span", { class: "chain-tree-conn" }, connector),
+          el("span", { class: "chain-tree-name" }, a.name),
+          a.description ? el("span", { class: "chain-tree-desc" }, ` - ${a.description}`) : null,
+        );
+        if (a.call_instruction) {
+          node.append(el("div", { class: "chain-tree-instr" },
+            el("span", { class: "chain-tree-indent" }, indent + "    "),
+            el("span", { class: "chain-tree-instr-text" }, `调用说明: ${a.call_instruction}`),
+          ));
+        }
+        tree.append(node);
+      }
+    }
+    card.append(tree);
+    inner.append(card);
+  }
+}
+
+function showCreateChainModal(existing = null) {
+  const isEdit = !!existing;
+  const agents = state.agents || [];
+
+  const nameInput = el("input", {
+    class: "input", placeholder: "链条名称（如 dev-deploy）",
+  });
+  if (existing?.name) nameInput.value = existing.name;
+  if (isEdit) nameInput.disabled = true;
+
+  const descInput = el("input", {
+    class: "input", placeholder: "链条描述（可选）",
+  });
+  if (existing?.description) descInput.value = existing.description;
+
+  // 层级构建器
+  const levelsContainer = el("div", { class: "chain-levels-container" });
+  const existingLevels = (existing?.levels || []).map(l => ({
+    level: l.level,
+    agents: l.agents.map(a => ({ name: a.name, call_instruction: a.call_instruction || "" })),
+  }));
+  if (!existingLevels.length) {
+    existingLevels.push({ level: 1, agents: [{ name: "", call_instruction: "" }] });
+  }
+
+  function renderLevels() {
+    levelsContainer.innerHTML = "";
+    for (let li = 0; li < existingLevels.length; li++) {
+      const level = existingLevels[li];
+      const levelDiv = el("div", { class: "chain-level" },
+        el("div", { class: "chain-level-header" },
+          el("span", { class: "chain-level-num" }, `Level ${li + 1}${li === 0 ? " (元 Agent)" : ""}`),
+          li > 0 ? el("button", { class: "btn btn-ghost btn-xs btn-danger",
+            onclick: () => { existingLevels.splice(li, 1); renderLevels(); }
+          }, "✕") : null,
+        ),
+      );
+
+      for (let ai = 0; ai < level.agents.length; ai++) {
+        const agent = level.agents[ai];
+        const used = existingLevels.flatMap((l, idx) =>
+          idx !== li ? l.agents.map(a => a.name) : []
+        );
+        const available = agents.filter(a => !used.includes(a.name) || a.name === agent.name);
+
+        const sel = el("select", { class: "select chain-agent-select" },
+          el("option", { value: "" }, "-- 选择 Agent --"),
+          ...available.map(a => {
+            const opt = el("option", { value: a.name },
+              `${a.name} - ${a.description || ""}`);
+            if (a.name === agent.name) opt.selected = true;
+            return opt;
+          }),
+        );
+        sel.addEventListener("change", () => { agent.name = sel.value; });
+
+        const agentRow = el("div", { class: "chain-agent-row" }, sel);
+        if (li > 0) {
+          const instrInput = el("input", {
+            class: "input chain-instr-input",
+            placeholder: "调用说明（可选）",
+          });
+          instrInput.value = agent.call_instruction || "";
+          instrInput.addEventListener("input", () => { agent.call_instruction = instrInput.value; });
+          agentRow.append(instrInput);
+          agentRow.append(el("button", { class: "btn btn-ghost btn-xs btn-danger",
+            onclick: () => { level.agents.splice(ai, 1); renderLevels(); }
+          }, "✕"));
+        }
+        levelDiv.append(agentRow);
+      }
+
+      if (li > 0) {
+        levelDiv.append(el("button", { class: "btn btn-ghost btn-xs",
+          onclick: () => { level.agents.push({ name: "", call_instruction: "" }); renderLevels(); }
+        }, "✚ 添加同级 Agent"));
+      }
+
+      levelsContainer.append(levelDiv);
+    }
+
+    levelsContainer.append(el("button", { class: "btn btn-ghost btn-sm",
+      onclick: () => {
+        existingLevels.push({ level: existingLevels.length + 1, agents: [{ name: "", call_instruction: "" }] });
+        renderLevels();
+      }
+    }, "✚ 添加下一层"));
+  }
+
+  renderLevels();
+
+  const { close } = openModal({
+    title: isEdit ? "编辑链条" : "新建链条",
+    body: el("div", null,
+      el("div", { class: "form-row" }, el("label", null, "链条名称"), nameInput),
+      el("div", { class: "form-row" }, el("label", null, "描述"), descInput),
+      el("div", { class: "form-row" }, el("label", null, "层级结构"), levelsContainer),
+    ),
+    footer: [
+      el("button", { class: "btn", onclick: () => close() }, "取消"),
+      el("button", { class: "btn btn-primary", onclick: async () => {
+        const name = nameInput.value.trim();
+        if (!name) { toast("请输入链条名称", "warn"); return; }
+        for (const l of existingLevels) {
+          for (const a of l.agents) {
+            if (!a.name) { toast("请选择所有 Agent", "warn"); return; }
+          }
+        }
+        const payload = {
+          name,
+          description: descInput.value.trim(),
+          levels: existingLevels.map((l, i) => ({
+            level: i + 1,
+            agents: l.agents.map(a => ({
+              name: a.name,
+              ...(a.call_instruction ? { call_instruction: a.call_instruction } : {}),
+            })),
+          })),
+        };
+        try {
+          if (isEdit) {
+            await api.updateChain(existing.name, payload);
+            toast("链条已更新", "success");
+          } else {
+            await api.createChain(payload);
+            toast("链条已创建", "success");
+          }
+          close();
+          loadChainsView();
+        } catch (e) { toast(e.message, "error"); }
+      } }, "保存"),
+    ],
+  });
+}
+
+async function showChainDetail(name) {
+  try {
+    const chain = await api.getChain(name);
+
+    const treeDiv = el("div", { class: "chain-tree" });
+    for (let i = 0; i < chain.levels.length; i++) {
+      const level = chain.levels[i];
+      const indent = "  ".repeat(i);
+      for (let j = 0; j < level.agents.length; j++) {
+        const a = level.agents[j];
+        const isLast = j === level.agents.length - 1;
+        const connector = i === 0 ? "" : (isLast ? "└── " : "├── ");
+        const node = el("div", { class: "chain-tree-node" },
+          el("span", { class: "chain-tree-indent" }, indent),
+          el("span", { class: "chain-tree-conn" }, connector),
+          el("span", { class: "chain-tree-name" }, a.name),
+          el("span", { class: "chain-tree-desc" },
+            ` (${a.model || "继承"}) - ${a.description || ""}`),
+        );
+        if (a.call_instruction) {
+          node.append(el("div", { class: "chain-tree-instr" },
+            el("span", { class: "chain-tree-indent" }, indent + "    "),
+            el("span", { class: "chain-tree-instr-text" }, `调用说明: ${a.call_instruction}`),
+          ));
+        }
+        treeDiv.append(node);
+      }
+    }
+
+    const bodyParts = [];
+    if (chain.description) {
+      bodyParts.push(el("p", { style: "color:var(--text-1);font-size:13.5px;" }, chain.description));
+    }
+    if (!chain.valid) {
+      bodyParts.push(el("div", { class: "badge badge-error" },
+        `⚠️ 引用了不存在的 Agent: ${(chain.missing_agents || []).join(", ")}`));
+    }
+    bodyParts.push(treeDiv);
+
+    const { close } = openModal({
+      title: `🔗 ${chain.name}`,
+      body: el("div", null, ...bodyParts),
+      footer: [
+        el("button", { class: "btn", onclick: () => close() }, "关闭"),
+        el("button", { class: "btn btn-primary", onclick: async () => {
+          try {
+            await api.useChain(state.activeAgent, state.selectedModel, chain.name);
+            toast(`链条 '${chain.name}' 已激活`, "success");
+            state.activeChain = chain.name;
+            updateChainIndicator();
+            close();
+            switchView("chat");
+          } catch (e) { toast(e.message, "error"); }
+        } }, "🔗 激活链条"),
+      ],
+    });
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function deleteChainConfirm(name) {
+  const ok = await confirmDialog("删除链条",
+    `确定删除链条 '${name}'？\n此操作不影响链条中引用的 Agent。`,
+    { danger: true, okText: "删除" });
+  if (!ok) return;
+  try {
+    await api.deleteChain(name);
+    toast(`链条 '${name}' 已删除`, "success");
+    if (state.activeChain === name) {
+      state.activeChain = null;
+      updateChainIndicator();
+    }
+    loadChainsView();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function updateChainIndicator() {
+  const btn = $("#btn-chain");
+  if (!btn) return;
+  if (state.activeChain) {
+    btn.textContent = `🔗 ${state.activeChain}`;
+    btn.title = `链条: ${state.activeChain}（点击切换/取消）`;
+    btn.classList.add("chain-active");
+  } else {
+    btn.textContent = "🔗";
+    btn.title = "Agent 链条（点击选择激活）";
+    btn.classList.remove("chain-active");
+  }
+}
+
+function initChainIndicator() {
+  const btn = $("#btn-chain");
+  if (!btn) return;
+  btn.addEventListener("click", showChainPicker);
+}
+
+async function showChainPicker() {
+  let chains = [];
+  try {
+    const data = await api.getChains();
+    chains = data.chains || [];
+  } catch (e) { toast(e.message, "error"); return; }
+
+  // 只显示当前 Agent 是元 Agent 的链条（与 CLI 一致）
+  const currentAgent = state.activeAgent;
+  const available = chains.filter(c => {
+    const rootLevel = (c.levels || [])[0];
+    if (!rootLevel || !rootLevel.agents || !rootLevel.agents.length) return false;
+    return rootLevel.agents[0].name === currentAgent;
+  });
+
+  const body = el("div", { class: "quick-list" });
+
+  function makeRow(name, desc, isActive) {
+    const radio = el("input", { type: "radio", name: "chain-pick", value: name });
+    radio.checked = isActive;
+    return el("label", { class: "quick-item", style: "cursor:pointer;" },
+      el("div", { class: "quick-item-info" },
+        el("div", { class: "quick-item-name" }, name === "" ? "无链条" : `🔗 ${name}`),
+        el("div", { class: "quick-item-desc" }, desc)),
+      el("label", { class: "switch" }, radio, el("span", { class: "track" })));
+  }
+
+  body.append(makeRow("", "普通单 Agent 模式", !state.activeChain));
+
+  for (const c of available) {
+    const desc = c.description || "";
+    const invalid = !c.valid ? " (无效)" : "";
+    body.append(makeRow(c.name, `${desc}${invalid}`, state.activeChain === c.name));
+  }
+
+  if (!available.length) {
+    body.append(el("div", { class: "card-sub", style: "padding:16px;text-align:center;" },
+      `当前 Agent '${currentAgent}' 没有以其为元 Agent 的链条。\n可切换到对应元 Agent 或在链条管理页面创建。`));
+  }
+
+  body.append(el("div", { style: "margin-top:12px;border-top:1px solid var(--border);padding-top:10px;" },
+    el("button", {
+      class: "btn btn-ghost btn-sm",
+      onclick: () => { closeFn(); switchView("chains"); },
+    }, "🔗 管理链条配置")));
+
+  const { close: closeFn } = openModal({
+    title: `🔗 Agent 链条 - ${currentAgent}`,
+    width: "min(620px, calc(100vw - 40px))",
+    body,
+  });
+
+  body.addEventListener("change", async (e) => {
+    if (e.target.name !== "chain-pick") return;
+    const chainName = e.target.value;
+    try {
+      if (chainName) {
+        await api.useChain(state.activeAgent, state.selectedModel, chainName);
+        state.activeChain = chainName;
+        toast(`链条 '${chainName}' 已激活`, "success");
+      } else {
+        await api.offChain(state.activeAgent, state.selectedModel);
+        state.activeChain = null;
+        toast("链条绑定已取消", "success");
+      }
+      updateChainIndicator();
+      closeFn();
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+
+/* ===================================================================
+   8. Agent 管理视图
    =================================================================== */
 
 async function loadAgentsView() {
@@ -2248,7 +2727,7 @@ function showModelForm(m) {
         el("div", { class: "form-row" }, el("label", null, "max_tokens"),
           maxTokensInput,
           el("div", { class: "form-hint" }, "留空用API默认值；思考模型建议设置（如 8192）")),
-        el("div", { class: "form-row" }, el("label", null, " "),
+        el("div", { class: "form-row" }, el("label", null, " "),
           el("label", { class: "checkbox-row" }, visionChk, " 支持视觉（图片识别）"))),
     footer: [
       el("button", { class: "btn", onclick: () => $("#modal-root").innerHTML = "" }, "取消"),
@@ -3158,9 +3637,11 @@ async function bootstrap() {
   }
 
   initRouter();
+  initChainIndicator();
   refreshSelectors();
   await restoreMessages();
   refreshStatus();
+  updateChainIndicator();
   chatUI.input.focus();
 }
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CBHCLI Web</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <link rel="stylesheet" href="/css/style.css?v=5.0.3" />
+  <link rel="stylesheet" href="/css/style.css?v=5.1.1" />
 </head>
 <body>
   <div id="app">
@@ -21,6 +21,7 @@
       <nav class="sidebar-nav" id="sidebar-nav">
         <a class="nav-item active" data-view="chat"><span class="nav-icon">💬</span><span class="nav-label">对话</span></a>
         <a class="nav-item" data-view="agents"><span class="nav-icon">🤖</span><span class="nav-label">Agent</span></a>
+        <a class="nav-item" data-view="chains"><span class="nav-icon">🔗</span><span class="nav-label">链条</span></a>
         <a class="nav-item" data-view="models"><span class="nav-icon">🧠</span><span class="nav-label">模型</span></a>
         <a class="nav-item" data-view="fallback"><span class="nav-icon">🔄</span><span class="nav-label">备用模型</span></a>
         <a class="nav-item" data-view="skills"><span class="nav-icon">⚡</span><span class="nav-label">技能</span></a>
@@ -47,6 +48,7 @@
             <select id="chat-model-select" class="select"></select>
           </div>
           <div class="chat-header-right">
+            <button class="btn btn-ghost" id="btn-chain" title="Agent 链条">🔗</button>
             <div class="mode-badge" id="mode-badge" title="权限模式（点击切换）">
               <span id="mode-badge-text">🟢 标准</span>
             </div>
@@ -94,6 +96,7 @@
 
       <!-- 其他视图容器 -->
       <section class="view" id="view-agents"></section>
+      <section class="view" id="view-chains"></section>
       <section class="view" id="view-models"></section>
       <section class="view" id="view-fallback"></section>
       <section class="view" id="view-skills"></section>
@@ -112,7 +115,7 @@
   <!-- Toast 通知 -->
   <div id="toast-root"></div>
 
-  <script src="/vendor/marked.umd.js?v=5.0.3"></script>
-  <script src="/js/app.js?v=5.0.3"></script>
+  <script src="/vendor/marked.umd.js?v=5.1.1"></script>
+  <script src="/js/app.js?v=5.1.1"></script>
 </body>
 </html>

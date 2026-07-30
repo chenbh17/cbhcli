@@ -1,4 +1,4 @@
-# CBHCLI v5.0.3 - AI驱动的终端助手
+# CBHCLI v5.1.1 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -33,8 +33,9 @@
 - **工具调用显示升级（v4.9.9）** - Claude Code 风格：⏺ 工具头 + braille 旋转动画实时显示执行耗时 + ✓/✗ 状态行 + ⎿ 树形结果引导线（超出12行折叠提示 Ctrl+R 查看全部）
 - **死循环检测修复（v5.0.0）** - 周期震荡检测从工具名序列改为签名序列（工具名+参数MD5），修复 read/edit 等不同参数交替调用被误判为循环的问题；Web 端子 Agent 并行上限从 10 提升到 100（与 CLI 对齐）
 - **Web AI 发送文件/图片（v5.0.0）** - Web 界面 AI 可主动向用户发送文件和图片：新增 `send_file` 工具（仅 Web 端注册，CLI 不可见）传入文件路径即可发送，图片内联显示点击放大，文件显示下载链接；python 生成图片（matplotlib 等）自动检测展示，write/edit 写文件自动生成下载链接；所有逻辑仅在 Web 端生效，CLI 零改动
+- **Agent 链条（v5.1.0）** - 用户 Agent 间调用编排：定义多层级 Agent 调用链（如 main → cbhcli → {dify-chat, dbm-vl}），元 Agent 通过 `call_agent` 工具按链条拓扑调用下游用户 Agent（各自以完整身份执行：系统提示/工具/工作空间/记忆/技能/MCP），结果回传汇总；同级可并行；`/chain` 命令管理（list/add/rm/use/off/show/config/rename）；Web 端链条管理视图 + 聊天界面链条指示器 + 下游调用折叠展示
 
-### 16大内置工具 + Web 专属工具
+### 17大内置工具 + Web 专属工具
 | 工具 | 功能 |
 |------|------|
 | `terminal` | 执行终端命令（超时自动转后台，不杀进程） |
@@ -52,6 +53,7 @@
 | `knowledge_base` | 查询知识库内容 |
 | `skills_create` | 创建新技能 |
 | `delegate_task` | 委托子任务给子Agent（单个串行 / 多个并行最多100个，实时状态板） |
+| `call_agent` | 调用链条中下游用户Agent执行任务（仅链条绑定时可用） |
 | `image` | 识别图片内容（主模型支持视觉时直发主模型，否则调用其他视觉模型） |
 | `send_file` 📡 | **仅 Web 端**：向用户发送文件/图片，图片内联显示、文件下载链接 |
 
@@ -136,7 +138,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.0.3-py3-none-any.whl
+pip install dist/cbhcli-5.1.1-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -490,6 +492,14 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/fallback rm [main\|vision] <模型名>` | 移除备用模型 |
 | `/fallback reorder [main\|vision]` | 重新排序备用模型 |
 | `/fallback clear [main\|vision]` | 清空备用模型列表 |
+| `/chain list` | 列出所有 Agent 链条 |
+| `/chain add <名称>` | 交互式创建链条 |
+| `/chain use <名称>` | 激活链条 |
+| `/chain off` | 取消链条绑定 |
+| `/chain show <名称>` | 查看链条详情 |
+| `/chain rm <名称>` | 删除链条 |
+| `/chain config <名称>` | 编辑链条配置 |
+| `/chain rename <旧名> <新名>` | 重命名链条 |
 | `/help [command]` | 显示帮助 |
 | `quit` | 退出程序 |
 

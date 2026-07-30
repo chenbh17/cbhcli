@@ -1319,3 +1319,140 @@ html, body {
   .page { padding: 18px 16px 50px; }
   .form-grid { grid-template-columns: 1fr; }
 }
+
+/* ===================================================================
+   Agent 链条样式
+   =================================================================== */
+
+.chain-indicator {
+  display: flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--bg-2);
+  border: 1px solid #ffaf0044;
+  font-size: 12px;
+  color: #ffaf00;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+.chain-indicator:hover { filter: brightness(1.25); border-color: #ffaf0088; }
+.chain-indicator.hidden { display: none; }
+/* 未激活链条时灰色低对比度 */
+.chain-indicator:not([data-active]) { color: var(--text-dim); border-color: var(--border); }
+
+.chain-card { margin-bottom: 12px; }
+.chain-icon { margin-right: 6px; }
+
+.chain-tree {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--bg-1);
+  border-radius: 8px;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.chain-tree-node { white-space: pre-wrap; }
+.chain-tree-indent { color: var(--text-dim); }
+.chain-tree-conn { color: var(--text-dim); }
+.chain-tree-name { color: #ffaf00; font-weight: 600; }
+.chain-tree-desc { color: var(--text-dim); }
+.chain-tree-instr { color: #87afff; font-size: 12px; }
+.chain-tree-instr-text { color: #87afff; }
+
+.chain-levels-container { display: flex; flex-direction: column; gap: 12px; }
+.chain-level {
+  padding: 10px;
+  background: var(--bg-1);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.chain-level-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.chain-level-num { font-weight: 600; color: var(--text); font-size: 13px; }
+.chain-agent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.chain-agent-select { flex: 1; }
+.chain-instr-input { flex: 1; font-size: 13px; }
+
+.chain-agent-call {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-left: 3px solid #ffaf00;
+  background: var(--bg-1);
+  border-radius: 0 8px 8px 0;
+}
+.chain-agent-call-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #ffaf00;
+  margin-bottom: 6px;
+}
+.chain-agent-call-content {
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.chain-agent-tag {
+  font-weight: 700;
+  color: #ffaf00;
+}
+.chain-agent-task {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-dim);
+  opacity: 0.8;
+}
+.chain-agent-reasoning {
+  font-size: 12px;
+  color: var(--text-dim);
+  opacity: 0.6;
+  font-style: italic;
+  margin: 4px 0;
+  max-height: 80px;
+  overflow-y: auto;
+  border-left: 2px solid #555;
+  padding-left: 8px;
+}
+.chain-agent-text {
+  margin: 4px 0;
+  color: var(--text);
+}
+.chain-agent-tool {
+  font-size: 12px;
+  color: #7ec8e3;
+  margin: 2px 0;
+  font-family: monospace;
+}
+.chain-agent-tool-result {
+  font-size: 12px;
+  margin: 2px 0 4px 12px;
+  color: var(--text-dim);
+}
+.chain-agent-call-done {
+  opacity: 0.7;
+}
+
+.btn-xs { padding: 2px 6px; font-size: 11px; }
+
+/* 链条按钮激活态 */
+.btn-ghost.chain-active {
+  color: #ffaf00;
+  border-color: #ffaf0055;
+  background: rgba(255, 175, 0, 0.08);
+}

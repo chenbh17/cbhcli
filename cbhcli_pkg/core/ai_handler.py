@@ -41,7 +41,8 @@ class AIHandler:
         session: Session,
         tool_executor: ToolExecutor,
         token_counter: 'TokenCounter',
-        is_subagent: bool = False
+        is_subagent: bool = False,
+        display_label: str = ""
     ):
         self.llm_client = llm_client
         self.session = session
@@ -56,21 +57,33 @@ class AIHandler:
         self.context_compressor: Optional['ContextCompressor'] = None  # 由 app.py 注入
         self.context_window: Optional['ContextWindow'] = None  # 由 app.py 注入
         self.auto_compress: bool = True  # 由 app.py 注入
+        # 链条下游 Agent 事件回调（Web 端 SSE 推送用）
+        # 签名: (event_type, agent_name, **data) -> None
+        self._chain_event_callback: Optional[Callable] = None
 
         # 根据是否为子agent选择颜色
         if is_subagent:
             self._c_hint = C_SUBAGENT_HINT
             self._c_text = C_SUBAGENT_TEXT
             self._c_dim = C_SUBAGENT_DIM
-            self._label = "[SubAgent] "
+            self._label = display_label or "[SubAgent] "
         else:
             self._c_hint = C_AI_HINT
             self._c_text = C_AI_TEXT
             self._c_dim = C_DIM
-            self._label = ""
+            self._label = display_label
             
         # 思考内容滚动显示管理器
         self.thinking_display = ThinkingDisplay(max_lines=THINKING_MAX_LINES, label=self._label)
+
+    def _emit_chain_event(self, event_type: str, **data):
+        """发送链条事件到回调（Web 端 SSE 推送用）"""
+        cb = self._chain_event_callback
+        if cb:
+            try:
+                cb(event_type, self.agent_name, **data)
+            except Exception:
+                pass
 
     # ==================================================================
     #  主流程
@@ -243,6 +256,8 @@ class AIHandler:
                     reasoning_buffer += content
                     # 将思考内容添加到滚动显示区域
                     self.thinking_display.add_content(content)
+                    # 链条事件回调（Web SSE 推送）
+                    self._emit_chain_event("reasoning", content=content)
                     # 思考内容复读检测
                     if reasoning_loop.feed(content):
                         text_loop_hit = True
@@ -277,6 +292,8 @@ class AIHandler:
                     # 通过 Markdown 流式渲染器处理内容
                     raw_content = md_renderer.feed(content)
                     ai_response += raw_content
+                    # 链条事件回调（Web SSE 推送）
+                    self._emit_chain_event("content", content=content)
                     # 正文复读检测
                     if content_loop.feed(content):
                         text_loop_hit = True
@@ -509,11 +526,20 @@ class AIHandler:
                     if self.tool_executor.tracer:
                         self.tool_executor.tracer.log_loop("warn", tc["tool"])
                 try:
+                    # 链条事件回调：工具调用开始
+                    self._emit_chain_event("tool_call", tool_name=tc["tool"],
+                                           arguments=tc["arguments"])
                     result = self.tool_executor.execute_with_display(
                         tc["tool"],
                         tc["arguments"],
                         tc["id"]
                     )
+                    # 链条事件回调：工具执行结果
+                    self._emit_chain_event(
+                        "tool_result", tool_name=tc["tool"],
+                        success=result.success,
+                        output=(result.output or "")[:500],
+                        error=result.error or "")
 
                     if result.success:
                         output = result.output[:MAX_TOOL_OUTPUT_LENGTH]

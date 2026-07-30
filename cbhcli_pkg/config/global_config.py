@@ -104,6 +104,20 @@ class GlobalConfig:
     def get_default_agent(self) -> str:
         """获取默认Agent名称"""
         return self.config.get("agents", {}).get("default_agent", "general")
+
+    # Agent 链条激活状态持久化（per-agent）
+    def get_active_chain(self, agent_name: str) -> Optional[str]:
+        """获取指定 Agent 当前激活的链条名称"""
+        return self.config.get("agents", {}).get("active_chains", {}).get(agent_name)
+
+    def set_active_chain(self, agent_name: str, chain_name: Optional[str]) -> None:
+        """设置指定 Agent 激活的链条（chain_name=None 表示取消）"""
+        chains = self.config.setdefault("agents", {}).setdefault("active_chains", {})
+        if chain_name:
+            chains[agent_name] = chain_name
+        else:
+            chains.pop(agent_name, None)
+        self.save()
     
     # 设置
     def get_settings(self) -> dict:

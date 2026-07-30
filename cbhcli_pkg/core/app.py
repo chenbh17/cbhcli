@@ -74,6 +74,7 @@ from cbhcli_pkg.commands.skills_cmd import register_skills_commands
 from cbhcli_pkg.commands.tools_cmd import register_tools_commands
 from cbhcli_pkg.commands.fallback_cmd import register_fallback_commands
 from cbhcli_pkg.commands.harness_cmd import register_harness_commands
+from cbhcli_pkg.commands.chain_cmd import register_chain_commands
 
 
 class SlashCommandHelper:
@@ -185,6 +186,16 @@ class SlashCommandHelper:
         ],
         'undo': [
             ('list', '查看可回滚的文件备份'),
+        ],
+        'chain': [
+            ('list', '列出所有链条'),
+            ('add', '创建新链条'),
+            ('rm', '删除链条'),
+            ('use', '激活链条'),
+            ('off', '取消链条绑定'),
+            ('show', '查看链条详情'),
+            ('config', '编辑链条配置'),
+            ('rename', '重命名链条'),
         ],
     }
     
@@ -404,6 +415,7 @@ class CBHCLIApp:
         register_tools_commands(self.command_parser, self)
         register_fallback_commands(self.command_parser, self)
         register_harness_commands(self.command_parser, self)
+        register_chain_commands(self.command_parser, self)
         
         # 注册help命令
         def help_handler(args):
@@ -453,6 +465,11 @@ class CBHCLIApp:
         self.mcp_manager: Optional[MCPManager] = None
         self.skill_manager: Optional[SkillManager] = None
         self._agent_indexed: bool = False  # 标记是否已索引
+        
+        # Agent 链条状态
+        self._active_chain = None          # 当前激活的 AgentChain
+        self._chain_active_path: list = None  # 当前执行路径 ["main", "cbhcli", ...]
+        self._chain_manager = None         # ChainManager 延迟初始化
         
         # 尝试加载上次活动的Agent
         active_agent = self.global_config.get_active_agent()
@@ -521,6 +538,35 @@ class CBHCLIApp:
                 print(f"⚠️  索引工作空间失败: {e}")
         
         self._reset_session()
+
+        # Agent 链条：恢复持久化的激活状态
+        if not getattr(self, '_active_chain', None):
+            saved_chain_name = self.global_config.get_active_chain(agent_name)
+            if saved_chain_name:
+                from cbhcli_pkg.commands.chain_cmd import _get_chain_manager
+                cm = _get_chain_manager(self)
+                saved_chain = cm.get_chain(saved_chain_name)
+                if saved_chain:
+                    # 校验 Agent 存在性
+                    missing = saved_chain.validate(self.agent_manager)
+                    if not missing and saved_chain.get_root_agent() == agent_name:
+                        from cbhcli_pkg.commands.chain_cmd import _activate_chain
+                        _activate_chain(self, saved_chain)
+                        print(f"{C_DIM}🔗 已恢复链条: {saved_chain_name}{C_RESET}")
+        else:
+            # 已有激活链条：检查是否匹配当前 Agent
+            chain = self._active_chain
+            root = chain.get_root_agent()
+            if agent_name != root:
+                # 切换的 Agent 不是当前链条的元 Agent，取消链条绑定
+                from cbhcli_pkg.commands.chain_cmd import _deactivate_chain
+                _deactivate_chain(self)
+                print(f"{C_DIM}💡 切换 Agent 导致链条绑定已取消{C_RESET}")
+            else:
+                # 重新注入链条信息
+                from cbhcli_pkg.commands.chain_cmd import _inject_chain_prompt, _register_call_agent_tool
+                _inject_chain_prompt(self, chain)
+                _register_call_agent_tool(self, chain)
 
         # SessionStart 钩子（stdout 打印给用户）
         if self.hook_manager and self.hook_manager.has_hooks("SessionStart"):

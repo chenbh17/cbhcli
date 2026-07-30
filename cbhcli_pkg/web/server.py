@@ -72,7 +72,7 @@ from cbhcli_pkg.context.compressor import ContextCompressor
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.0.3")
+app = FastAPI(title="CBHCLI Web", version="5.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -181,7 +181,7 @@ def _reset_vector_store():
 # 只读/交互工具 — 无需用户确认
 _READONLY_TOOLS = {
     "grep", "glob", "ask_user", "read", "Todo",
-    "memory_search", "knowledge_base", "delegate_task",
+    "memory_search", "knowledge_base", "delegate_task", "call_agent",
 }
 
 
@@ -200,6 +200,21 @@ class _WebAgentContext:
         self.context_window = None
         self.auto_compress = True
         self.current_agent_config = None
+        # Agent 链条状态
+        self.active_chain = None
+        self.chain_active_path = None
+        self._chain_manager = None
+        # ChainExecutor 所需的 app 级引用
+        self.agent_manager = None  # 由 WebChatSession.create 设置
+        self.global_config = None  # 由 WebChatSession.create 设置
+        self.tracer = None         # 由 WebChatSession.create 设置
+        self.permission_engine = None  # 由 WebChatSession.create 设置
+        # 链条下游 Agent 确认回调（call_agent 执行期间由 _react_loop 设置）
+        self._chain_confirm_callback = None
+        # 链条下游 Agent ask_user 回调
+        self._chain_ask_user_callback = None
+        # 链条下游 Agent 事件回调（content/reasoning/tool_call/tool_result）
+        self._chain_event_callback = None
 
 
 class SendFileTool:
@@ -278,7 +293,8 @@ class SendFileTool:
         )
 
 
-def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext) -> ToolRegistry:
+def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext,
+                         chain=None) -> ToolRegistry:
     """构建完整工具注册表（内置工具 + cbhpacks + 知识库/记忆/子Agent）。"""
     _init_vector_store()
 
@@ -341,6 +357,16 @@ def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext) -> ToolRe
         if config and config.disabled_tools:
             registry.set_disabled_tools(config.disabled_tools)
 
+    # 如果激活了链条且当前 Agent 有下游，注册 call_agent 工具
+    if chain and agent_name:
+        downstream = chain.get_downstream_agents(agent_name)
+        if downstream:
+            from cbhcli_pkg.tools.call_agent import CallAgentTool
+            # app_proxy 需要模拟 chain 执行所需的 app 接口
+            app_proxy.active_chain = chain
+            app_proxy.chain_active_path = [chain.get_root_agent()]
+            registry.register(CallAgentTool(app_proxy, chain, agent_name))
+
     return registry
 
 
@@ -377,6 +403,10 @@ class WebChatSession:
         self.checkpoint_manager: Optional[CheckpointManager] = None
         self.tracer: Optional[Tracer] = None
         self.hook_start_outputs: list = []   # SessionStart 钩子输出（待下发）
+
+        # Agent 链条状态
+        self.active_chain = None
+        self.chain_active_path = None
 
         # asyncio 原语（在首次使用时绑定到运行中的事件循环）
         self.respond_queue: Optional[asyncio.Queue] = None
@@ -458,6 +488,11 @@ class WebChatSession:
         cs.app_proxy.context_window = cs.context_window
         cs.app_proxy.auto_compress = cs.auto_compress
         cs.app_proxy.current_agent_config = agent_config
+        # ChainExecutor 所需引用
+        cs.app_proxy.agent_manager = manager
+        cs.app_proxy.global_config = config
+        cs.app_proxy.tracer = cs.tracer
+        cs.app_proxy.permission_engine = cs.permission_engine
 
         # SessionStart 钩子（输出暂存，首次聊天时通过 SSE 下发）
         if cs.hook_manager and cs.hook_manager.has_hooks("SessionStart"):
@@ -468,11 +503,30 @@ class WebChatSession:
             except Exception:
                 pass
 
+        # 恢复持久化的链条激活状态（与 CLI 一致）
+        try:
+            saved_chain_name = config.get_active_chain(agent_name)
+            if saved_chain_name:
+                cm = _get_chain_manager()
+                saved_chain = cm.get_chain(saved_chain_name)
+                if saved_chain:
+                    missing = saved_chain.validate(manager)
+                    if not missing and saved_chain.get_root_agent() == agent_name:
+                        cs.active_chain = saved_chain
+                        cs.chain_active_path = [saved_chain.get_root_agent()]
+                        cs.app_proxy.active_chain = saved_chain
+                        cs.app_proxy.chain_active_path = cs.chain_active_path
+                        cs._rebuild_tools()
+                        cs._rebuild_system_prompt()
+        except Exception:
+            pass
+
         return cs
 
     def _rebuild_tools(self):
         """重建工具注册表和 MCP 管理器（MCP 配置变更后同步调用）。"""
-        self.tool_registry = _build_tool_registry(self.agent_name, self.app_proxy)
+        self.tool_registry = _build_tool_registry(
+            self.agent_name, self.app_proxy, chain=self.active_chain)
         self.app_proxy.tool_executor = ToolExecutor(self.tool_registry)
 
         # Harness 组件挂载（delegate_task 子Agent经 tool_executor 执行工具）
@@ -558,6 +612,14 @@ class WebChatSession:
         )
         # 注入当前权限模式说明（与 CLI 一致）
         system_prompt += build_mode_note(get_permission_engine().mode)
+        # 注入 Agent 链条信息（如果激活了链条）
+        if self.active_chain and self.agent_name:
+            from cbhcli_pkg.core.agent_chain import build_chain_prompt
+            chain_prompt = build_chain_prompt(
+                self.active_chain, get_agent_manager(), self.agent_name
+            )
+            if chain_prompt:
+                system_prompt += chain_prompt
         # 注入 Web 界面特有功能说明（仅 Web 端，CLI 不注入）
         system_prompt += (
             "\n\n## Web 界面功能\n"
@@ -1657,6 +1719,184 @@ def delete_history(agent_name: str, filename: str):
 
 
 # ===================================================================
+#  API: Agent Chains (链条管理)
+# ===================================================================
+
+def _get_chain_manager():
+    """获取或创建 ChainManager 单例"""
+    from cbhcli_pkg.core.agent_chain import ChainManager
+    global _chain_manager_instance
+    if _chain_manager_instance is None:
+        _chain_manager_instance = ChainManager()
+    return _chain_manager_instance
+
+_chain_manager_instance = None
+
+
+@app.get("/api/chains")
+def list_chains():
+    cm = _get_chain_manager()
+    manager = get_agent_manager()
+    chains = []
+    for chain in cm.list_chains():
+        d = chain.to_dict()
+        # 附加每个 Agent 的 description（实时读取）
+        for level in d.get("levels", []):
+            for agent in level.get("agents", []):
+                cfg = manager.load_agent(agent["name"])
+                agent["description"] = cfg.description if cfg else ""
+                model = cfg.primary_model if cfg else ""
+                agent["model"] = model or ""
+        # 校验
+        missing = chain.validate(manager)
+        d["valid"] = len(missing) == 0
+        d["missing_agents"] = missing
+        chains.append(d)
+    return {"chains": chains}
+
+
+@app.post("/api/chains")
+async def create_chain(req: Request):
+    data = json.loads(await req.body())
+    from cbhcli_pkg.core.agent_chain import AgentChain, ChainLevel, ChainAgent
+    cm = _get_chain_manager()
+    name = data.get("name", "")
+    if not name:
+        raise HTTPException(400, "链条名称不能为空")
+    if cm.get_chain(name):
+        raise HTTPException(400, f"链条 '{name}' 已存在")
+    chain = AgentChain(
+        name=name,
+        description=data.get("description", ""),
+        levels=[ChainLevel.from_dict(l) for l in data.get("levels", [])],
+    )
+    # 校验 Agent 存在性
+    missing = chain.validate(get_agent_manager())
+    if missing:
+        raise HTTPException(400, f"链条中引用了不存在的 Agent: {', '.join(missing)}")
+    cm.add_chain(chain)
+    return {"message": f"链条 '{name}' 已创建", "chain": chain.to_dict()}
+
+
+@app.get("/api/chains/{chain_name}")
+def get_chain(chain_name: str):
+    cm = _get_chain_manager()
+    chain = cm.get_chain(chain_name)
+    if not chain:
+        raise HTTPException(404, f"链条 '{chain_name}' 不存在")
+    manager = get_agent_manager()
+    d = chain.to_dict()
+    for level in d.get("levels", []):
+        for agent in level.get("agents", []):
+            cfg = manager.load_agent(agent["name"])
+            agent["description"] = cfg.description if cfg else ""
+            agent["model"] = cfg.primary_model if cfg else ""
+    missing = chain.validate(manager)
+    d["valid"] = len(missing) == 0
+    d["missing_agents"] = missing
+    return d
+
+
+@app.put("/api/chains/{chain_name}")
+async def update_chain(chain_name: str, req: Request):
+    cm = _get_chain_manager()
+    chain = cm.get_chain(chain_name)
+    if not chain:
+        raise HTTPException(404, f"链条 '{chain_name}' 不存在")
+    data = json.loads(await req.body())
+    from cbhcli_pkg.core.agent_chain import AgentChain, ChainLevel
+    if "description" in data:
+        chain.description = data["description"]
+    if "levels" in data:
+        chain.levels = [ChainLevel.from_dict(l) for l in data["levels"]]
+    missing = chain.validate(get_agent_manager())
+    if missing:
+        raise HTTPException(400, f"链条中引用了不存在的 Agent: {', '.join(missing)}")
+    cm.update_chain(chain_name, chain)
+    return {"message": f"链条 '{chain_name}' 已更新"}
+
+
+@app.delete("/api/chains/{chain_name}")
+def delete_chain(chain_name: str):
+    cm = _get_chain_manager()
+    if not cm.get_chain(chain_name):
+        raise HTTPException(404, f"链条 '{chain_name}' 不存在")
+    cm.remove_chain(chain_name)
+    return {"message": f"链条 '{chain_name}' 已删除"}
+
+
+@app.post("/api/chat/use-chain")
+async def use_chain(req: Request):
+    """当前会话绑定链条"""
+    data = json.loads(await req.body())
+    chain_name = data.get("chain_name", "")
+    agent_name = data.get("agent_name", "")
+    model_name = data.get("model_name", "")
+
+    cm = _get_chain_manager()
+    chain = cm.get_chain(chain_name)
+    if not chain:
+        raise HTTPException(404, f"链条 '{chain_name}' 不存在")
+
+    missing = chain.validate(get_agent_manager())
+    if missing:
+        raise HTTPException(400, f"链条中引用了不存在的 Agent: {', '.join(missing)}")
+
+    # 校验：只有元 Agent 才能激活对应链条（与 CLI 一致）
+    root = chain.get_root_agent()
+    if agent_name != root:
+        raise HTTPException(400,
+            f"链条 '{chain_name}' 的元 Agent 是 '{root}'，"
+            f"当前 Agent 是 '{agent_name}'。请先切换到元 Agent 再激活。")
+
+    cs = _get_or_create_session(agent_name, model_name)
+    cs.active_chain = chain
+    cs.chain_active_path = [chain.get_root_agent()]
+    cs.app_proxy.active_chain = chain
+    cs.app_proxy.chain_active_path = cs.chain_active_path
+
+    # 持久化激活状态（与 CLI 一致，刷新页面/重新进入 Agent 时自动恢复）
+    root = chain.get_root_agent()
+    if root:
+        get_config().set_active_chain(root, chain_name)
+
+    # 重建工具（注册 call_agent）
+    cs._rebuild_tools()
+    # 重建系统提示（注入链条信息）
+    cs._rebuild_system_prompt()
+
+    return {
+        "message": f"链条 '{chain_name}' 已激活",
+        "chain_name": chain_name,
+        "root_agent": chain.get_root_agent(),
+    }
+
+
+@app.post("/api/chat/off-chain")
+async def off_chain(req: Request):
+    """取消当前会话的链条绑定"""
+    data = json.loads(await req.body())
+    agent_name = data.get("agent_name", "")
+    model_name = data.get("model_name", "")
+
+    cs = _get_or_create_session(agent_name, model_name)
+    cs.active_chain = None
+    cs.chain_active_path = None
+    cs.app_proxy.active_chain = None
+    cs.app_proxy.chain_active_path = None
+
+    # 持久化取消状态
+    get_config().set_active_chain(agent_name, None)
+
+    # 重建工具（移除 call_agent）
+    cs._rebuild_tools()
+    # 重建系统提示
+    cs._rebuild_system_prompt()
+
+    return {"message": "链条绑定已取消"}
+
+
+# ===================================================================
 #  API: Chat (SSE Streaming + ReAct Loop)
 # ===================================================================
 
@@ -2164,11 +2404,234 @@ async def _react_loop(cs: WebChatSession):
                         "tool_name": tool_name, "tool_id": tool_id})
             import time as _time
             _t0 = _time.monotonic()
-            try:
-                result = await asyncio.to_thread(
-                    cs.tool_registry.execute, tool_name, **tool_args)
-            except Exception as e:
-                result = ToolResult(success=False, output="", error=str(e))
+
+            if tool_name == "call_agent":
+                # 链条下游 Agent 调用：执行期间下游的工具确认/ask_user/输出
+                # 通过事件队列路由到 Web UI（SSE）
+                import queue as _queue_mod
+                import threading as _threading_mod
+
+                _chain_evt_q: "_queue_mod.Queue" = _queue_mod.Queue()
+                _chain_confirm_evt = _threading_mod.Event()
+                _chain_confirm_resp = [None]   # mutable holder
+                _chain_no_more = [False]       # 下游 "all" 免确认标志
+                _chain_ask_evt = _threading_mod.Event()
+                _chain_ask_resp = [None]       # ask_user 回答 holder
+
+                _target_agent = tool_args.get("agent_name", "")
+
+                # 发送 chain_call_start 事件
+                yield _sse({
+                    "type": "chain_call_start",
+                    "agent_name": _target_agent,
+                    "task": tool_args.get("task", "")[:200],
+                })
+
+                def _chain_confirm_cb(ct_name, ct_args):
+                    """下游 Agent 线程中调用：阻塞等待 Web 用户确认结果。"""
+                    if _chain_no_more[0]:
+                        return True
+                    _chain_evt_q.put({
+                        "type": "_chain_confirm",
+                        "tool_name": ct_name,
+                        "tool_args": ct_args,
+                    })
+                    _chain_confirm_evt.wait(timeout=600)
+                    _chain_confirm_evt.clear()
+                    resp = _chain_confirm_resp[0]
+                    _chain_confirm_resp[0] = None
+                    if resp is None or resp in ("n", "no"):
+                        return False
+                    if resp == "all":
+                        _chain_no_more[0] = True
+                    return True
+
+                def _chain_ask_user_cb(question, options, allow_multiple):
+                    """下游 Agent 线程中调用：阻塞等待 Web 用户回答 ask_user。"""
+                    _chain_evt_q.put({
+                        "type": "_chain_ask_user",
+                        "question": question,
+                        "options": options or [],
+                        "allow_multiple": allow_multiple or False,
+                    })
+                    _chain_ask_evt.wait(timeout=600)
+                    _chain_ask_evt.clear()
+                    resp = _chain_ask_resp[0]
+                    _chain_ask_resp[0] = None
+                    return resp if resp else "用户未回答"
+
+                def _chain_event_cb(event_type, agent_name, **data):
+                    """下游 Agent 线程中调用：将执行过程事件推入队列。"""
+                    _chain_evt_q.put({
+                        "type": f"_chain_evt_{event_type}",
+                        "agent_name": agent_name,
+                        **data,
+                    })
+
+                cs.app_proxy._chain_confirm_callback = _chain_confirm_cb
+                cs.app_proxy._chain_ask_user_callback = _chain_ask_user_cb
+                cs.app_proxy._chain_event_callback = _chain_event_cb
+
+                # 在后台线程执行下游 Agent（其内部确认经上面的回调路由到 SSE）
+                _chain_future = asyncio.get_event_loop().run_in_executor(
+                    None, lambda: cs.tool_registry.execute(tool_name, **tool_args))
+
+                # 轮询事件直到下游执行完毕
+                while not _chain_future.done():
+                    try:
+                        _cev = _chain_evt_q.get_nowait()
+                    except _queue_mod.Empty:
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    _cev_type = _cev.get("type", "")
+
+                    # ---- 下游 Agent 工具确认请求 ----
+                    if _cev_type == "_chain_confirm":
+                        _ct_name = _cev["tool_name"]
+                        _ct_args = _cev["tool_args"]
+
+                        # 下游工具先过权限引擎（deny 红线直接拒绝不弹确认）
+                        _ct_action, _ct_rule = engine.check(_ct_name, _ct_args)
+                        if _ct_action == PERM_DENY:
+                            _chain_confirm_resp[0] = "n"
+                            _chain_confirm_evt.set()
+                            yield _sse({
+                                "type": "tool_denied",
+                                "tool_name": _ct_name,
+                                "tool_id": tool_id,
+                                "rule": str(_ct_rule),
+                                "reason": (f"下游 Agent [{_target_agent}] "
+                                           f"操作被权限规则禁止: {_ct_rule}"),
+                                "chain_agent": _target_agent,
+                            })
+                            continue
+                        if _ct_action == PERM_WARN:
+                            yield _sse({
+                                "type": "tool_yolo_warn",
+                                "tool_name": _ct_name,
+                                "tool_id": tool_id,
+                                "rule": str(_ct_rule),
+                                "chain_agent": _target_agent,
+                            })
+
+                        # 弹出确认框（与主会话确认一致的 UI）
+                        yield _sse({
+                            "type": "tool_confirm",
+                            "tool_name": _ct_name,
+                            "tool_args": _ct_args,
+                            "preview": _tool_preview(_ct_name, _ct_args),
+                            "tool_id": tool_id,
+                            "needs_confirm": True,
+                            "chain_agent": _target_agent,
+                        })
+                        _uresp = await cs.wait_response(timeout=600)
+                        if _uresp is None:
+                            if cs.abort:
+                                _chain_confirm_resp[0] = "n"
+                                _chain_confirm_evt.set()
+                                yield _sse({"type": "aborted"})
+                                return
+                            _uresp = "n"
+                        _uresp = _uresp.strip().lower()
+
+                        if _uresp == "always":
+                            _rs = PermissionEngine.suggest_allow_rule(
+                                _ct_name, _ct_args)
+                            engine.add_rule("allow", _rs)
+                            yield _sse({"type": "rule_added",
+                                        "category": "allow", "rule": _rs})
+                            _uresp = "y"
+
+                        _chain_confirm_resp[0] = _uresp
+                        _chain_confirm_evt.set()
+
+                        if _uresp in ("n", "no"):
+                            yield _sse({
+                                "type": "tool_rejected",
+                                "tool_name": _ct_name,
+                                "tool_id": tool_id,
+                                "chain_agent": _target_agent,
+                            })
+
+                    # ---- 下游 Agent ask_user 请求 ----
+                    elif _cev_type == "_chain_ask_user":
+                        yield _sse({
+                            "type": "ask_user",
+                            "question": _cev.get("question", ""),
+                            "options": _cev.get("options", []),
+                            "allow_multiple": _cev.get("allow_multiple", False),
+                            "tool_id": tool_id,
+                            "chain_agent": _target_agent,
+                        })
+                        _ans = await cs.wait_response(timeout=600)
+                        if _ans is None:
+                            if cs.abort:
+                                _chain_ask_resp[0] = ""
+                                _chain_ask_evt.set()
+                                yield _sse({"type": "aborted"})
+                                return
+                            _ans = "用户未回答"
+                        _chain_ask_resp[0] = _ans
+                        _chain_ask_evt.set()
+                        yield _sse({
+                            "type": "chain_call_ask_answered",
+                            "agent_name": _target_agent,
+                            "answer": _ans,
+                        })
+
+                    # ---- 下游 Agent 执行过程事件（content/reasoning/tool） ----
+                    elif _cev_type == "_chain_evt_content":
+                        yield _sse({
+                            "type": "chain_call_content",
+                            "agent_name": _cev.get("agent_name", _target_agent),
+                            "content": _cev.get("content", ""),
+                        })
+                    elif _cev_type == "_chain_evt_reasoning":
+                        yield _sse({
+                            "type": "chain_call_reasoning",
+                            "agent_name": _cev.get("agent_name", _target_agent),
+                            "content": _cev.get("content", ""),
+                        })
+                    elif _cev_type == "_chain_evt_tool_call":
+                        yield _sse({
+                            "type": "chain_call_tool",
+                            "agent_name": _cev.get("agent_name", _target_agent),
+                            "tool_name": _cev.get("tool_name", ""),
+                            "arguments": _cev.get("arguments", {}),
+                        })
+                    elif _cev_type == "_chain_evt_tool_result":
+                        yield _sse({
+                            "type": "chain_call_tool_result",
+                            "agent_name": _cev.get("agent_name", _target_agent),
+                            "tool_name": _cev.get("tool_name", ""),
+                            "success": _cev.get("success", False),
+                            "output": _cev.get("output", ""),
+                            "error": _cev.get("error", ""),
+                        })
+
+                # 下游执行完毕，取结果
+                try:
+                    result = _chain_future.result()
+                except Exception as e:
+                    result = ToolResult(success=False, output="", error=str(e))
+                finally:
+                    cs.app_proxy._chain_confirm_callback = None
+                    cs.app_proxy._chain_ask_user_callback = None
+                    cs.app_proxy._chain_event_callback = None
+
+                # 发送 chain_call_end 事件
+                yield _sse({
+                    "type": "chain_call_end",
+                    "agent_name": _target_agent,
+                    "success": result.success,
+                })
+            else:
+                try:
+                    result = await asyncio.to_thread(
+                        cs.tool_registry.execute, tool_name, **tool_args)
+                except Exception as e:
+                    result = ToolResult(success=False, output="", error=str(e))
             result.duration_ms = int((_time.monotonic() - _t0) * 1000)
 
             # ---- Web 端：python 工具执行后检测新生成的图片文件 ----
@@ -2520,14 +2983,26 @@ def chat_status(agent_name: str, model_name: str):
     key = _get_session_key(agent_name, model_name)
     cs = _chat_sessions.get(key)
     if not cs:
-        return {
+        # 会话不存在（页面刷新后），也从 GlobalConfig 返回持久化的链条状态
+        result = {
             "active": False, "message_count": 0, "token_estimate": 0,
             "ctx_percentage": 0.0, "model_limit": 0, "remaining_tokens": 0,
             "tool_call_count": 0, "cwd": os.getcwd(),
         }
+        try:
+            saved_chain = get_config().get_active_chain(agent_name)
+            result["active_chain"] = saved_chain or None
+        except Exception:
+            result["active_chain"] = None
+        return result
     stats = cs.usage_stats()
     stats.update({"active": True, "cwd": os.getcwd(),
                   "busy": bool(cs.lock and cs.lock.locked())})
+    # 链条激活状态（前端据此更新按钮）
+    if cs.active_chain:
+        stats["active_chain"] = cs.active_chain.name
+    else:
+        stats["active_chain"] = None
     return stats
 
 

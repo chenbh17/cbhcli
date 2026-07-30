@@ -81,6 +81,12 @@ class ToolExecutor:
         self.checkpoint_manager = None  # CheckpointManager
         self.tracer = None              # Tracer
         self.session_id: str = ""       # 当前会话 ID（hooks payload 用）
+        # 自定义确认回调（Web 端链条下游 Agent 用）：
+        # 签名 (tool_name, arguments) -> bool，设置后替代 CLI 交互确认
+        self._confirm_callback: Optional[Callable] = None
+        # 自定义 ask_user 回调（Web 端链条下游 Agent 用）：
+        # 签名 (question, options, allow_multiple) -> str，设置后替代 CLI 交互
+        self._ask_user_callback: Optional[Callable] = None
 
     def set_verbose(self, verbose: bool):
         """设置详细输出模式"""
@@ -100,14 +106,22 @@ class ToolExecutor:
         Returns:
             ToolResult: 执行结果
         """
+        # Web 端链条下游 Agent 的 ask_user 通过回调路由到 Web UI（SSE）
+        if tool_name == "ask_user" and self._ask_user_callback is not None:
+            answer = self._ask_user_callback(
+                arguments.get("question", ""),
+                arguments.get("options", []),
+                arguments.get("allow_multiple", False),
+            )
+            return ToolResult(success=True, output=f"用户回答: {answer}")
         return self.tool_registry.execute(tool_name, **arguments)
 
     # 自带显示的工具（跳过 executor 的头部和结果显示）
-    _SELF_DISPLAY_TOOLS = {"Todo"}
+    _SELF_DISPLAY_TOOLS = {"Todo", "call_agent"}
 
     # 执行期间有自身实时输出/交互的工具（不显示 spinner 动画，避免输出打架）
     _NO_SPIN_TOOLS = {"ask_user", "process", "delegate_task", "image",
-                      "skills_create"}
+                      "skills_create", "call_agent"}
 
     def execute_with_display(
         self,
@@ -705,12 +719,17 @@ class ToolExecutor:
           all    本会话内不再确认（deny 红线除外）
           always 本次放行，并提炼一条 allow 规则永久生效（写入 permissions.json）
         """
-        if self.no_more_confirmations:
-            return True
-
         # 只读/交互工具跳过确认
         if tool_name in ("grep", "glob", "ask_user", "read", "Todo",
-                         "memory_search", "knowledge_base"):
+                         "memory_search", "knowledge_base", "call_agent"):
+            return True
+
+        # 自定义确认回调优先（Web 端链条下游 Agent 确认走 SSE 流程，
+        # 回调内部自行处理 all 逻辑，因此先于 no_more_confirmations 检查）
+        if self._confirm_callback is not None:
+            return self._confirm_callback(tool_name, arguments)
+
+        if self.no_more_confirmations:
             return True
 
         from cbhcli_pkg.core.prompt_utils import ask_text_or_none
