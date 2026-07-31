@@ -63,6 +63,96 @@ def _fix_unicode_escapes(obj):
         return obj
 
 
+def repair_tool_messages(messages: list) -> list:
+    """修复 tool_calls 消息序列不完整问题（DeepSeek 等 API 严格要求）。
+
+    触发 400 错误 "An assistant message with 'tool_calls' must be followed by
+    tool messages responding to each 'tool_call_id'" 的典型场景：
+    1. assistant(tool_calls) 后缺少对应 tool 消息
+       （工具执行被 Ctrl+C / abort / 异常中断，仅记录了 assistant 消息）
+    2. user 消息（如 image 工具直发的带图消息）插在 tool 消息之间
+       （多个 tool_call 且其中某个返回图片时，图片 user 消息插队）
+
+    修复策略：
+    - 扫描每个带 tool_calls 的 assistant，收集其后连续的工具区
+      （tool 消息 + 其间插入的 user 消息）
+    - 缺失的 tool_call_id 补占位 tool 消息（内容提示模型结果缺失）
+    - 插队的 user 消息（位于最后一个 tool 消息之前）移到工具组之后
+
+    Args:
+        messages: Session.get_context_messages() 输出的 dict 列表
+
+    Returns:
+        修复后的新列表（不修改原列表 / 会话内部状态）
+    """
+    result = []
+    i, n = 0, len(messages)
+    while i < n:
+        msg = messages[i]
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            result.append(msg)
+            i += 1
+            continue
+
+        tc_ids = {tc.get("id") for tc in msg["tool_calls"] if tc.get("id")}
+
+        # 扫描工具区：连续的 tool 消息 + 其间插入的 user 消息
+        j = i + 1
+        region = []
+        while j < n:
+            m = messages[j]
+            r = m.get("role")
+            if r == "tool" and m.get("tool_call_id") in tc_ids:
+                region.append(m)
+                j += 1
+            elif r == "user":
+                region.append(m)  # 可能是插队消息，稍后判定
+                j += 1
+            else:
+                break
+
+        result.append(msg)
+
+        # 工具区内的 tool 消息（保持原顺序）
+        group_tools = [m for m in region if m.get("role") == "tool"]
+        users = [m for m in region if m.get("role") == "user"]
+
+        result.extend(group_tools)
+
+        # 补全缺失的 tool 消息（工具被中断/异常时只记录了 assistant 消息）
+        seen = {m.get("tool_call_id") for m in group_tools}
+        for tid in tc_ids:
+            if tid not in seen:
+                result.append({
+                    "role": "tool",
+                    "tool_call_id": tid,
+                    "content": "[系统补全] 该工具调用的结果缺失（可能因中断或异常未执行），"
+                               "请根据已有上下文继续任务，不要重复调用。",
+                })
+
+        # 插队 user（位于最后一个 tool 消息之前）移到工具组之后；
+        # 工具组之后的 user 是正常新轮次，保持原顺序
+        if group_tools:
+            last_tool_idx = max(
+                idx for idx, m in enumerate(region) if m.get("role") == "tool")
+            interleaved = [
+                m for idx, m in enumerate(region)
+                if m.get("role") == "user" and idx < last_tool_idx
+            ]
+            trailing = [
+                m for idx, m in enumerate(region)
+                if m.get("role") == "user" and idx >= last_tool_idx
+            ]
+            result.extend(interleaved)
+            result.extend(trailing)
+        else:
+            # 没有任何 tool 消息（全部缺失已补占位）：user 均为正常轮次
+            result.extend(users)
+
+        i = j
+    return result
+
+
 class AIHandler:
     """处理AI请求和响应
 
@@ -163,6 +253,9 @@ class AIHandler:
             self._check_and_compress_in_react(round_idx)
 
             messages = self.session.get_context_messages()
+            # 防御性修复：补全缺失 tool 消息 / 移动插队的 user 消息
+            # （DeepSeek 等 API 严格要求 assistant(tool_calls) 后紧跟全部 tool 消息）
+            messages = repair_tool_messages(messages)
 
             ai_response, reasoning_tokens, reasoning_content, tool_calls = self._get_ai_response(
                 messages, round_idx
@@ -536,115 +629,142 @@ class AIHandler:
         self.session.messages.append(assistant_msg)
 
         # 逐个执行（每个 tool_call 必须产生对应的 tool 消息，否则 API 会报错）
-        for tc in valid_calls:
-            # ---- 死循环检测（同参数重复 / 周期震荡）----
-            verdict, loop_msg = "ok", None
-            if getattr(self, "_loop_tracker", None) is not None:
-                verdict, loop_msg = self._loop_tracker.check(
-                    tc["tool"], tc["arguments"])
+        # 图片 user 消息延迟到所有 tool 消息之后统一追加，避免插在 tool 消息之间
+        # 导致 DeepSeek 等 API 报 "insufficient tool messages following tool_calls"
+        pending_image_msgs: list = []
+        try:
+            for tc in valid_calls:
+                # ---- 死循环检测（同参数重复 / 周期震荡）----
+                verdict, loop_msg = "ok", None
+                if getattr(self, "_loop_tracker", None) is not None:
+                    verdict, loop_msg = self._loop_tracker.check(
+                        tc["tool"], tc["arguments"])
 
-            if verdict == "abort":
-                self._loop_aborted = True
-                if self.tool_executor.tracer:
-                    self.tool_executor.tracer.log_loop("abort", tc["tool"])
-                result = ToolResult(
-                    success=False,
-                    output="🛑 [系统熔断] 多次陷入死循环，本轮任务已终止。",
-                    error="loop abort")
-                output = result.output
-            elif verdict == "block":
-                print(f"\n{self._c_dim}🛑 死循环熔断: 已阻止重复调用 "
-                      f"{tc['tool']}（同参数第4+次），已告知模型换策略{C_RESET}")
-                if self.tool_executor.tracer:
-                    self.tool_executor.tracer.log_loop("block", tc["tool"])
-                result = ToolResult(success=False, output=loop_msg,
-                                    error="loop blocked")
-                output = loop_msg
-            else:
-                if verdict == "warn":
-                    print(f"\n{self._c_dim}⚠️ 检测到疑似死循环（{tc['tool']} "
-                          f"重复调用），已在结果中提醒模型{C_RESET}")
+                if verdict == "abort":
+                    self._loop_aborted = True
                     if self.tool_executor.tracer:
-                        self.tool_executor.tracer.log_loop("warn", tc["tool"])
-                try:
-                    # 链条事件回调：工具调用开始
-                    self._emit_chain_event("tool_call", tool_name=tc["tool"],
-                                           arguments=tc["arguments"])
-                    result = self.tool_executor.execute_with_display(
-                        tc["tool"],
-                        tc["arguments"],
-                        tc["id"]
-                    )
-                    # 链条事件回调：工具执行结果
-                    self._emit_chain_event(
-                        "tool_result", tool_name=tc["tool"],
-                        success=result.success,
-                        output=(result.output or "")[:500],
-                        error=result.error or "")
+                        self.tool_executor.tracer.log_loop("abort", tc["tool"])
+                    result = ToolResult(
+                        success=False,
+                        output="🛑 [系统熔断] 多次陷入死循环，本轮任务已终止。",
+                        error="loop abort")
+                    output = result.output
+                elif verdict == "block":
+                    print(f"\n{self._c_dim}🛑 死循环熔断: 已阻止重复调用 "
+                          f"{tc['tool']}（同参数第4+次），已告知模型换策略{C_RESET}")
+                    if self.tool_executor.tracer:
+                        self.tool_executor.tracer.log_loop("block", tc["tool"])
+                    result = ToolResult(success=False, output=loop_msg,
+                                        error="loop blocked")
+                    output = loop_msg
+                else:
+                    if verdict == "warn":
+                        print(f"\n{self._c_dim}⚠️ 检测到疑似死循环（{tc['tool']} "
+                              f"重复调用），已在结果中提醒模型{C_RESET}")
+                        if self.tool_executor.tracer:
+                            self.tool_executor.tracer.log_loop("warn", tc["tool"])
+                    try:
+                        # 链条事件回调：工具调用开始
+                        self._emit_chain_event("tool_call", tool_name=tc["tool"],
+                                               arguments=tc["arguments"])
+                        result = self.tool_executor.execute_with_display(
+                            tc["tool"],
+                            tc["arguments"],
+                            tc["id"]
+                        )
+                        # 链条事件回调：工具执行结果
+                        self._emit_chain_event(
+                            "tool_result", tool_name=tc["tool"],
+                            success=result.success,
+                            output=(result.output or "")[:500],
+                            error=result.error or "")
 
-                    if result.success:
-                        output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
-                    else:
-                        # 失败时：优先使用 output（包含完整 traceback），其次用 error
-                        if result.output:
+                        if result.success:
                             output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
                         else:
-                            output = f"错误: {result.error}"
-                except Exception as e:
-                    # 兜底：确保即使 execute_with_display 异常也能产生 tool 消息
-                    output = f"工具执行异常: {str(e)}"
-                    result = ToolResult(success=False, output=output, error=str(e))
+                            # 失败时：优先使用 output（包含完整 traceback），其次用 error
+                            if result.output:
+                                output = result.output[:MAX_TOOL_OUTPUT_LENGTH]
+                            else:
+                                output = f"错误: {result.error}"
+                    except Exception as e:
+                        # 兜底：确保即使 execute_with_display 异常也能产生 tool 消息
+                        output = f"工具执行异常: {str(e)}"
+                        result = ToolResult(success=False, output=output, error=str(e))
 
-                # 软警告附加到工具结果尾部（模型最重视的信息通道）
-                if verdict == "warn" and loop_msg:
-                    output = f"{output}\n\n{loop_msg}"
+                    # 软警告附加到工具结果尾部（模型最重视的信息通道）
+                    if verdict == "warn" and loop_msg:
+                        output = f"{output}\n\n{loop_msg}"
 
-            # 工具失败时：将反思提示附着在 tool 输出中（而非注入 system 消息）
-            # 保持标准 OAI 消息序列不变，有利于 LLM 前缀缓存命中
-            # （死循环熔断的失败不进入反思重试，避免雪上加霜）
-            if not result.success and verdict == "ok":
-                fail_key = tc["tool"]
-                self._failure_counts[fail_key] = self._failure_counts.get(fail_key, 0) + 1
-                if self._failure_counts[fail_key] <= MAX_REFLECTION_RETRIES:
-                    retry_count = self._failure_counts[fail_key]
-                    remaining = MAX_REFLECTION_RETRIES - retry_count
-                    print(f"\n{self._c_hint}🔁 {tc['tool']} 执行失败，正在自我反思 (重试 {retry_count}/{MAX_REFLECTION_RETRIES})...{C_RESET}")
-                    reflection_hint = (
-                        f"[反思提示] 上一个工具调用失败，请分析原因并重试。\n"
-                        f"失败工具: {tc['tool']}\n"
-                        f"参数: {json.dumps(tc['arguments'], ensure_ascii=False)}\n"
-                        f"剩余重试: {remaining}/{MAX_REFLECTION_RETRIES}\n\n"
-                        f"--- 原始输出 ---\n{output}"
-                    )
-                    output = reflection_hint
+                # 工具失败时：将反思提示附着在 tool 输出中（而非注入 system 消息）
+                # 保持标准 OAI 消息序列不变，有利于 LLM 前缀缓存命中
+                # （死循环熔断的失败不进入反思重试，避免雪上加霜）
+                if not result.success and verdict == "ok":
+                    fail_key = tc["tool"]
+                    self._failure_counts[fail_key] = self._failure_counts.get(fail_key, 0) + 1
+                    if self._failure_counts[fail_key] <= MAX_REFLECTION_RETRIES:
+                        retry_count = self._failure_counts[fail_key]
+                        remaining = MAX_REFLECTION_RETRIES - retry_count
+                        print(f"\n{self._c_hint}🔁 {tc['tool']} 执行失败，正在自我反思 (重试 {retry_count}/{MAX_REFLECTION_RETRIES})...{C_RESET}")
+                        reflection_hint = (
+                            f"[反思提示] 上一个工具调用失败，请分析原因并重试。\n"
+                            f"失败工具: {tc['tool']}\n"
+                            f"参数: {json.dumps(tc['arguments'], ensure_ascii=False)}\n"
+                            f"剩余重试: {remaining}/{MAX_REFLECTION_RETRIES}\n\n"
+                            f"--- 原始输出 ---\n{output}"
+                        )
+                        output = reflection_hint
+                    else:
+                        print(f"\n{self._c_hint}❌ {tc['tool']} 已达最大重试次数 ({MAX_REFLECTION_RETRIES})，放弃重试{C_RESET}")
                 else:
-                    print(f"\n{self._c_hint}❌ {tc['tool']} 已达最大重试次数 ({MAX_REFLECTION_RETRIES})，放弃重试{C_RESET}")
-            else:
-                self._failure_counts.pop(tc["tool"], None)
+                    self._failure_counts.pop(tc["tool"], None)
 
-            tool_msg = Message(
-                role="tool",
-                content=output,
-                token_count=self.token_counter.count_tokens(output),
-                tool_call_id=tc["id"]
-            )
-            tool_msg.metadata = {"tool_name": tc["tool"], "success": getattr(result, 'success', False)}
-            self.session.messages.append(tool_msg)
-
-            # 工具结果携带图片（image 工具直发模式）：追加带图用户消息，
-            # 使支持视觉的主模型直接在当前会话中查看图片（共享上下文）
-            if result.success and getattr(result, "images", None):
-                vision_prompt = (result.metadata or {}).get("vision_prompt", "")
-                note = f"[image 工具传入 {len(result.images)} 张图片]"
-                if vision_prompt:
-                    note += f" 识别需求: {vision_prompt}"
-                img_msg = Message(
-                    role="user",
-                    content=note,
-                    token_count=self.token_counter.count_tokens(note),
-                    images=result.images
+                tool_msg = Message(
+                    role="tool",
+                    content=output,
+                    token_count=self.token_counter.count_tokens(output),
+                    tool_call_id=tc["id"]
                 )
-                self.session.messages.append(img_msg)
+                tool_msg.metadata = {"tool_name": tc["tool"], "success": getattr(result, 'success', False)}
+                self.session.messages.append(tool_msg)
+
+                # 工具结果携带图片（image 工具直发模式）：延迟到所有 tool 消息之后
+                # 统一追加带图用户消息，使支持视觉的主模型直接在当前会话中查看图片
+                if result.success and getattr(result, "images", None):
+                    vision_prompt = (result.metadata or {}).get("vision_prompt", "")
+                    note = f"[image 工具传入 {len(result.images)} 张图片]"
+                    if vision_prompt:
+                        note += f" 识别需求: {vision_prompt}"
+                    img_msg = Message(
+                        role="user",
+                        content=note,
+                        token_count=self.token_counter.count_tokens(note),
+                        images=result.images
+                    )
+                    pending_image_msgs.append(img_msg)
+        except KeyboardInterrupt:
+            # 用户在工具执行时 Ctrl+C 中断：补全未执行的 tool 消息，
+            # 保持 OAI 消息序列完整（assistant(tool_calls) 后必须有全部 tool 消息）
+            executed_ids = {
+                m.tool_call_id for m in self.session.messages if m.role == "tool"
+            }
+            for tc in valid_calls:
+                if tc["id"] in executed_ids:
+                    continue
+                tool_msg = Message(
+                    role="tool",
+                    content="[系统补全] 工具执行被用户中断，未产生结果。请根据上下文继续任务。",
+                    token_count=self.token_counter.count_tokens(
+                        "[系统补全] 工具执行被用户中断，未产生结果。请根据上下文继续任务。"),
+                    tool_call_id=tc["id"]
+                )
+                tool_msg.metadata = {"tool_name": tc["tool"], "success": False}
+                self.session.messages.append(tool_msg)
+            raise
+
+        # 所有 tool 消息添加完成后，统一追加图片 user 消息（避免插队破坏序列）
+        for img_msg in pending_image_msgs:
+            self.session.messages.append(img_msg)
 
     def _resolve_tool_name(self, name: str) -> Optional[str]:
         """模糊匹配工具名，返回注册名或 None"""

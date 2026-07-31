@@ -2720,10 +2720,25 @@ function showModelForm(m) {
   thinkingSel.append(el("option", { value: "true" }, "开启 (true)"));
   thinkingSel.append(el("option", { value: "false" }, "关闭 (false)"));
   thinkingSel.value = m.thinking === undefined || m.thinking === null ? "" : String(m.thinking);
-  const reasoningInput = el("input", {
-    class: "input",
-    value: m.reasoning_effort || "", placeholder: "low / medium / high",
-  });
+  const reasoningSel = el("select", { class: "select" });
+  reasoningSel.append(el("option", { value: "" }, "（不传）"));
+  reasoningSel.append(el("option", { value: "low" }, "low"));
+  reasoningSel.append(el("option", { value: "medium" }, "medium"));
+  reasoningSel.append(el("option", { value: "high" }, "high"));
+  reasoningSel.append(el("option", { value: "max" }, "max"));
+  reasoningSel.value = m.reasoning_effort || "";
+  const reasoningHint = el("div", { class: "form-hint" },
+    "留空不传；推理强度 low / medium / high / max");
+  // thinking=off 时不能配置 reasoning_effort（DeepSeek 等 API 报 400）
+  const syncReasoningState = () => {
+    const off = thinkingSel.value === "false";
+    reasoningSel.disabled = off;
+    reasoningHint.textContent = off
+      ? "⚠️ thinking 已关闭(off)，不能配置 reasoning_effort（API 会报 400）"
+      : "留空不传；推理强度 low / medium / high / max";
+  };
+  thinkingSel.addEventListener("change", syncReasoningState);
+  syncReasoningState();
 
   openModal({
     title: isEdit ? `编辑模型 — ${m.name}` : "添加模型",
@@ -2744,8 +2759,7 @@ function showModelForm(m) {
           thinkingSel,
           el("div", { class: "form-hint" }, "留空不传；开启/关闭思考模式（如 DeepSeek）")),
         el("div", { class: "form-row" }, el("label", null, "reasoning_effort"),
-          reasoningInput,
-          el("div", { class: "form-hint" }, "留空不传；推理强度 low / medium / high")),
+          reasoningSel, reasoningHint),
         el("div", { class: "form-row" }, el("label", null, " "),
           el("label", { class: "checkbox-row" }, visionChk, " 支持视觉（图片识别）"))),
     footer: [
@@ -2776,9 +2790,13 @@ function showModelForm(m) {
           if (thinkingSel.value !== "") {
             payload.thinking = thinkingSel.value === "true";
           }
-          const reasoningVal = reasoningInput.value.trim();
+          const reasoningVal = reasoningSel.value;
           if (reasoningVal !== "") {
-            if (reasoningVal.toLowerCase() === "none") { toast("reasoning_effort 留空即可不传，无需填 none", "warn"); return; }
+            // thinking=off 时不能配置 reasoning_effort（DeepSeek 等 API 报 400）
+            if (payload.thinking === false) {
+              toast("thinking 已关闭(off)，不能配置 reasoning_effort（API 会报 400）", "warn");
+              return;
+            }
             payload.reasoning_effort = reasoningVal;
           }
           if (!payload.name || !payload.apiKey || !payload.url || !payload.model) {

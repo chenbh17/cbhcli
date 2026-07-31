@@ -131,13 +131,21 @@ def _add_model(app):
         else:
             return "❌ thinking 参数只能是 on/off 或 true/false"
 
-    reasoning_effort_str = ask_text("reasoning_effort 参数 (如 low/medium/high，留空不传): ").strip()
+    # reasoning_effort 参数：thinking=off 时不能配置（DeepSeek 等 API 报 400）
     reasoning_effort = None
-    if reasoning_effort_str:
+    while True:
+        reasoning_effort_str = ask_text("reasoning_effort 参数 (如 low/medium/high/max，留空不传): ").strip()
+        if not reasoning_effort_str:
+            break
         if reasoning_effort_str.lower() == 'none':
             reasoning_effort = None
-        else:
-            reasoning_effort = reasoning_effort_str
+            break
+        if thinking is False:
+            print("⚠️ thinking 已关闭(off)，此时不能配置 reasoning_effort（API 会返回 400 错误）")
+            print("   请重新输入：留空不传 / 输入 none 清除；如需 reasoning_effort 请将 thinking 改为 on 后重试")
+            continue
+        reasoning_effort = reasoning_effort_str
+        break
 
     model_config = {
         "name": name,
@@ -466,19 +474,31 @@ def _config_model(app, param):
             model_config['thinking'] = True
         elif thinking_str in ('off', 'false', '0', 'no', 'n'):
             model_config['thinking'] = False
+            # thinking 关闭时不能配置 reasoning_effort（DeepSeek 等 API 报 400）
+            if model_config.get('reasoning_effort'):
+                print("⚠️ thinking 已关闭(off)，不能同时配置 reasoning_effort（API 会返回 400 错误）")
+                model_config.pop('reasoning_effort', None)
+                print("  -> 已自动清除 reasoning_effort")
         else:
             return "❌ thinking 参数只能是 on/off 或 true/false（输入 none 可清除）"
 
-    # reasoning_effort 参数
+    # reasoning_effort 参数：thinking=off 时不能配置（DeepSeek 等 API 报 400）
     current_reasoning_effort = model_config.get('reasoning_effort')
     reasoning_display = str(current_reasoning_effort) if current_reasoning_effort is not None else "不传该参数"
-    reasoning_str = ask_text(f"reasoning_effort 参数 (当前: {reasoning_display}, 如 low/medium/high, 输入 none 清除): ").strip()
-    if reasoning_str:
+    while True:
+        reasoning_str = ask_text(f"reasoning_effort 参数 (当前: {reasoning_display}, 如 low/medium/high/max, 输入 none 清除): ").strip()
+        if not reasoning_str:
+            break
         if reasoning_str.lower() in ('none', '-'):
             model_config.pop('reasoning_effort', None)
             print("  -> 已清除，将不传该参数")
-        else:
-            model_config['reasoning_effort'] = reasoning_str
+            break
+        if model_config.get('thinking') is False:
+            print("⚠️ thinking 已关闭(off)，此时不能配置 reasoning_effort（API 会返回 400 错误）")
+            print("   请重新输入：留空不传 / 输入 none 清除；如需 reasoning_effort 请先将 thinking 改为 on")
+            continue
+        model_config['reasoning_effort'] = reasoning_str
+        break
 
     # 保存配置
     # global_config 中 models 是列表，需要找到并替换

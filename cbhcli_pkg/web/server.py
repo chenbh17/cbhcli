@@ -53,6 +53,7 @@ from cbhcli_pkg.core.embedding_client import EmbeddingClient
 from cbhcli_pkg.core.rerank_client import RerankClient
 from cbhcli_pkg.core.subagent import SubAgentScheduler
 from cbhcli_pkg.core.tool_executor import ToolExecutor
+from cbhcli_pkg.core.ai_handler import repair_tool_messages
 from cbhcli_pkg.core.permissions import (
     PermissionEngine, MODE_META, MODES, build_mode_note,
     ALLOW as PERM_ALLOW, ASK as PERM_ASK, DENY as PERM_DENY,
@@ -95,7 +96,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.1.3")
+app = FastAPI(title="CBHCLI Web", version="5.1.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1005,6 +1006,11 @@ def add_model(model: ModelConfig):
     config = get_config()
     if config.get_model(model.name):
         raise HTTPException(400, f"模型 '{model.name}' 已存在")
+    # thinking=off 时不能配置 reasoning_effort（DeepSeek 等 API 报 400）
+    if model.thinking is False and model.reasoning_effort:
+        raise HTTPException(
+            400, "thinking=off 时不能配置 reasoning_effort（API 会返回 400 错误），"
+                 "请清除 reasoning_effort 或开启 thinking")
     config.add_model(model.to_config_dict())
     return {"message": f"模型 '{model.name}' 已添加"}
 
@@ -1047,6 +1053,11 @@ def update_model(model_name: str, model: ModelConfig):
     models = config.get_models()
     for i, m in enumerate(models):
         if m.get("name") == model_name:
+            # thinking=off 时不能配置 reasoning_effort（DeepSeek 等 API 报 400）
+            if model.thinking is False and model.reasoning_effort:
+                raise HTTPException(
+                    400, "thinking=off 时不能配置 reasoning_effort（API 会返回 400 错误），"
+                         "请清除 reasoning_effort 或开启 thinking")
             models[i] = model.to_config_dict()
             config.save()
             return {"message": f"模型 '{model_name}' 已更新"}
@@ -2115,6 +2126,26 @@ async def _stream_round(cs: WebChatSession, messages: list, stream_kwargs: dict,
             return
 
 
+def _fill_aborted_tool_msgs(cs: WebChatSession, valid_calls: list):
+    """abort 中断时为未执行的 tool_call 补 tool 消息，保持 OAI 消息序列完整。
+
+    assistant(tool_calls) 消息已记录但工具未全部执行时，
+    若不补全 tool 消息，下一次请求会报 400：
+    "An assistant message with 'tool_calls' must be followed by tool messages..."
+    """
+    executed_ids = {
+        m.tool_call_id for m in cs.session.messages if m.role == "tool"
+    }
+    for tc in valid_calls:
+        if tc["id"] in executed_ids:
+            continue
+        cs.session.add_message(
+            "tool",
+            "[系统补全] 工具执行被用户中断，未产生结果。请根据上下文继续任务。",
+            metadata={"tool_name": tc["tool"], "success": False},
+            tool_call_id=tc["id"])
+
+
 async def _react_loop(cs: WebChatSession):
     """完整 ReAct 循环（与 CLI ai_handler 对齐），产生 SSE 事件。"""
     failure_counts: dict[str, int] = {}
@@ -2156,6 +2187,9 @@ async def _react_loop(cs: WebChatSession):
                     yield _sse({"type": "compress_failed", "content": "压缩失败，继续执行"})
 
         messages = cs.session.get_context_messages()
+        # 防御性修复：补全缺失 tool 消息 / 移动插队的 user 消息
+        # （DeepSeek 等 API 严格要求 assistant(tool_calls) 后紧跟全部 tool 消息）
+        messages = repair_tool_messages(messages)
 
         # ---- 流式请求一轮 ----
         result: dict = {}
@@ -2250,8 +2284,11 @@ async def _react_loop(cs: WebChatSession):
             tool_calls=openai_tool_calls)
 
         # ---- 逐个执行工具 ----
+        pending_image_msgs = []  # 图片 user 消息延迟到所有 tool 消息之后统一追加
         for tc in valid_calls:
             if cs.abort:
+                # 补全未执行的 tool 消息，保持消息序列完整
+                _fill_aborted_tool_msgs(cs, valid_calls)
                 yield _sse({"type": "aborted"})
                 return
 
@@ -2271,6 +2308,8 @@ async def _react_loop(cs: WebChatSession):
                 answer = await cs.wait_response(timeout=600)
                 if answer is None:
                     if cs.abort:
+                        # 补全未执行的 tool 消息，保持消息序列完整
+                        _fill_aborted_tool_msgs(cs, valid_calls)
                         yield _sse({"type": "aborted"})
                         return
                     answer = "用户未回答"
@@ -2798,14 +2837,18 @@ async def _react_loop(cs: WebChatSession):
                 "tool", tool_output, tool_call_id=tool_id,
                 metadata={"tool_name": tool_name, "success": result.success})
 
-            # 工具结果携带图片（image 工具直发模式）：追加带图用户消息，
-            # 使支持视觉的主模型直接在当前会话中查看图片（与 CLI 一致）
+            # 工具结果携带图片（image 工具直发模式）：延迟到所有 tool 消息之后
+            # 统一追加带图用户消息（避免插在 tool 消息之间导致 API 报错）
             if result.success and getattr(result, "images", None):
                 vision_prompt = (result.metadata or {}).get("vision_prompt", "")
                 note = f"[image 工具传入 {len(result.images)} 张图片]"
                 if vision_prompt:
                     note += f" 识别需求: {vision_prompt}"
-                cs.session.add_message("user", note, images=result.images)
+                pending_image_msgs.append((note, result.images))
+
+        # ---- 所有工具执行完毕：统一追加图片 user 消息（避免插队破坏消息序列）----
+        for note, images in pending_image_msgs:
+            cs.session.add_message("user", note, images=images)
 
         # ---- 死循环熔断：终止本轮任务 ----
         if loop_aborted:

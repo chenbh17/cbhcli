@@ -308,14 +308,18 @@ class ToolExecutor:
                         with open(path, 'r', encoding='utf-8') as f:
                             content = f.read()
 
-                        # 找到 old_str 的位置
-                        pos = content.find(old_str)
-                        if pos != -1:
+                        # 统一查找（精确/空白宽容/Unicode转义宽容），
+                        # 宽容匹配时 old_str 可能与文件实际内容不同，
+                        # 用文件实际匹配的文本渲染预览
+                        from cbhcli_pkg.tools.file_edit import find_edit_matches
+                        spans, matched_text = find_edit_matches(content, old_str)
+                        if spans:
+                            pos = spans[0][0]
                             # 计算行号
                             prefix = content[:pos]
                             start_line = prefix.count('\n') + 1
 
-                            old_lines = old_str.split('\n')
+                            old_lines = matched_text.split('\n')
                             new_lines = new_str.split('\n')
 
                             # 移除末尾空行（避免显示为空绿行）

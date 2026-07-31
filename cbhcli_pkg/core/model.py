@@ -35,6 +35,9 @@ class LLMClient:
         self.thinking = model_config.get("thinking")
         
         # 推理强度参数（可选，None 则不传给 API，如 low/medium/high）
+        # 注意：DeepSeek 等 API 在 thinking=disabled 时不允许传 reasoning_effort
+        # （400: thinking options type cannot be disabled when reasoning_effort...），
+        # 发送时由 _get_extra_payload 统一处理
         self.reasoning_effort = model_config.get("reasoning_effort")
         
         # 是否支持思考模式（动态检测：一旦模型返回 reasoning_content 就自动标记）
@@ -113,12 +116,36 @@ class LLMClient:
             return self.model_temperature
         return temperature
 
+    @staticmethod
+    def _normalize_thinking(value):
+        """将 thinking 配置规范化为 API 期望的 ThinkingOptions 结构体
+
+        DeepSeek 等 API 期望 {"type": "enabled"} / {"type": "disabled"} 结构体，
+        不接受布尔值（否则 400: thinking: invalid type: boolean ...）。
+        """
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, bool):
+            return {"type": "enabled" if value else "disabled"}
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("true", "on", "1", "yes", "y", "enabled"):
+                return {"type": "enabled"}
+            if v in ("false", "off", "0", "no", "n", "disabled"):
+                return {"type": "disabled"}
+        return value  # 无法识别的值原样传（保险，不拦截）
+
     def _get_extra_payload(self) -> dict:
-        """获取思考相关参数（None 不传给 API）"""
+        """获取思考相关参数（None 不传给 API）
+
+        - thinking: 规范化为 {"type": "enabled"/"disabled"} 结构体
+        - thinking=False 时忽略 reasoning_effort（DeepSeek 等 API
+          不允许 thinking disabled 时携带 reasoning_effort，会报 400）
+        """
         extra = {}
         if self.thinking is not None:
-            extra["thinking"] = self.thinking
-        if self.reasoning_effort is not None:
+            extra["thinking"] = self._normalize_thinking(self.thinking)
+        if self.reasoning_effort is not None and self.thinking is not False:
             extra["reasoning_effort"] = self.reasoning_effort
         return extra
 
