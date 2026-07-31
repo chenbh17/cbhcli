@@ -2574,7 +2574,11 @@ async function loadModelsView() {
           el("div", { class: "card-title" },
             m.name,
             isSel ? el("span", { class: "tag green" }, "使用中") : null,
-            m.vision ? el("span", { class: "tag purple" }, "视觉") : null),
+            m.vision ? el("span", { class: "tag purple" }, "视觉") : null,
+            m.thinking !== undefined && m.thinking !== null
+              ? el("span", { class: "tag" }, `thinking:${m.thinking}`) : null,
+            m.reasoning_effort
+              ? el("span", { class: "tag" }, `effort:${m.reasoning_effort}`) : null),
           el("div", { class: "card-sub" }, `${m.model} · ${m.url} · 上下文 ${fmtNum(m.context_limit)}`)),
         el("div", { class: "card-actions" },
           el("button", { class: "btn btn-sm", onclick: () => showModelForm(m) }, "编辑"),
@@ -2711,6 +2715,15 @@ function showModelForm(m) {
     class: "input", type: "number", min: "1",
     value: m.max_tokens ?? "", placeholder: "留空用API默认值",
   });
+  const thinkingSel = el("select", { class: "select" });
+  thinkingSel.append(el("option", { value: "" }, "（不传）"));
+  thinkingSel.append(el("option", { value: "true" }, "开启 (true)"));
+  thinkingSel.append(el("option", { value: "false" }, "关闭 (false)"));
+  thinkingSel.value = m.thinking === undefined || m.thinking === null ? "" : String(m.thinking);
+  const reasoningInput = el("input", {
+    class: "input",
+    value: m.reasoning_effort || "", placeholder: "low / medium / high",
+  });
 
   openModal({
     title: isEdit ? `编辑模型 — ${m.name}` : "添加模型",
@@ -2727,6 +2740,12 @@ function showModelForm(m) {
         el("div", { class: "form-row" }, el("label", null, "max_tokens"),
           maxTokensInput,
           el("div", { class: "form-hint" }, "留空用API默认值；思考模型建议设置（如 8192）")),
+        el("div", { class: "form-row" }, el("label", null, "thinking"),
+          thinkingSel,
+          el("div", { class: "form-hint" }, "留空不传；开启/关闭思考模式（如 DeepSeek）")),
+        el("div", { class: "form-row" }, el("label", null, "reasoning_effort"),
+          reasoningInput,
+          el("div", { class: "form-hint" }, "留空不传；推理强度 low / medium / high")),
         el("div", { class: "form-row" }, el("label", null, " "),
           el("label", { class: "checkbox-row" }, visionChk, " 支持视觉（图片识别）"))),
     footer: [
@@ -2753,6 +2772,14 @@ function showModelForm(m) {
             const mt = parseInt(maxTokensVal);
             if (isNaN(mt) || mt <= 0) { toast("max_tokens 需为正整数", "warn"); return; }
             payload.max_tokens = mt;
+          }
+          if (thinkingSel.value !== "") {
+            payload.thinking = thinkingSel.value === "true";
+          }
+          const reasoningVal = reasoningInput.value.trim();
+          if (reasoningVal !== "") {
+            if (reasoningVal.toLowerCase() === "none") { toast("reasoning_effort 留空即可不传，无需填 none", "warn"); return; }
+            payload.reasoning_effort = reasoningVal;
           }
           if (!payload.name || !payload.apiKey || !payload.url || !payload.model) {
             toast("名称 / Key / URL / 模型 ID 为必填", "warn"); return;

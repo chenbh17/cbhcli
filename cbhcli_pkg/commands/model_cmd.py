@@ -121,6 +121,24 @@ def _add_model(app):
         except ValueError:
             return "❌ max_tokens 必须是数字"
 
+    thinking_str = ask_text("thinking 参数 (on/off 或 true/false，留空不传): ").strip().lower()
+    thinking = None
+    if thinking_str:
+        if thinking_str in ('on', 'true', '1', 'yes', 'y'):
+            thinking = True
+        elif thinking_str in ('off', 'false', '0', 'no', 'n'):
+            thinking = False
+        else:
+            return "❌ thinking 参数只能是 on/off 或 true/false"
+
+    reasoning_effort_str = ask_text("reasoning_effort 参数 (如 low/medium/high，留空不传): ").strip()
+    reasoning_effort = None
+    if reasoning_effort_str:
+        if reasoning_effort_str.lower() == 'none':
+            reasoning_effort = None
+        else:
+            reasoning_effort = reasoning_effort_str
+
     model_config = {
         "name": name,
         "apiKey": api_key,
@@ -133,12 +151,19 @@ def _add_model(app):
         model_config["temperature"] = temperature
     if max_tokens is not None:
         model_config["max_tokens"] = max_tokens
+    if thinking is not None:
+        model_config["thinking"] = thinking
+    if reasoning_effort is not None:
+        model_config["reasoning_effort"] = reasoning_effort
 
     app.global_config.add_model(model_config)
     temp_info = f"   温度: {temperature}" if temperature is not None else "   温度: 使用全局值(0.1)"
     vision_info = "✅ 支持" if supports_vision else "❌ 不支持"
     max_tokens_info = f"   max_tokens: {max_tokens}" if max_tokens is not None else "   max_tokens: 使用API默认值"
-    return f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens\n{temp_info}\n   视觉: {vision_info}\n{max_tokens_info}"
+    thinking_info = f"   thinking: {thinking}" if thinking is not None else "   thinking: 不传该参数"
+    reasoning_info = f"   reasoning_effort: {reasoning_effort}" if reasoning_effort is not None else "   reasoning_effort: 不传该参数"
+    return (f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens\n"
+            f"{temp_info}\n   视觉: {vision_info}\n{max_tokens_info}\n{thinking_info}\n{reasoning_info}")
 
 
 def _list_models(app):
@@ -169,6 +194,12 @@ def _list_models(app):
         max_tokens = m.get('max_tokens')
         if max_tokens is not None:
             lines.append(f"    max_tokens: {max_tokens}")
+        thinking = m.get('thinking')
+        if thinking is not None:
+            lines.append(f"    thinking: {thinking}")
+        reasoning_effort = m.get('reasoning_effort')
+        if reasoning_effort is not None:
+            lines.append(f"    reasoning_effort: {reasoning_effort}")
         lines.append("")
 
     return "\n".join(lines)
@@ -303,6 +334,16 @@ def _model_info(app):
         lines.append(f"  max_tokens: {max_tokens}")
     else:
         lines.append(f"  max_tokens: 使用API默认值")
+    thinking = app.llm_client.thinking
+    if thinking is not None:
+        lines.append(f"  thinking: {thinking}")
+    else:
+        lines.append(f"  thinking: 不传该参数")
+    reasoning_effort = app.llm_client.reasoning_effort
+    if reasoning_effort is not None:
+        lines.append(f"  reasoning_effort: {reasoning_effort}")
+    else:
+        lines.append(f"  reasoning_effort: 不传该参数")
 
     if app.context_window:
         total = app.session.get_total_tokens() if app.session else 0
@@ -413,6 +454,32 @@ def _config_model(app, param):
             except ValueError:
                 return "❌ max_tokens 必须是数字（输入 none 可清除）"
 
+    # thinking 参数
+    current_thinking = model_config.get('thinking')
+    thinking_display = str(current_thinking) if current_thinking is not None else "不传该参数"
+    thinking_str = ask_text(f"thinking 参数 (当前: {thinking_display}, on/off 或 true/false, 输入 none 清除): ").strip().lower()
+    if thinking_str:
+        if thinking_str in ('none', '-'):
+            model_config.pop('thinking', None)
+            print("  -> 已清除，将不传该参数")
+        elif thinking_str in ('on', 'true', '1', 'yes', 'y'):
+            model_config['thinking'] = True
+        elif thinking_str in ('off', 'false', '0', 'no', 'n'):
+            model_config['thinking'] = False
+        else:
+            return "❌ thinking 参数只能是 on/off 或 true/false（输入 none 可清除）"
+
+    # reasoning_effort 参数
+    current_reasoning_effort = model_config.get('reasoning_effort')
+    reasoning_display = str(current_reasoning_effort) if current_reasoning_effort is not None else "不传该参数"
+    reasoning_str = ask_text(f"reasoning_effort 参数 (当前: {reasoning_display}, 如 low/medium/high, 输入 none 清除): ").strip()
+    if reasoning_str:
+        if reasoning_str.lower() in ('none', '-'):
+            model_config.pop('reasoning_effort', None)
+            print("  -> 已清除，将不传该参数")
+        else:
+            model_config['reasoning_effort'] = reasoning_str
+
     # 保存配置
     # global_config 中 models 是列表，需要找到并替换
     models = app.global_config.get_models()
@@ -437,6 +504,16 @@ def _config_model(app, param):
         lines.append(f"   max_tokens: {max_tokens}")
     else:
         lines.append(f"   max_tokens: 使用API默认值")
+    thinking = model_config.get('thinking')
+    if thinking is not None:
+        lines.append(f"   thinking: {thinking}")
+    else:
+        lines.append(f"   thinking: 不传该参数")
+    reasoning_effort = model_config.get('reasoning_effort')
+    if reasoning_effort is not None:
+        lines.append(f"   reasoning_effort: {reasoning_effort}")
+    else:
+        lines.append(f"   reasoning_effort: 不传该参数")
     
     # 如果当前正在使用这个模型，提示需要重新加载
     if app.llm_client and app.llm_client.model_name == model_config.get('model'):

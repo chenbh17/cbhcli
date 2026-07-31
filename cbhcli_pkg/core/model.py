@@ -29,6 +29,14 @@ class LLMClient:
         # 最大输出 token 数（可选，未设置则不传给 API，使用 API 默认值）
         self.max_tokens = model_config.get("max_tokens")
         
+        # 思考模式参数（可选，None 则不传给 API，如 true/false）
+        # 注意：这里的 thinking 是 API 请求参数（如 DeepSeek thinking: true/false），
+        # 与 supports_reasoning（动态检测的推理模式标记）相互独立
+        self.thinking = model_config.get("thinking")
+        
+        # 推理强度参数（可选，None 则不传给 API，如 low/medium/high）
+        self.reasoning_effort = model_config.get("reasoning_effort")
+        
         # 是否支持思考模式（动态检测：一旦模型返回 reasoning_content 就自动标记）
         self.supports_reasoning = False
         
@@ -105,6 +113,15 @@ class LLMClient:
             return self.model_temperature
         return temperature
 
+    def _get_extra_payload(self) -> dict:
+        """获取思考相关参数（None 不传给 API）"""
+        extra = {}
+        if self.thinking is not None:
+            extra["thinking"] = self.thinking
+        if self.reasoning_effort is not None:
+            extra["reasoning_effort"] = self.reasoning_effort
+        return extra
+
     def chat(self, messages: list[dict], temperature: float = 0.1, **kwargs) -> str:
         """
         非流式聊天完成
@@ -121,6 +138,7 @@ class LLMClient:
             "model": self.model_name,
             "messages": self._clean_messages(messages),
             "temperature": self._get_temperature(temperature),
+            **self._get_extra_payload(),
             **kwargs
         }
         if self.max_tokens:
@@ -169,6 +187,7 @@ class LLMClient:
             "messages": self._clean_messages(messages),
             "temperature": self._get_temperature(temperature),
             "stream": True,
+            **self._get_extra_payload(),
             **kwargs
         }
         if self.max_tokens:

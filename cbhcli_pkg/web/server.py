@@ -68,11 +68,34 @@ from cbhcli_pkg.context.token_counter import get_token_counter
 from cbhcli_pkg.context.compressor import ContextCompressor
 
 
+def _fix_unicode_escapes(obj):
+    """修复 LLM 返回的双斜杠 Unicode 转义序列（与 ai_handler.py 中相同）
+
+    LLM 有时会在 JSON 字符串中返回 \\u2192（双斜杠）而不是 \u2192（单斜杠），
+    导致 json.loads 解析后保留字面字符串 '\\u2192'（6个字符）而非实际箭头 '→'。
+    """
+    if isinstance(obj, dict):
+        return {k: _fix_unicode_escapes(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_fix_unicode_escapes(item) for item in obj]
+    elif isinstance(obj, str):
+        import re
+        pattern = r'\\u([0-9a-fA-F]{4})'
+        def replace_match(match):
+            try:
+                return chr(int(match.group(1), 16))
+            except (ValueError, OverflowError):
+                return match.group(0)
+        return re.sub(pattern, replace_match, obj)
+    else:
+        return obj
+
+
 # ===================================================================
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.1.1")
+app = FastAPI(title="CBHCLI Web", version="5.1.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -737,6 +760,7 @@ class WebChatSession:
                         func = tc.get("function", {})
                         try:
                             args = json.loads(func.get("arguments", "{}"))
+                            args = _fix_unicode_escapes(args)
                         except Exception:
                             args = {}
                         tool_calls.append({
@@ -837,6 +861,8 @@ class ModelConfig(BaseModel):
     vision: bool = False
     temperature: Optional[float] = None  # 模型专属温度（None 使用全局默认）
     max_tokens: Optional[int] = None  # 最大输出token数（None 使用API默认值）
+    thinking: Optional[bool] = None  # 思考模式参数（None 不传给 API）
+    reasoning_effort: Optional[str] = None  # 推理强度（None 不传给 API，如 low/medium/high）
 
     def to_config_dict(self) -> dict:
         """转为存储配置（None 字段不写入，避免覆盖已有配置）。"""
@@ -2052,6 +2078,7 @@ async def _stream_round(cs: WebChatSession, messages: list, stream_kwargs: dict,
                 tc_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
                 try:
                     args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                    args = _fix_unicode_escapes(args)
                 except json.JSONDecodeError:
                     args = {}
                 tool_calls.append({"id": tc_id, "name": tc["name"], "arguments": args})

@@ -1,5 +1,6 @@
 """AI请求处理器 - 纯 OpenAI Function Calling"""
 import json
+import re
 import sys
 import uuid
 from typing import Optional, Callable, TYPE_CHECKING
@@ -22,6 +23,44 @@ if TYPE_CHECKING:
     from cbhcli_pkg.context.token_counter import TokenCounter
     from cbhcli_pkg.context.compressor import ContextCompressor
     from cbhcli_pkg.core.session import ContextWindow
+
+
+def _fix_unicode_escapes(obj):
+    """修复 LLM 返回的双斜杠 Unicode 转义序列
+
+    LLM 有时会在 JSON 字符串中返回 \u2192（双斜杠）而不是 \u2192（单斜杠），
+    导致 json.loads 解析后保留字面字符串 '\u2192'（6个字符）而非实际箭头 '→'。
+    此函数递归地将这些字面 Unicode 转义序列转换为实际字符。
+
+    Args:
+        obj: 从 json.loads 解析出的对象（dict/list/str/其他）
+
+    Returns:
+        修复后的对象
+    """
+    if isinstance(obj, dict):
+        return {k: _fix_unicode_escapes(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_fix_unicode_escapes(item) for item in obj]
+    elif isinstance(obj, str):
+        # 检测并替换字面 \uXXXX 序列（双斜杠转义的结果）
+        # 匹配字面字符串 \uXXXX（其中 X 是十六进制数字）
+        pattern = r'\\u([0-9a-fA-F]{4})'
+
+        def replace_match(match):
+            hex_code = match.group(1)
+            try:
+                # 将十六进制转换为实际字符
+                return chr(int(hex_code, 16))
+            except (ValueError, OverflowError):
+                # 转换失败则保留原样
+                return match.group(0)
+
+        # 先尝试替换，如果字符串中没有 \uXXXX 模式则返回原字符串
+        result = re.sub(pattern, replace_match, obj)
+        return result
+    else:
+        return obj
 
 
 class AIHandler:
@@ -314,6 +353,8 @@ class AIHandler:
                         tc_id = tc['id'] or f"call_{uuid.uuid4().hex[:8]}"
                         try:
                             args = json.loads(tc['arguments']) if tc['arguments'] else {}
+                            # 修复 LLM 可能返回的双斜杠 Unicode 转义序列（\\u2192 → →）
+                            args = _fix_unicode_escapes(args)
                         except json.JSONDecodeError:
                             args = {}
                         tool_calls.append({
