@@ -96,7 +96,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.1.5")
+app = FastAPI(title="CBHCLI Web", version="5.1.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -499,7 +499,9 @@ class WebChatSession:
         cs._rebuild_system_prompt()
 
         # 上下文压缩组件
-        cs.context_compressor = ContextCompressor(cs.llm_client, cs.token_counter)
+        cs.context_compressor = ContextCompressor(
+            cs.llm_client, cs.token_counter,
+            workspace_path=getattr(agent_config, "workspace_path", None))
         tools_schema_tokens = cs.token_counter.count_tokens(
             json.dumps(cs.tool_registry.get_openai_tools(), ensure_ascii=False)
         ) if cs.tool_registry.get_openai_tools() else 0
@@ -2175,7 +2177,7 @@ async def _react_loop(cs: WebChatSession):
                 try:
                     success = await asyncio.to_thread(
                         cs.context_compressor.compress,
-                        cs.session, cs.context_window.trigger_threshold())
+                        cs.session, cs.context_window.compression_target())
                 except Exception:
                     success = False
                 if success:
@@ -3012,7 +3014,9 @@ async def chat_switch_model(req: Request):
     # 原地替换模型组件（会话消息原样保留）
     cs.llm_client = LLMClient(model_config)
     cs.token_counter = get_token_counter(model_config.get("model"))
-    cs.context_compressor = ContextCompressor(cs.llm_client, cs.token_counter)
+    cs.context_compressor = ContextCompressor(
+        cs.llm_client, cs.token_counter,
+        workspace_path=getattr(cs.agent_config, "workspace_path", None))
     if cs.context_window:
         cs.context_window.model_limit = cs.llm_client.context_limit
     if cs.app_proxy:
@@ -3152,7 +3156,7 @@ async def chat_compress(req: Request):
     try:
         success = await asyncio.to_thread(
             cs.context_compressor.compress,
-            cs.session, cs.context_window.trigger_threshold(),
+            cs.session, cs.context_window.compression_target(),
             instructions)
     except Exception as e:
         raise HTTPException(500, f"压缩失败: {e}")

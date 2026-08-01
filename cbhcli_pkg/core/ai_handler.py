@@ -519,7 +519,7 @@ class AIHandler:
         print(f"\n{self._c_dim}📦 上下文接近上限 ({self.context_window.get_status_text()})")
         print(f"{self._c_dim}   正在自动压缩上下文...{C_RESET}")
 
-        target_tokens = self.context_window.trigger_threshold()
+        target_tokens = self.context_window.compression_target()
         success = self.context_compressor.compress(self.session, target_tokens)
 
         if success:

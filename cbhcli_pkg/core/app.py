@@ -526,7 +526,8 @@ class CBHCLIApp:
                 self.llm_client = LLMClient(model_config)
                 self.token_counter = get_token_counter(model_config.get("model"))
                 self.context_compressor = ContextCompressor(
-                    self.llm_client, self.token_counter
+                    self.llm_client, self.token_counter,
+                    workspace_path=config.workspace_path
                 )
         
         # 初始化会话历史管理器
@@ -614,7 +615,8 @@ class CBHCLIApp:
         self.llm_client = LLMClient(model_config)
         self.token_counter = get_token_counter(model_config.get("model"))
         self.context_compressor = ContextCompressor(
-            self.llm_client, self.token_counter
+            self.llm_client, self.token_counter,
+            workspace_path=getattr(self.current_agent_config, "workspace_path", None)
         )
 
         # 更新上下文窗口的模型限制（新模型的 context_limit 可能不同）
@@ -986,7 +988,7 @@ class CBHCLIApp:
                             # QQ ASR 不可用，自动调用本地识别脚本
                             try:
                                 import subprocess as _sp
-                                script = os.path.expanduser("~/.cbhcli/agents/qqbot/skills/qq-voice-recognition/script/recognize_qq_voice.py")
+                                script = "/home/administrator/.cbhcli/agents/qqbot/skills/qq-voice-recognition/script/recognize_qq_voice.py"
                                 result = _sp.run(
                                     ["python3", script, local_path],
                                     capture_output=True, text=True, timeout=60
@@ -1112,7 +1114,7 @@ class CBHCLIApp:
         if not self.context_compressor or not self.session:
             return False
         before = self.session.get_total_tokens(self.token_counter)
-        target_tokens = self.context_window.trigger_threshold()
+        target_tokens = self.context_window.compression_target()
         success = self.context_compressor.compress(
             self.session, target_tokens, instructions=instructions or None)
         if getattr(self, "tracer", None):

@@ -200,6 +200,15 @@ class ContextWindow:
     def trigger_threshold(self) -> int:
         """获取触发压缩的token阈值"""
         return int(self.model_limit * self.compression_ratio)
+
+    def compression_target(self) -> int:
+        """压缩后目标 token 数（默认窗口的 30%）
+
+        与 trigger_threshold（80% 触发）不同：压缩目标应显著低于触发阈值，
+        否则压缩后立即再次接近上限触发重复压缩。
+        """
+        from cbhcli_pkg.core.constants import COMPRESSION_TARGET_RATIO
+        return int(self.model_limit * COMPRESSION_TARGET_RATIO)
     
     def remaining_tokens(self) -> int:
         """获取剩余可用token数"""
