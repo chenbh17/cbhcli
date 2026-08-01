@@ -119,6 +119,7 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /history - 查看历史会话列表
 - /ctx - 查看上下文使用情况
 - /comp [指令] - 手动压缩上下文（可带保留/丢弃指令）
+- /undo-compress [编号] - 撤销最近一次上下文压缩（恢复压缩前原始消息）
 - /mode [readonly|standard|auto|yolo] - 权限模式切换（Shift+Tab循环切换）
 - /permissions [list|add|rm] - 权限规则管理
 - /hooks [list|reload|test] - 生命周期钩子管理

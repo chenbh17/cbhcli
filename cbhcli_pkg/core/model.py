@@ -168,7 +168,7 @@ class LLMClient:
             **self._get_extra_payload(),
             **kwargs
         }
-        if self.max_tokens:
+        if self.max_tokens and "max_tokens" not in kwargs:
             payload["max_tokens"] = self.max_tokens
         
         response = self._session.post(
@@ -217,7 +217,8 @@ class LLMClient:
             **self._get_extra_payload(),
             **kwargs
         }
-        if self.max_tokens:
+        # 调用方显式传入的 max_tokens（kwargs）优先于模型配置
+        if self.max_tokens and "max_tokens" not in kwargs:
             payload["max_tokens"] = self.max_tokens
         
         response = self._session.post(

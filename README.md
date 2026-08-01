@@ -1,4 +1,4 @@
-# CBHCLI v5.1.5 - AI驱动的终端助手
+# CBHCLI v5.1.6 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -36,6 +36,7 @@
 - **Agent 链条（v5.1.0）** - 用户 Agent 间调用编排：定义多层级 Agent 调用链（如 main → cbhcli → {dify-chat, dbm-vl}），元 Agent 通过 `call_agent` 工具按链条拓扑调用下游用户 Agent（各自以完整身份执行：系统提示/工具/工作空间/记忆/技能/MCP），结果回传汇总；同级可并行；`/chain` 命令管理（list/add/rm/use/off/show/config/rename）；Web 端链条管理视图 + 聊天界面链条指示器 + 下游调用折叠展示
 - **edit 工具 Unicode 转义宽容匹配与错误诊断（v5.1.5）** - edit 工具对 Unicode 转义序列（\uXXXX 等）做宽容匹配，old_str 与实际文件内容在转义形式不同时仍可正确命中替换；匹配失败时输出精确诊断信息（未找到片段定位、候选相似片段提示），大幅降低跨编码/转义场景下的误配与排查成本
 - **Web 端 reasoning_effort 下拉框含 max 选项（v5.1.5）** - Web 模型配置界面 reasoning_effort 下拉框新增 `max` 选项（与 CLI 对齐），支持更深度的推理强度配置
+- **上下文压缩四项优化（v5.1.6）** - ① 压缩目标可控：修复 target_tokens 死参数，压缩后降到窗口 30%（摘要 max_tokens 预算限制 + 超目标迭代降级保留轮数）；② 摘要提示词对标 Claude Code：CRITICAL 约束 + analysis/summary 双块 + 9 章节结构化模板；③ 压缩可撤销：自动备份到 history/compressions/，`/undo-compress` 一键恢复压缩前原始消息；④ 摘要输入保留工具调用链（`[工具 terminal 结果]`）+ 大输出截断
 
 ### 17大内置工具 + Web 专属工具
 | 工具 | 功能 |
@@ -140,7 +141,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.1.5-py3-none-any.whl
+pip install dist/cbhcli-5.1.6-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -216,6 +217,7 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 /history          # 查看历史会话列表
 /comp             # 手动压缩上下文
 /comp 保留迁移方案，丢弃调试过程   # 带指令压缩
+/undo-compress    # 撤销最近一次上下文压缩（恢复压缩前原始消息）
 /ctx              # 查看上下文使用情况
 ```
 
@@ -460,6 +462,7 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/resume [编号]` | 列出或恢复历史会话 |
 | `/history` | 查看历史会话列表 |
 | `/comp [指令]` | 压缩上下文（可带保留/丢弃指令） |
+| `/undo-compress [编号]` | 撤销最近一次上下文压缩（恢复压缩前原始消息） |
 | `/ctx` | 查看上下文使用 |
 | `/mode [模式]` | 权限模式切换（readonly/standard/auto/yolo） |
 | `/permissions [list\|add\|rm]` | 权限规则管理 |

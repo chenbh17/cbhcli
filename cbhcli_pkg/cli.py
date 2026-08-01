@@ -35,6 +35,7 @@ def print_help():
     print("  会话管理:")
     print("    /reset 或 /new        重置/新建会话")
     print("    /comp [指令]          压缩上下文（可带保留/丢弃指令）")
+    print("    /undo-compress [编号] 撤销最近一次上下文压缩")
     print("    /ctx                  查看上下文使用")
     print("")
     print("  权限与安全 (Harness):")
