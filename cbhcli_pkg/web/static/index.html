@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CBHCLI Web</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="stylesheet" href="/css/style.css?v=5.1.6" />
+</head>
+<body>
+  <div id="app">
+    <!-- ===== 侧边栏 ===== -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <span class="logo-icon">❯</span>
+          <span class="logo-text">CBHCLI</span>
+          <span class="logo-version" id="app-version"></span>
+        </div>
+      </div>
+      <nav class="sidebar-nav" id="sidebar-nav">
+        <a class="nav-item active" data-view="chat"><span class="nav-icon">💬</span><span class="nav-label">对话</span></a>
+        <a class="nav-item" data-view="agents"><span class="nav-icon">🤖</span><span class="nav-label">Agent</span></a>
+        <a class="nav-item" data-view="chains"><span class="nav-icon">🔗</span><span class="nav-label">链条</span></a>
+        <a class="nav-item" data-view="models"><span class="nav-icon">🧠</span><span class="nav-label">模型</span></a>
+        <a class="nav-item" data-view="fallback"><span class="nav-icon">🔄</span><span class="nav-label">备用模型</span></a>
+        <a class="nav-item" data-view="skills"><span class="nav-icon">⚡</span><span class="nav-label">技能</span></a>
+        <a class="nav-item" data-view="mcp"><span class="nav-icon">🔌</span><span class="nav-label">MCP</span></a>
+        <a class="nav-item" data-view="knowledge"><span class="nav-icon">📚</span><span class="nav-label">知识库</span></a>
+        <a class="nav-item" data-view="tools"><span class="nav-icon">🔧</span><span class="nav-label">工具</span></a>
+        <a class="nav-item" data-view="security"><span class="nav-icon">🛡️</span><span class="nav-label">安全</span></a>
+        <a class="nav-item" data-view="embedding"><span class="nav-icon">🧭</span><span class="nav-label">索引</span></a>
+        <a class="nav-item" data-view="history"><span class="nav-icon">🕘</span><span class="nav-label">历史</span></a>
+        <a class="nav-item" data-view="settings"><span class="nav-icon">⚙️</span><span class="nav-label">设置</span></a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="sidebar-footer-text">AI 驱动的终端助手</div>
+      </div>
+    </aside>
+
+    <!-- ===== 主区域 ===== -->
+    <main id="main">
+      <!-- 对话视图 -->
+      <section class="view active" id="view-chat">
+        <header class="chat-header">
+          <div class="chat-selectors">
+            <select id="chat-agent-select" class="select"></select>
+            <select id="chat-model-select" class="select"></select>
+          </div>
+          <div class="chat-header-right">
+            <button class="btn btn-ghost" id="btn-chain" title="Agent 链条">🔗</button>
+            <div class="mode-badge" id="mode-badge" title="权限模式（点击切换）">
+              <span id="mode-badge-text">🟢 标准</span>
+            </div>
+            <div class="ctx-meter" id="ctx-meter" title="上下文使用情况">
+              <div class="ctx-meter-bar"><div class="ctx-meter-fill" id="ctx-meter-fill"></div></div>
+              <span class="ctx-meter-text" id="ctx-meter-text">0%</span>
+            </div>
+            <button class="btn btn-ghost" id="btn-quick-tools" title="快捷配置：工具开关">🔧</button>
+            <button class="btn btn-ghost" id="btn-quick-skills" title="快捷配置：技能管理">⚡</button>
+            <button class="btn btn-ghost" id="btn-quick-model" title="快捷配置：切换模型">🧠</button>
+            <button class="btn btn-ghost" id="btn-undo" title="回滚文件修改 (/undo)">↩️</button>
+            <button class="btn btn-ghost" id="btn-compress" title="手动压缩上下文 (/comp)">📦</button>
+            <button class="btn btn-ghost" id="btn-new-session" title="新建会话 (/new)">✚ 新会话</button>
+          </div>
+        </header>
+
+        <div class="chat-messages" id="chat-messages">
+          <div class="chat-empty" id="chat-empty">
+            <div class="chat-empty-icon">❯</div>
+            <h2>CBHCLI Web</h2>
+            <p>AI 驱动的终端助手 · 支持工具调用、知识库、技能系统</p>
+          </div>
+        </div>
+
+        <div class="chat-composer">
+          <div class="attachments" id="attachments"></div>
+          <div class="composer-box">
+            <button class="btn btn-icon" id="btn-attach" title="上传文件/图片">
+              <svg class="icon-paperclip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            </button>
+            <textarea id="chat-input" placeholder="输入消息… (Enter 发送，Shift+Enter / Alt+Enter 换行)" rows="1"></textarea>
+            <button class="btn btn-icon btn-send" id="btn-send" title="发送">➤</button>
+            <button class="btn btn-icon btn-abort hidden" id="btn-abort" title="中断">■</button>
+          </div>
+          <div class="composer-footer">
+            <div class="cwd-bar" id="cwd-bar" title="">
+              <svg class="icon-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+              <span class="cwd-bar-text" id="cwd-bar-text"></span>
+            </div>
+            <div class="composer-hint" id="composer-hint"></div>
+          </div>
+          <input type="file" id="file-input" multiple hidden />
+        </div>
+      </section>
+
+      <!-- 其他视图容器 -->
+      <section class="view" id="view-agents"></section>
+      <section class="view" id="view-chains"></section>
+      <section class="view" id="view-models"></section>
+      <section class="view" id="view-fallback"></section>
+      <section class="view" id="view-skills"></section>
+      <section class="view" id="view-mcp"></section>
+      <section class="view" id="view-knowledge"></section>
+      <section class="view" id="view-tools"></section>
+      <section class="view" id="view-security"></section>
+      <section class="view" id="view-embedding"></section>
+      <section class="view" id="view-history"></section>
+      <section class="view" id="view-settings"></section>
+    </main>
+  </div>
+
+  <!-- 模态框 -->
+  <div id="modal-root"></div>
+  <!-- Toast 通知 -->
+  <div id="toast-root"></div>
+
+  <script src="/vendor/marked.umd.js?v=5.1.6"></script>
+  <script src="/js/app.js?v=5.1.6"></script>
+</body>
+</html>
