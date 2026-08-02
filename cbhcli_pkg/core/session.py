@@ -109,13 +109,20 @@ class Session:
         """
         return [msg.to_dict() for msg in self.messages]
     
-    def get_total_tokens(self) -> int:
-        """
-        获取会话总token数
+    def get_total_tokens(self, token_counter=None) -> int:
+        """获取会话总token数
         
+        如果传入 token_counter，则使用 count_message_tokens 重新计算
+        （含消息结构开销，更准确）；否则累加各消息存储的 token_count。
+        
+        Args:
+            token_counter: TokenCounter 实例（可选，传入则精确计算）
+            
         Returns:
             总token数
         """
+        if token_counter is not None:
+            return token_counter.count_messages_tokens(self.messages)
         return sum(msg.token_count for msg in self.messages)
     
     def reset(self) -> None:
@@ -193,6 +200,15 @@ class ContextWindow:
     def trigger_threshold(self) -> int:
         """获取触发压缩的token阈值"""
         return int(self.model_limit * self.compression_ratio)
+
+    def compression_target(self) -> int:
+        """压缩后目标 token 数（默认窗口的 30%）
+
+        与 trigger_threshold（80% 触发）不同：压缩目标应显著低于触发阈值，
+        否则压缩后立即再次接近上限触发重复压缩。
+        """
+        from cbhcli_pkg.core.constants import COMPRESSION_TARGET_RATIO
+        return int(self.model_limit * COMPRESSION_TARGET_RATIO)
     
     def remaining_tokens(self) -> int:
         """获取剩余可用token数"""

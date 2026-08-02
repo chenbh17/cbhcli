@@ -1,4 +1,5 @@
 """MCP 命令处理"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -140,7 +141,7 @@ def _select_server(app, prompt_msg="请选择服务器"):
     lines.append(f"\n  0. 取消\n")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return None
@@ -249,7 +250,7 @@ def _mcp_toggle(args: str, app, enable: bool) -> str:
         lines.append(f"  0. 取消\n")
 
         print("\n" + "\n".join(lines))
-        choice = input("请选择 [编号/名称]: ").strip()
+        choice = ask_text("请选择 [编号/名称]: ").strip()
         if not choice or choice == '0':
             return "已取消"
 

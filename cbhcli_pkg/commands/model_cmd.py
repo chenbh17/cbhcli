@@ -1,4 +1,5 @@
 """模型配置命令处理"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -68,7 +69,7 @@ def register_model_commands(parser, app):
 def _add_model(app):
     """添加新模型"""
     print("\n--- 添加新模型 ---")
-    name = input("模型名称: ").strip()
+    name = ask_text("模型名称: ").strip()
     if not name:
         return "❌ 模型名称不能为空"
 
@@ -76,19 +77,19 @@ def _add_model(app):
     if app.global_config.get_model(name):
         return f"❌ 模型 '{name}' 已存在"
 
-    api_key = input("API Key: ").strip()
+    api_key = ask_text("API Key: ").strip()
     if not api_key:
         return "❌ API Key不能为空"
 
-    base_url = input("API Base URL (例如 https://api.openai.com/v1): ").strip()
+    base_url = ask_text("API Base URL (例如 https://api.openai.com/v1): ").strip()
     if not base_url:
         return "❌ API Base URL不能为空"
 
-    model_id = input("模型ID (例如 gpt-4o): ").strip()
+    model_id = ask_text("模型ID (例如 gpt-4o): ").strip()
     if not model_id:
         return "❌ 模型ID不能为空"
 
-    context_limit_str = input("上下文长度限制 (默认 128000): ").strip()
+    context_limit_str = ask_text("上下文长度限制 (默认 128000): ").strip()
     context_limit = 128000
     if context_limit_str:
         try:
@@ -96,7 +97,7 @@ def _add_model(app):
         except ValueError:
             return "❌ 上下文长度必须是数字"
 
-    temperature_str = input("温度参数 (默认使用全局值0.1，留空跳过): ").strip()
+    temperature_str = ask_text("温度参数 (默认使用全局值0.1，留空跳过): ").strip()
     temperature = None
     if temperature_str:
         try:
@@ -107,8 +108,44 @@ def _add_model(app):
             return "❌ 温度参数必须是数字"
 
 
-    vision_str = input("是否支持视觉/图片输入 (y/n, 默认 n): ").strip().lower()
+    vision_str = ask_text("是否支持视觉/图片输入 (y/n, 默认 n): ").strip().lower()
     supports_vision = vision_str == 'y'
+
+    max_tokens_str = ask_text("最大输出token数 (留空用API默认值, 思考模型建议设置如 8192): ").strip()
+    max_tokens = None
+    if max_tokens_str:
+        try:
+            max_tokens = int(max_tokens_str)
+            if max_tokens <= 0:
+                return "❌ max_tokens 必须大于 0"
+        except ValueError:
+            return "❌ max_tokens 必须是数字"
+
+    thinking_str = ask_text("thinking 参数 (on/off 或 true/false，留空不传): ").strip().lower()
+    thinking = None
+    if thinking_str:
+        if thinking_str in ('on', 'true', '1', 'yes', 'y'):
+            thinking = True
+        elif thinking_str in ('off', 'false', '0', 'no', 'n'):
+            thinking = False
+        else:
+            return "❌ thinking 参数只能是 on/off 或 true/false"
+
+    # reasoning_effort 参数：thinking=off 时不能配置（DeepSeek 等 API 报 400）
+    reasoning_effort = None
+    while True:
+        reasoning_effort_str = ask_text("reasoning_effort 参数 (如 low/medium/high/max，留空不传): ").strip()
+        if not reasoning_effort_str:
+            break
+        if reasoning_effort_str.lower() == 'none':
+            reasoning_effort = None
+            break
+        if thinking is False:
+            print("⚠️ thinking 已关闭(off)，此时不能配置 reasoning_effort（API 会返回 400 错误）")
+            print("   请重新输入：留空不传 / 输入 none 清除；如需 reasoning_effort 请将 thinking 改为 on 后重试")
+            continue
+        reasoning_effort = reasoning_effort_str
+        break
 
     model_config = {
         "name": name,
@@ -120,11 +157,21 @@ def _add_model(app):
     }
     if temperature is not None:
         model_config["temperature"] = temperature
+    if max_tokens is not None:
+        model_config["max_tokens"] = max_tokens
+    if thinking is not None:
+        model_config["thinking"] = thinking
+    if reasoning_effort is not None:
+        model_config["reasoning_effort"] = reasoning_effort
 
     app.global_config.add_model(model_config)
     temp_info = f"   温度: {temperature}" if temperature is not None else "   温度: 使用全局值(0.1)"
     vision_info = "✅ 支持" if supports_vision else "❌ 不支持"
-    return f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens\n{temp_info}\n   视觉: {vision_info}"
+    max_tokens_info = f"   max_tokens: {max_tokens}" if max_tokens is not None else "   max_tokens: 使用API默认值"
+    thinking_info = f"   thinking: {thinking}" if thinking is not None else "   thinking: 不传该参数"
+    reasoning_info = f"   reasoning_effort: {reasoning_effort}" if reasoning_effort is not None else "   reasoning_effort: 不传该参数"
+    return (f"✅ 模型 '{name}' 已添加\n   模型ID: {model_id}\n   上下文限制: {context_limit:,} tokens\n"
+            f"{temp_info}\n   视觉: {vision_info}\n{max_tokens_info}\n{thinking_info}\n{reasoning_info}")
 
 
 def _list_models(app):
@@ -152,6 +199,15 @@ def _list_models(app):
             lines.append(f"    温度: 使用全局值(0.1)")
         vision = m.get('vision', False)
         lines.append(f"    视觉: {'✅ 支持' if vision else '❌ 不支持'}")
+        max_tokens = m.get('max_tokens')
+        if max_tokens is not None:
+            lines.append(f"    max_tokens: {max_tokens}")
+        thinking = m.get('thinking')
+        if thinking is not None:
+            lines.append(f"    thinking: {thinking}")
+        reasoning_effort = m.get('reasoning_effort')
+        if reasoning_effort is not None:
+            lines.append(f"    reasoning_effort: {reasoning_effort}")
         lines.append("")
 
     return "\n".join(lines)
@@ -179,7 +235,7 @@ def _show_model_menu(app):
     lines.append("")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return "已取消选择"
@@ -215,7 +271,7 @@ def _show_rm_model_menu(app):
     lines.append("")
 
     print("\n" + "\n".join(lines))
-    choice = input("请选择 [编号/名称]: ").strip()
+    choice = ask_text("请选择 [编号/名称]: ").strip()
 
     if not choice or choice == '0':
         return "已取消"
@@ -250,12 +306,11 @@ def _use_model(app, model_name):
     # 保存上次选择的模型
     app.global_config.set_last_selected_model(model_name)
 
-    # 重新加载Agent以应用新模型
-    if app.current_agent_name:
-        app._load_agent(app.current_agent_name)
+    # 原地切换模型，保留当前会话全部内容（不再重建会话）
+    app.switch_model(model_config)
 
     ctx = model_config.get('context_limit', 128000)
-    return f"✅ 已切换到模型: {model_name}\n   模型ID: {model_config['model']}\n   上下文限制: {ctx:,} tokens"
+    return f"✅ 已切换到模型: {model_name}\n   模型ID: {model_config['model']}\n   上下文限制: {ctx:,} tokens\n   当前会话内容已保留"
 
 
 def _delete_model(app, model_name):
@@ -282,6 +337,21 @@ def _model_info(app):
         lines.append(f"  温度: 使用全局值(0.1)")
     vision = "✅ 支持" if app.llm_client.supports_vision else "❌ 不支持"
     lines.append(f"  视觉: {vision}")
+    max_tokens = app.llm_client.max_tokens
+    if max_tokens is not None:
+        lines.append(f"  max_tokens: {max_tokens}")
+    else:
+        lines.append(f"  max_tokens: 使用API默认值")
+    thinking = app.llm_client.thinking
+    if thinking is not None:
+        lines.append(f"  thinking: {thinking}")
+    else:
+        lines.append(f"  thinking: 不传该参数")
+    reasoning_effort = app.llm_client.reasoning_effort
+    if reasoning_effort is not None:
+        lines.append(f"  reasoning_effort: {reasoning_effort}")
+    else:
+        lines.append(f"  reasoning_effort: 不传该参数")
 
     if app.context_window:
         total = app.session.get_total_tokens() if app.session else 0
@@ -311,7 +381,7 @@ def _config_model(app, param):
         
         lines.append(f"\n  0. 取消")
         print("\n" + "\n".join(lines))
-        choice = input("请选择 [编号/名称]: ").strip()
+        choice = ask_text("请选择 [编号/名称]: ").strip()
         
         if not choice or choice == '0':
             return "已取消"
@@ -342,7 +412,7 @@ def _config_model(app, param):
     
     # 上下文长度
     current_ctx = model_config.get('context_limit', 128000)
-    ctx_str = input(f"上下文长度限制 (当前: {current_ctx}): ").strip()
+    ctx_str = ask_text(f"上下文长度限制 (当前: {current_ctx}): ").strip()
     if ctx_str:
         try:
             new_ctx = int(ctx_str)
@@ -353,7 +423,7 @@ def _config_model(app, param):
     # 温度参数
     current_temp = model_config.get('temperature')
     temp_display = str(current_temp) if current_temp is not None else "使用全局值(0.1)"
-    temp_str = input(f"温度参数 (当前: {temp_display}): ").strip()
+    temp_str = ask_text(f"温度参数 (当前: {temp_display}): ").strip()
     if temp_str:
         if temp_str.lower() == 'none' or temp_str == '-':
             # 清除模型专属温度，恢复使用全局值
@@ -371,9 +441,64 @@ def _config_model(app, param):
     # 视觉参数
     current_vision = model_config.get('vision', False)
     vision_display = "y" if current_vision else "n"
-    vision_str = input(f"是否支持视觉/图片输入 (当前: {vision_display}): ").strip().lower()
+    vision_str = ask_text(f"是否支持视觉/图片输入 (当前: {vision_display}): ").strip().lower()
     if vision_str:
         model_config['vision'] = vision_str == 'y'
+    
+    # max_tokens 参数
+    current_max_tokens = model_config.get('max_tokens')
+    max_tokens_display = str(current_max_tokens) if current_max_tokens is not None else "使用API默认值"
+    max_tokens_str = ask_text(f"最大输出token数 (当前: {max_tokens_display}, 输入 none 清除): ").strip()
+    if max_tokens_str:
+        if max_tokens_str.lower() == 'none' or max_tokens_str == '-':
+            model_config.pop('max_tokens', None)
+            print("  -> 已清除，将使用API默认值")
+        else:
+            try:
+                new_max_tokens = int(max_tokens_str)
+                if new_max_tokens <= 0:
+                    return "❌ max_tokens 必须大于 0"
+                model_config['max_tokens'] = new_max_tokens
+            except ValueError:
+                return "❌ max_tokens 必须是数字（输入 none 可清除）"
+
+    # thinking 参数
+    current_thinking = model_config.get('thinking')
+    thinking_display = str(current_thinking) if current_thinking is not None else "不传该参数"
+    thinking_str = ask_text(f"thinking 参数 (当前: {thinking_display}, on/off 或 true/false, 输入 none 清除): ").strip().lower()
+    if thinking_str:
+        if thinking_str in ('none', '-'):
+            model_config.pop('thinking', None)
+            print("  -> 已清除，将不传该参数")
+        elif thinking_str in ('on', 'true', '1', 'yes', 'y'):
+            model_config['thinking'] = True
+        elif thinking_str in ('off', 'false', '0', 'no', 'n'):
+            model_config['thinking'] = False
+            # thinking 关闭时不能配置 reasoning_effort（DeepSeek 等 API 报 400）
+            if model_config.get('reasoning_effort'):
+                print("⚠️ thinking 已关闭(off)，不能同时配置 reasoning_effort（API 会返回 400 错误）")
+                model_config.pop('reasoning_effort', None)
+                print("  -> 已自动清除 reasoning_effort")
+        else:
+            return "❌ thinking 参数只能是 on/off 或 true/false（输入 none 可清除）"
+
+    # reasoning_effort 参数：thinking=off 时不能配置（DeepSeek 等 API 报 400）
+    current_reasoning_effort = model_config.get('reasoning_effort')
+    reasoning_display = str(current_reasoning_effort) if current_reasoning_effort is not None else "不传该参数"
+    while True:
+        reasoning_str = ask_text(f"reasoning_effort 参数 (当前: {reasoning_display}, 如 low/medium/high/max, 输入 none 清除): ").strip()
+        if not reasoning_str:
+            break
+        if reasoning_str.lower() in ('none', '-'):
+            model_config.pop('reasoning_effort', None)
+            print("  -> 已清除，将不传该参数")
+            break
+        if model_config.get('thinking') is False:
+            print("⚠️ thinking 已关闭(off)，此时不能配置 reasoning_effort（API 会返回 400 错误）")
+            print("   请重新输入：留空不传 / 输入 none 清除；如需 reasoning_effort 请先将 thinking 改为 on")
+            continue
+        model_config['reasoning_effort'] = reasoning_str
+        break
 
     # 保存配置
     # global_config 中 models 是列表，需要找到并替换
@@ -394,6 +519,21 @@ def _config_model(app, param):
         lines.append(f"   温度: 使用全局值(0.1)")
     vision = "✅ 支持" if model_config.get('vision', False) else "❌ 不支持"
     lines.append(f"   视觉: {vision}")
+    max_tokens = model_config.get('max_tokens')
+    if max_tokens is not None:
+        lines.append(f"   max_tokens: {max_tokens}")
+    else:
+        lines.append(f"   max_tokens: 使用API默认值")
+    thinking = model_config.get('thinking')
+    if thinking is not None:
+        lines.append(f"   thinking: {thinking}")
+    else:
+        lines.append(f"   thinking: 不传该参数")
+    reasoning_effort = model_config.get('reasoning_effort')
+    if reasoning_effort is not None:
+        lines.append(f"   reasoning_effort: {reasoning_effort}")
+    else:
+        lines.append(f"   reasoning_effort: 不传该参数")
     
     # 如果当前正在使用这个模型，提示需要重新加载
     if app.llm_client and app.llm_client.model_name == model_config.get('model'):
@@ -434,23 +574,23 @@ def _embedding_model_menu(app, param):
 def _add_embedding_model(app):
     """添加嵌入模型"""
     print("\n--- 添加嵌入模型 ---")
-    name = input("模型名称 (例如 openai-embedding): ").strip()
+    name = ask_text("模型名称 (例如 openai-embedding): ").strip()
     if not name:
         return "❌ 模型名称不能为空"
     
-    api_key = input("API Key: ").strip()
+    api_key = ask_text("API Key: ").strip()
     if not api_key:
         return "❌ API Key不能为空"
     
-    base_url = input("API Base URL (例如 https://api.openai.com/v1): ").strip()
+    base_url = ask_text("API Base URL (例如 https://api.openai.com/v1): ").strip()
     if not base_url:
         return "❌ API Base URL不能为空"
     
-    model_id = input("模型ID (例如 text-embedding-3-small): ").strip()
+    model_id = ask_text("模型ID (例如 text-embedding-3-small): ").strip()
     if not model_id:
         return "❌ 模型ID不能为空"
     
-    model_type = input("模型类型 (openai/custom, 默认 openai): ").strip() or "openai"
+    model_type = ask_text("模型类型 (openai/custom, 默认 openai): ").strip() or "openai"
     
     config = {
         "name": name,
@@ -491,7 +631,7 @@ def _delete_embedding_model(app):
         return "⚠️  未配置嵌入模型"
     
     name = config.get('name', '未知')
-    confirm = input(f"确定要删除嵌入模型 '{name}' 吗? (y/n): ").strip().lower()
+    confirm = ask_text(f"确定要删除嵌入模型 '{name}' 吗? (y/n): ").strip().lower()
     if confirm != 'y':
         return "已取消删除"
     
@@ -531,23 +671,23 @@ def _rerank_model_menu(app, param):
 def _add_rerank_model(app):
     """添加重排序模型"""
     print("\n--- 添加重排序模型 ---")
-    name = input("模型名称 (例如 jina-reranker): ").strip()
+    name = ask_text("模型名称 (例如 jina-reranker): ").strip()
     if not name:
         return "❌ 模型名称不能为空"
     
-    api_key = input("API Key: ").strip()
+    api_key = ask_text("API Key: ").strip()
     if not api_key:
         return "❌ API Key不能为空"
     
-    base_url = input("API Base URL (例如 https://api.jina.ai/v1): ").strip()
+    base_url = ask_text("API Base URL (例如 https://api.jina.ai/v1): ").strip()
     if not base_url:
         return "❌ API Base URL不能为空"
     
-    model_id = input("模型ID (例如 jina-reranker-v2-base-multilingual): ").strip()
+    model_id = ask_text("模型ID (例如 jina-reranker-v2-base-multilingual): ").strip()
     if not model_id:
         return "❌ 模型ID不能为空"
     
-    top_n = input("返回结果数量 (默认 5): ").strip()
+    top_n = ask_text("返回结果数量 (默认 5): ").strip()
     top_n = int(top_n) if top_n else 5
     
     config = {
@@ -589,7 +729,7 @@ def _delete_rerank_model(app):
         return "⚠️  未配置重排序模型"
     
     name = config.get('name', '未知')
-    confirm = input(f"确定要删除重排序模型 '{name}' 吗? (y/n): ").strip().lower()
+    confirm = ask_text(f"确定要删除重排序模型 '{name}' 吗? (y/n): ").strip().lower()
     if confirm != 'y':
         return "已取消删除"
     

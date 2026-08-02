@@ -1,11 +1,13 @@
 """cbhpacks 特征编码工具 - cols_encode 模块封装
 
 每次执行自动保存可复现的Python源码脚本到输出目录。
+执行结果变量(ce/encode_data等)自动注入 python 会话，可在 python 工具中直接使用。
 """
 import os
 import json
 import pandas as pd
-from cbhcli_pkg.tools.registry import BaseTool, ToolResult
+from cbhcli_pkg.tools.registry import ToolResult
+from cbhcli_pkg.tools.cbhpacks_session import CbhpacksSessionTool
 
 
 def auto_version_path(base_path):
@@ -23,14 +25,15 @@ def save_script(output_dir, filename, code):
         f.write(code)
 
 
-class ColsEncodeTool(BaseTool):
+class ColsEncodeTool(CbhpacksSessionTool):
     @property
     def name(self): return "cbhpacks_cols_encode"
 
     @property
     def description(self):
         return (
-            "cbhpacks 特征编码工具 - 7种编码方法。每次执行自动保存可复现源码。\n\n"
+            "cbhpacks 特征编码工具 - 7种编码方法。每次执行自动保存可复现源码。\n"
+            "执行后结果变量自动注入 python 会话：ce(cols_encode实例)/df/encode_data\n\n"
             "【method】data_to_sigmoid/data_to_sc/data_to_minmax/data_to_softmax/bins_to_num/str_to_num/data_to_woe"
         )
 
@@ -141,11 +144,16 @@ ce = cols_encode(df=df, cols={cols}, bins_type="{bins_type}", group={group},
             save_script(path, f"run_{method}.py", script_code)
             output_files.append(f"  ✅ {path}/run_{method}.py — 可复现源码")
 
+            # 结果变量注入 python 会话
+            encode_data = woe_df if method == "data_to_woe" else data
+            self._expose(ce=ce, df=df, encode_data=encode_data)
+
             return ToolResult(success=True, output=(
                 f"📊 cbhpacks_cols_encode.{method} 执行完成\n\n"
                 f"📁 输出文件:\n" + "\n".join(output_files) + f"\n"
                 f"  📁 输出目录: {path}/\n\n"
-                f"📋 结果:\n{result_text}"
+                f"📋 结果:\n{result_text}\n\n"
+                f"💡 已注入 python 会话变量: ce, df, encode_data"
             ))
 
         except Exception as e:

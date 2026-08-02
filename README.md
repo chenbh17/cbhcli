@@ -1,4 +1,4 @@
-# CBHCLI v4.7.9 - AI驱动的终端助手
+# CBHCLI v5.1.7 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -11,13 +11,40 @@
 - **知识库系统** - 为每个Agent建立专属知识库，支持语义搜索和问答
 - **会话管理** - 上下文窗口监控、自动压缩、会话重置
 - **向量检索** - 基于ChromaDB的语义搜索，支持历史对话和知识库检索
-- **Web管理界面** - 内置Web服务器，提供可视化Agent、知识库、模型、MCP管理
+- **Web界面（v4.9.4 全面重构）** - 对标 CLI 全部功能：SSE 流式对话（思考块折叠/工具卡片/确认条/ask_user 问答/中断/上下文仪表/附件上传/刷新恢复会话）+ 11 个管理视图（Agent/模型/备用模型/技能/MCP/知识库/工具/索引/历史/设置），原生 JS 零构建依赖，现代深色主题
 - **技能系统** - 可复用的提示词+脚本技能，按需激活增强AI能力
+- **Markdown渲染** - CLI界面支持Markdown格式渲染，代码高亮、表格、列表等美观显示
+- **LaTeX公式渲染** - 支持LaTeX数学公式渲染，行内公式与块级公式均可正常显示
+- **ReAct持续交付** - ReAct循环中自动压缩上下文，突破上下文窗口限制实现长任务持续交付
+- **聊天输入框** - 基于 prompt_toolkit 原生补全系统，字素簇宽度感知，支持中英文/emoji（含ZWJ/VS16/旗帜/肤色）输入退格无错位、resize防抖防重叠、斜杠命令补全菜单
+- **统一交互输入** - 所有交互式提问（/model add 等）统一使用 prompt_toolkit 输入系统，中英文/emoji 退格行为一致
+- **状态栏** - 输入框下方状态栏以文字标签+高对比配色显示：模型/上下文/Agent/技能/完整路径
+- **并行子Agent** - AI智能拆分多个独立子任务并行委托（最多100个并发），rich.Live 实时状态板展示每个子Agent当前步骤，全部完成后主Agent再继续
+- **工具预览语法高亮** - edit/write/python 工具预览统一用 rich.Table + Pygments 语法高亮（monokai 主题）渲染：edit 差异对比宽屏左右并排、窄屏上下堆叠，write/python 按文件类型自动分色（30+种扩展名识别），长行自动折行，行列精确对齐
+- **后台任务管理** - terminal 命令超时(默认30秒)不杀进程转后台运行，process 工具实时监控进度直到完成，任务满1小时自动终止，kill_process 工具随时手动终止，长任务（pip install 大包等）不再被误杀
+- **图片识别双模式（v4.9.5）** - 识图统一走 image 工具：主模型支持视觉时图片作为多模态消息直发主模型（共享会话上下文，零额外API调用）；主模型无视觉时自动调用其他已配置视觉模型识别（fallback链），识别能力不被主模型限制
+- **会话内热切换模型（v4.9.6）** - `/model use` 切换模型不再重建会话，当前对话内容完整保留，仅替换LLM客户端并原地更新系统提示；视觉主模型 fallback 到非视觉模型时自动将历史带图消息降级为纯文本，不再报"不是视觉模型"错误
+- **状态栏即时显示（v4.9.7）** - 修复输入框下方状态栏（模型/上下文/Agent/技能/路径）偶尔不显示的问题：AI 回答期间按键产生 type-ahead 残留时，prompt_toolkit 跳过 CPR 光标查询导致高度永远未知、工具栏被过滤器隐藏，现改为首轮渲染即显示
+- **权限模式（v4.9.9 Harness 治理层）** - 四档权限模板 Shift+Tab 循环热切换：🔒readonly 只读（AI 只能看）/ 🟢standard 标准（危险操作逐个确认，默认）/ 🟡auto 自动（工作区内写操作自动放行）/ 🔴yolo 最高权限（零确认直接执行，deny 红线降级警告）；内置 deny 红线规则（rm -rf /、写 .env/.git 等物理禁止）+ ask 危险操作（git push/sudo/rm 等）+ allow 只读命令；确认框新增 always 选项自动提炼永久放行规则；/mode /permissions 命令管理
+- **Hooks 钩子系统（v4.9.9）** - 生命周期 6 事件（SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/SubagentStop/Stop）自动执行自定义 shell 命令：PreToolUse 可拦截危险操作（退出码2+stderr 反馈模型）、PostToolUse 可自动跑测试/格式化并反馈、Stop 可自动通知/保存；配置于 ~/.cbhcli/hooks.json 或 Agent 工作空间，/hooks 命令管理
+- **死循环熔断（v4.9.9）** - 自动检测两类死循环：工具同参数重复调用（3次警告附加结果、4次熔断并告知模型换策略、3次干预仍无效则终止任务）与 A→B→A→B 周期震荡；流式输出文本复读（150字符块出现3次）自动截断；全程不中断任务，只有彻底没救才告知用户
+- **文件检查点回滚（v4.9.9）** - write/edit 执行前自动备份目标文件（Agent 工作空间 backups/，保留最近50份），/undo 一键回滚最近一次修改或按 ID 回滚指定备份
+- **调用链追踪（v4.9.9 可观测性）** - 每次工具调用（名称/参数摘要/权限判定/耗时/成败）、模式切换、循环熔断、压缩等事件自动落盘 JSONL（工作空间 history/traces/），可追溯可审计
+- **工具调用显示升级（v4.9.9）** - Claude Code 风格：⏺ 工具头 + braille 旋转动画实时显示执行耗时 + ✓/✗ 状态行 + ⎿ 树形结果引导线（超出12行折叠提示 Ctrl+R 查看全部）
+- **死循环检测修复（v5.0.0）** - 周期震荡检测从工具名序列改为签名序列（工具名+参数MD5），修复 read/edit 等不同参数交替调用被误判为循环的问题；Web 端子 Agent 并行上限从 10 提升到 100（与 CLI 对齐）
+- **Web AI 发送文件/图片（v5.0.0）** - Web 界面 AI 可主动向用户发送文件和图片：新增 `send_file` 工具（仅 Web 端注册，CLI 不可见）传入文件路径即可发送，图片内联显示点击放大，文件显示下载链接；python 生成图片（matplotlib 等）自动检测展示，write/edit 写文件自动生成下载链接；所有逻辑仅在 Web 端生效，CLI 零改动
+- **Agent 链条（v5.1.0）** - 用户 Agent 间调用编排：定义多层级 Agent 调用链（如 main → cbhcli → {dify-chat, dbm-vl}），元 Agent 通过 `call_agent` 工具按链条拓扑调用下游用户 Agent（各自以完整身份执行：系统提示/工具/工作空间/记忆/技能/MCP），结果回传汇总；同级可并行；`/chain` 命令管理（list/add/rm/use/off/show/config/rename）；Web 端链条管理视图 + 聊天界面链条指示器 + 下游调用折叠展示
+- **edit 工具 Unicode 转义宽容匹配与错误诊断（v5.1.5）** - edit 工具对 Unicode 转义序列（\uXXXX 等）做宽容匹配，old_str 与实际文件内容在转义形式不同时仍可正确命中替换；匹配失败时输出精确诊断信息（未找到片段定位、候选相似片段提示），大幅降低跨编码/转义场景下的误配与排查成本
+- **Web 端 reasoning_effort 下拉框含 max 选项（v5.1.5）** - Web 模型配置界面 reasoning_effort 下拉框新增 `max` 选项（与 CLI 对齐），支持更深度的推理强度配置
+- **上下文压缩四项优化（v5.1.6）** - ① 压缩目标可控：修复 target_tokens 死参数，压缩后降到窗口 30%（摘要 max_tokens 预算限制 + 超目标迭代降级保留轮数）；② 摘要提示词对标 Claude Code：CRITICAL 约束 + analysis/summary 双块 + 9 章节结构化模板；③ 压缩可撤销：自动备份到 history/compressions/，`/undo-compress` 一键恢复压缩前原始消息；④ 摘要输入保留工具调用链（`[工具 terminal 结果]`）+ 大输出截断
+- **文本复读检测误报修复（v5.1.7）** - TextLoopDetector 改为双块整体匹配（尾部 2×150 字符）+ 近邻窗口（最近 5000 字符）统计，且重复 ≥15 次才判定复读（连续重复总长 <4500 字符永不触发）。修复正常思考中"先设计后实现"重复写出的模板/骨架片段（如 HTML 头部）被误判死循环、思考被截断的问题；真正的连续大量复读仍会正常熔断。改 loop_detector.py 1 个文件，CLI/Web 调用方零改动
 
-### 13大内置工具
+### 17大内置工具 + Web 专属工具
 | 工具 | 功能 |
 |------|------|
-| `terminal` | 执行终端命令 |
+| `terminal` | 执行终端命令（超时自动转后台，不杀进程） |
+| `process` | 实时监控后台任务进度，等待完成获取全部输出 |
+| `kill_process` | 终止运行时间过长的后台任务 |
 | `read` | 读取文件内容 |
 | `write` | 创建/覆盖文件 |
 | `edit` | 精确字符串替换 |
@@ -29,10 +56,15 @@
 | `memory_search` | 语义搜索向量化知识内容 |
 | `knowledge_base` | 查询知识库内容 |
 | `skills_create` | 创建新技能 |
-| `delegate_task` | 将子任务委托给子Agent执行 |
+| `delegate_task` | 委托子任务给子Agent（单个串行 / 多个并行最多100个，实时状态板） |
+| `call_agent` | 调用链条中下游用户Agent执行任务（仅链条绑定时可用） |
+| `image` | 识别图片内容（主模型支持视觉时直发主模型，否则调用其他视觉模型） |
+| `send_file` 📡 | **仅 Web 端**：向用户发送文件/图片，图片内联显示、文件下载链接 |
 
 ### cbhpacks 数据科学工具（13个，默认关闭）
 基于 [cbhpacks](https://github.com/chenbh17/cbhpacks) 数据科学工具包封装，覆盖完整的机器学习建模流水线。默认不开启，通过 `/tools on` 手动开启。
+
+**会话级状态缓存（v4.9.3）**：与 python 工具共享会话命名空间 —— 各工具的执行结果变量（如 `bm`/`woe_data`/`iv_data`/`mt`/`clf`/`selected_cols`/`data`）自动注入会话，可在 python 工具中直接使用做二次分析；同参数重复调用自动复用缓存实例（如 fit 后的模型可直接调参/出报告）。`/new` 或 `/reset` 后所有缓存与变量自动释放。
 
 | 工具 | 功能 | 方法 |
 |------|------|------|
@@ -60,14 +92,15 @@ cbhpacks_get_random_data → cbhpacks_desc_df → cbhpacks_cols_encode → cbhpa
 通过 MCP (Model Context Protocol) 协议连接外部工具服务器，无限扩展AI的能力。
 添加的MCP工具与内置工具使用方式完全相同。
 
-### Web 管理界面
-内置基于 Vue 3 + FastAPI 的 Web 管理界面，支持：
-- **可视化聊天** - 浏览器中与AI对话
-- **Agent管理** - 创建/切换/删除Agent
-- **模型配置** - 在线管理模型与嵌入/重排序模型
-- **知识库管理** - 文件上传、索引状态查看
-- **MCP管理** - 在线添加/管理MCP服务器
-- **会话历史** - 查看和管理历史会话
+### Web 界面（v4.9.4 全面重构）
+基于 FastAPI + 原生 JS SPA（零构建依赖，marked 内置离线可用），对标 CLI 全部功能与逻辑：
+- **流式对话** - SSE 实时渲染 Markdown、思考块折叠、工具调用卡片（参数/结果/状态）、工具确认条（允许/拒绝/全部允许）、ask_user 交互问答、自我反思重试提示、随时中断
+- **会话能力** - 上下文使用仪表、手动/自动压缩、新会话自动存档、历史会话恢复、**刷新页面自动恢复对话**
+- **Agent管理** - 创建/切换/删除/编辑配置，soul/memory/tools/usage 四文件在线编辑
+- **模型配置** - 模型 CRUD、嵌入/重排序模型、备用模型（main/vision 排序管理）
+- **知识库管理** - 文件上传/按路径添加、删除、重建索引、向量状态
+- **MCP管理** - 服务器增删、真实连接状态、逐工具开关、在线刷新
+- **更多** - 技能激活、工具开关（即时生效）、向量索引管理、全局设置
 
 启动方式：
 ```bash
@@ -81,12 +114,13 @@ cbhcli web -p 18888
 ### 高级功能
 - **多步规划** - 复杂任务自动拆解为 Todo 计划列表，逐步执行并追踪进度
 - **自我反思** - 工具执行失败时自动分析原因并重试（最多3次）
-- **子Agent协作** - 将独立子任务委托给子Agent执行，拥有独立上下文
+- **子Agent协作** - 将独立子任务委托给子Agent执行，拥有独立上下文；多个独立子任务可并行委托，全部完成后主Agent再继续
 - **技能系统** - 创建可复用的技能（提示词+脚本），按需激活增强AI能力
 - **嵌入模型支持** - 可配置专用嵌入模型API（OpenAI compatible）
 - **重排序服务** - 支持Jina、Cohere等重排序API提高检索质量
 - **自动上下文压缩** - 当接近模型限制时自动压缩上下文
 - **多模型支持** - 配置多个OpenAI兼容的AI模型，随时切换
+- **备用模型自动切换** - 主模型断网/异常时自动切换到备用模型继续任务，视觉模型同理
 
 ## 安装
 
@@ -108,7 +142,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-4.7.9-py3-none-any.whl
+pip install dist/cbhcli-5.1.7-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -183,8 +217,26 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 /resume 1         # 恢复第1个历史会话
 /history          # 查看历史会话列表
 /comp             # 手动压缩上下文
+/comp 保留迁移方案，丢弃调试过程   # 带指令压缩
+/undo-compress    # 撤销最近一次上下文压缩（恢复压缩前原始消息）
 /ctx              # 查看上下文使用情况
 ```
+
+### 权限与安全（Harness）
+
+```
+/mode                      # 查看权限模式（readonly/standard/auto/yolo）
+/mode auto                 # 切换到自动模式（yolo 需二次确认）
+/permissions list          # 查看权限规则
+/permissions add allow terminal(pytest:*)   # 添加永久放行规则
+/hooks list                # 查看生命周期钩子
+/hooks reload              # 重载 hooks.json
+/undo                      # 回滚最近一次 write/edit
+/undo list                 # 查看可回滚备份
+/undo <ID>                 # 回滚指定备份
+```
+
+**快捷键**: `Shift+Tab` 循环切换权限模式（YOLO 需 3 秒内再按一次确认）；`Ctrl+R` 切换工具显示详细/简洁
 
 ### 7. 技能系统
 技能是可复用的提示词+可选脚本，用于增强Agent在特定领域的能力。
@@ -200,7 +252,7 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 你可以直接让AI帮你创建技能，例如："帮我创建一个代码审查技能"。
 
 ### 8. 工具管理
-每个Agent可以独立控制26个内置工具（13个通用+13个数据科学）的开关状态，关闭的工具AI将无法调用。
+每个Agent可以独立控制27个内置工具（14个通用+13个数据科学）的开关状态，关闭的工具AI将无法调用。
 通用工具默认开启，cbhpacks数据科学工具默认关闭。
 
 ```
@@ -220,13 +272,30 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 - 关闭工具会自动更新该Agent工作空间的 `tools.md` 和 `usage.md`
 - 使用 `/tools list` 可随时查看当前状态
 
-### 9. memory.md 长期记忆
+### 9. 备用模型管理
+当主模型断网或出现异常时，自动切换到备用模型继续任务。视觉模型（image工具）同理。
+
+```
+/fallback list                          # 查看备用模型配置
+/fallback add main gpt-4o               # 添加主模型备用
+/fallback add vision qwen-vl            # 添加视觉模型备用
+/fallback rm main gpt-4o               # 移除主模型备用
+/fallback reorder main                  # 重新排序主模型备用
+/fallback clear vision                  # 清空视觉模型备用列表
+```
+
+- **main** - 主模型备用：主模型调用失败时按顺序自动切换
+- **vision** - 视觉模型备用：image工具的视觉模型不可用时按顺序自动切换
+- 备用模型必须已通过 `/model add` 配置
+- 视觉备用模型必须支持视觉功能（添加时选择 vision=y）
+
+### 10. memory.md 长期记忆
 memory.md 用于保存用户要求记住的重要信息：
 - **不会自动写入**：只有用户明确要求"记住"、"记录"时才写入
 - **始终包含在系统提示中**：每次对话都会读取 memory.md 内容
 - 普通对话历史通过 `/history` 和 `/resume` 管理
 
-### 10. Python 工具
+### 11. Python 工具
 使用 `python` 工具执行 Python 代码，支持会话记忆：
 - **会话记忆**：同一会话中定义的变量和导入的模块会保留
 - 示例：第一次导入 pandas 并读取数据，第二次可以直接使用之前的变量
@@ -393,8 +462,13 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/reset` 或 `/new` | 创建新会话（自动保存当前会话） |
 | `/resume [编号]` | 列出或恢复历史会话 |
 | `/history` | 查看历史会话列表 |
-| `/comp` | 压缩上下文 |
+| `/comp [指令]` | 压缩上下文（可带保留/丢弃指令） |
+| `/undo-compress [编号]` | 撤销最近一次上下文压缩（恢复压缩前原始消息） |
 | `/ctx` | 查看上下文使用 |
+| `/mode [模式]` | 权限模式切换（readonly/standard/auto/yolo） |
+| `/permissions [list\|add\|rm]` | 权限规则管理 |
+| `/hooks [list\|reload\|test]` | 生命周期钩子管理 |
+| `/undo [ID\|list]` | 回滚 write/edit 文件修改 |
 | `/kb add <file>` | 添加文件到知识库 |
 | `/kb list` | 列出知识库文件 |
 | `/kb rm [file]` | 删除知识文件 |
@@ -419,6 +493,19 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/tools list` | 查看当前Agent的工具开关状态 |
 | `/tools on` | 开启工具（交互式多选） |
 | `/tools off` | 关闭工具（交互式多选） |
+| `/fallback list` | 查看备用模型配置 |
+| `/fallback add [main\|vision] <模型名>` | 添加备用模型 |
+| `/fallback rm [main\|vision] <模型名>` | 移除备用模型 |
+| `/fallback reorder [main\|vision]` | 重新排序备用模型 |
+| `/fallback clear [main\|vision]` | 清空备用模型列表 |
+| `/chain list` | 列出所有 Agent 链条 |
+| `/chain add <名称>` | 交互式创建链条 |
+| `/chain use <名称>` | 激活链条 |
+| `/chain off` | 取消链条绑定 |
+| `/chain show <名称>` | 查看链条详情 |
+| `/chain rm <名称>` | 删除链条 |
+| `/chain config <名称>` | 编辑链条配置 |
+| `/chain rename <旧名> <新名>` | 重命名链条 |
 | `/help [command]` | 显示帮助 |
 | `quit` | 退出程序 |
 
@@ -426,7 +513,12 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 
 | 快捷键 | 功能 |
 |--------|------|
+| `Enter` | 发送消息 / 执行命令 |
+| `Alt+Enter` | 输入框换行 |
+| `Ctrl+J` | 输入框换行 |
 | `Ctrl+R` | 切换工具显示详细/简洁模式 |
+| `Tab` | 补全菜单选择下一项 |
+| `↑` / `↓` | 补全菜单上下选择 |
 
 ## 项目结构
 
@@ -434,13 +526,17 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 cbhcli_pkg/
 ├── core/              # 核心模块
 │   ├── app.py              # 主应用
+│   ├── input_box.py        # 聊天输入框组件（原生补全系统）
+│   ├── text_width.py       # 字素簇宽度计算（emoji/CJK精确对齐）
+│   ├── resize_fix.py       # 终端resize防抖（防输入框重复显示）
+│   ├── prompt_utils.py     # 统一交互输入（替代内置input）
 │   ├── agent.py            # Agent管理
 │   ├── session.py          # 会话管理
 │   ├── session_history.py  # 会话历史管理
 │   ├── model.py            # LLM客户端
-│   ├── ai_handler.py       # AI请求处理（Function Calling + 规划/反思）
+│   ├── ai_handler.py       # AI请求处理（Function Calling + 反思）
 │   ├── tool_executor.py    # 工具执行
-│   ├── subagent.py         # 子Agent调度器
+│   ├── subagent.py         # 子Agent调度器（支持并行执行）
 │   ├── skill_manager.py    # 技能管理器
 │   ├── response_cleaner.py # 响应清理
 │   ├── embedding_client.py # 嵌入模型客户端
@@ -449,6 +545,12 @@ cbhcli_pkg/
 │   ├── mcp_client.py       # MCP协议客户端
 │   ├── mcp_manager.py      # MCP服务器管理
 │   ├── mcp_tool_adapter.py # MCP工具适配器
+│   ├── permissions.py      # 权限规则引擎（4模式，Harness 治理层）
+│   ├── loop_detector.py    # 死循环检测（工具重复/文本复读）
+│   ├── hooks.py            # Hooks 钩子系统（生命周期6事件）
+│   ├── tracer.py           # 调用链追踪（JSONL 落盘）
+│   ├── checkpoint.py       # 文件检查点（write/edit 自动备份/回滚）
+│   ├── spinner.py          # 终端加载动画（工具执行spinner）
 │   ├── constants.py        # 常量定义
 │   └── errors.py           # 异常类型
 ├── tools/             # 工具实现
@@ -463,7 +565,8 @@ cbhcli_pkg/
 │   ├── python_tool.py  # Python执行（带会话记忆）
 │   ├── memory_search.py # 记忆搜索
 │   ├── knowledge_base.py # 知识库查询
-│   ├── delegate_task.py  # 子Agent任务委托
+│   ├── delegate_task.py  # 子Agent任务委托（串行/并行）
+│   ├── image.py         # 图片识别（调用视觉模型）
 │   ├── skills_create.py  # 技能创建
 │   ├── base.py          # 工具基类
 │   └── registry.py      # 工具注册中心
@@ -476,10 +579,12 @@ cbhcli_pkg/
 │   ├── embedding_cmd.py # 向量索引命令
 │   ├── mcp_cmd.py      # MCP管理命令
 │   ├── skills_cmd.py   # 技能管理命令
-│   └── tools_cmd.py    # 工具开关管理命令
-├── web/               # Web管理界面
-│   ├── server.py       # FastAPI Web服务器
-│   └── static/         # Vue前端静态文件
+│   ├── tools_cmd.py    # 工具开关管理命令
+│   ├── fallback_cmd.py # 备用模型管理命令
+│   └── harness_cmd.py  # Harness命令（/mode /permissions /hooks /undo）
+├── web/               # Web界面
+│   ├── server.py       # FastAPI 后端（SSE 流式 + 全量管理 API）
+│   └── static/         # 原生前端 SPA（index.html + css + js + vendor/marked，零构建）
 ├── config/            # 配置管理
 │   └── global_config.py # 全局配置
 ├── context/           # 上下文管理

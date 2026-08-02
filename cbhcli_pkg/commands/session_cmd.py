@@ -1,4 +1,5 @@
 """会话和上下文命令处理"""
+from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
 
@@ -58,7 +59,7 @@ def register_session_commands(parser, app):
             lines.append("")
             
             print("\n" + "\n".join(lines))
-            choice = input("请选择 [编号/文件名]: ").strip()
+            choice = ask_text("请选择 [编号/文件名]: ").strip()
             
             if not choice or choice == '0':
                 return "已取消"
@@ -133,28 +134,98 @@ def register_session_commands(parser, app):
         requires_agent=True
     ))
     
-    # /comp 命令 - 手动压缩上下文
+    # /comp 命令 - 手动压缩上下文（支持带指令：/comp 保留迁移方案，丢弃调试过程）
     def compress_handler(args):
-        """手动压缩上下文"""
+        """手动压缩上下文，可携带保留/丢弃指令"""
         if not app.current_agent_name:
             return "❌ 请先选择Agent"
-        
+
         if app.session is None:
             return "❌ 当前没有活动会话"
-        
+
+        instructions = args.strip()
+
         # 执行压缩
-        success = app._compress_context()
-        
+        success = app._compress_context(instructions=instructions)
+
         if success:
+            if instructions:
+                return f"✅ 上下文已压缩（按指令: {instructions}）"
             return "✅ 上下文已压缩"
         else:
             return "ℹ️  上下文较短,无需压缩"
-    
+
     parser.register(SlashCommand(
         name="comp",
-        description="手动压缩上下文",
-        usage="",
+        description="手动压缩上下文（可带指令: /comp 保留X 丢弃Y）",
+        usage="[压缩指令]",
         handler=compress_handler,
+        requires_agent=True
+    ))
+
+    # /undo-compress 命令 - 撤销最近一次上下文压缩
+    def undo_compress_handler(args):
+        """撤销最近一次上下文压缩（从备份恢复原始消息）"""
+        if not app.current_agent_name:
+            return "❌ 请先选择Agent"
+
+        if app.session is None:
+            return "❌ 当前没有活动会话"
+
+        if not app.context_compressor:
+            return "❌ 压缩组件未初始化"
+
+        backups = app.context_compressor.list_backups()
+        if not backups:
+            return "📭 没有可撤销的压缩记录"
+
+        choice = args.strip()
+
+        if not choice:
+            # 无参数时显示交互式选择菜单
+            lines = ["📋 选择要恢复的压缩记录 (输入编号):\n"]
+            for i, b in enumerate(backups, 1):
+                lines.append(
+                    f"  {i:2d}. [{b['time']}] "
+                    f"{b['before_tokens']:,} → {b['after_tokens']:,} tokens "
+                    f"({b['message_count']} 条消息)")
+            lines.append(f"\n   0. 取消")
+            lines.append("")
+
+            print("\n" + "\n".join(lines))
+            choice = ask_text("请选择 [编号]: ").strip()
+
+            if not choice or choice == '0':
+                return "已取消"
+
+        # 解析编号并恢复
+        try:
+            idx = int(choice) - 1
+            if not (0 <= idx < len(backups)):
+                return f"❌ 无效的编号: {choice}"
+        except ValueError:
+            return f"❌ 无效的编号: {choice}"
+
+        backup = backups[idx]
+        success = app.context_compressor.restore_backup(backup["file"], app.session)
+
+        if not success:
+            return "❌ 恢复失败（备份文件可能已损坏）"
+
+        # 更新上下文窗口
+        if app.context_window:
+            total = app.session.get_total_tokens(app.token_counter)
+            app.context_window.update(total)
+
+        return (f"✅ 已恢复压缩前的上下文 "
+                f"({backup['after_tokens']:,} → {backup['before_tokens']:,} tokens, "
+                f"{backup['time']})")
+
+    parser.register(SlashCommand(
+        name="undo-compress",
+        description="撤销最近一次上下文压缩（恢复压缩前的原始消息）",
+        usage="[编号]",
+        handler=undo_compress_handler,
         requires_agent=True
     ))
     

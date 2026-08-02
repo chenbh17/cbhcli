@@ -5,6 +5,7 @@
 # =============================================================================
 DEFAULT_CONTEXT_LIMIT = 128000
 DEFAULT_COMPRESSION_RATIO = 0.8
+COMPRESSION_TARGET_RATIO = 0.3  # 压缩后目标 token 比例（压缩到窗口的 30%，避免压缩后立即再次触发）
 MIN_MESSAGES_FOR_COMPRESSION = 6
 
 # =============================================================================
@@ -15,12 +16,11 @@ THINKING_MAX_LINES = 8   # 思考内容滚动区域最大行数
 # =============================================================================
 # 工具调用
 # =============================================================================
-MAX_TOOL_ROUNDS = 99
+MAX_TOOL_ROUNDS = 99999
 MAX_TOOL_OUTPUT_LENGTH = 1000000
 TOOL_PREVIEW_LENGTH = 1000
 TOOL_OUTPUT_TRUNCATE_LENGTH = 2500
-MAX_REFLECTION_RETRIES = 3
-PLANNING_MIN_LENGTH = 20
+MAX_REFLECTION_RETRIES = 10
 
 # =============================================================================
 # API配置

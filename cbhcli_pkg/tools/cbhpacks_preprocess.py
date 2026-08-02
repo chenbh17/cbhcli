@@ -2,11 +2,13 @@
 
 三个工具类: ColsOperateTool / DescDfTool / DescColTool
 每次执行自动保存可复现的Python源码脚本到输出目录。
+执行结果变量自动注入 python 会话，可在 python 工具中直接使用。
 """
 import os
 import json
 import pandas as pd
-from cbhcli_pkg.tools.registry import BaseTool, ToolResult
+from cbhcli_pkg.tools.registry import ToolResult
+from cbhcli_pkg.tools.cbhpacks_session import CbhpacksSessionTool
 
 
 def auto_version_path(base_path):
@@ -24,13 +26,17 @@ def save_script(output_dir, filename, code):
         f.write(code)
 
 
-class ColsOperateTool(BaseTool):
+class ColsOperateTool(CbhpacksSessionTool):
     @property
     def name(self): return "cbhpacks_cols_operate"
 
     @property
     def description(self):
-        return "cbhpacks 列操作工具 - 炸裂/转置/分割/日期转换/分词。每次执行自动保存可复现源码。"
+        return ("cbhpacks 列操作工具 - 炸裂/转置/分割/日期转换/分词。每次执行自动保存可复现源码。\n"
+                "执行后结果变量自动注入 python 会话：co(cols_operate实例)/df/operate_data\n\n"
+                "【⚠️ 注意事项】\n"
+                "- date_col_trans: 日期列必须是完整yyyymmdd格式(如20240601)，只有年月(如202406)会报错。"
+                "解决方案：先拼接补全日期(str(mth)+'01')再调用。")
 
     @property
     def parameters(self):
@@ -105,22 +111,27 @@ print(f"处理完成，shape: {{data.shape}}")
 print(data.head())
 ''')
 
+            # 结果变量注入 python 会话
+            self._expose(co=co, df=df, operate_data=data)
+
             return ToolResult(success=True, output=(
                 f"📊 cbhpacks_cols_operate.{method} 执行完成\n\n"
-                f"📋 shape: {data.shape}\n前5行:\n{data.head().to_string()}"
+                f"📋 shape: {data.shape}\n前5行:\n{data.head().to_string()}\n\n"
+                f"💡 已注入 python 会话变量: co, df, operate_data"
             ))
         except Exception as e:
             import traceback
             return ToolResult(success=False, output="", error=f"执行失败: {str(e)}\n{traceback.format_exc()}")
 
 
-class DescDfTool(BaseTool):
+class DescDfTool(CbhpacksSessionTool):
     @property
     def name(self): return "cbhpacks_desc_df"
 
     @property
     def description(self):
-        return "cbhpacks 数据集描述统计工具。每次执行自动保存可复现源码。"
+        return ("cbhpacks 数据集描述统计工具。每次执行自动保存可复现源码。\n"
+                "执行后结果变量自动注入 python 会话：dd(desc_df实例)/df/num_report/cat_report")
 
     @property
     def parameters(self):
@@ -160,24 +171,29 @@ print(f"数值型特征: {{len(num_report)}}个")
 print(f"类别型特征: {{len(cat_report)}}个")
 ''')
 
+            # 结果变量注入 python 会话
+            self._expose(dd=dd, df=df, num_report=num_report, cat_report=cat_report)
+
             return ToolResult(success=True, output=(
                 f"📊 cbhpacks_desc_df.get_rpt 执行完成\n\n"
                 f"📁 输出: {path}/desc_num_rpt.xlsx, desc_cat_rpt.xlsx\n"
                 f"  ✅ {path}/run_get_rpt.py — 可复现源码\n\n"
-                f"📋 数值型: {len(num_report)}个, 类别型: {len(cat_report)}个"
+                f"📋 数值型: {len(num_report)}个, 类别型: {len(cat_report)}个\n\n"
+                f"💡 已注入 python 会话变量: dd, df, num_report, cat_report"
             ))
         except Exception as e:
             import traceback
             return ToolResult(success=False, output="", error=f"执行失败: {str(e)}\n{traceback.format_exc()}")
 
 
-class DescColTool(BaseTool):
+class DescColTool(CbhpacksSessionTool):
     @property
     def name(self): return "cbhpacks_desc_col"
 
     @property
     def description(self):
-        return "cbhpacks 单变量分析工具 - 描述/相关性/有监督/异常值检测。每次执行自动保存可复现源码。"
+        return ("cbhpacks 单变量分析工具 - 描述/相关性/有监督/异常值检测。每次执行自动保存可复现源码。\n"
+                "执行后结果变量自动注入 python 会话：dc(desc_col实例)/df")
 
     @property
     def parameters(self):
@@ -263,11 +279,15 @@ print("分析完成，输出目录: {path}/")
 ''')
             output_files.append(f"  ✅ {path}/run_{method}.py — 可复现源码")
 
+            # 结果变量注入 python 会话
+            self._expose(dc=dc, df=df)
+
             return ToolResult(success=True, output=(
                 f"📊 cbhpacks_desc_col.{method} 执行完成\n\n"
                 f"📁 输出文件:\n" + "\n".join(output_files) + f"\n"
                 f"  📁 输出目录: {path}/\n\n"
-                f"📋 结果:\n{result_text}"
+                f"📋 结果:\n{result_text}\n\n"
+                f"💡 已注入 python 会话变量: dc, df"
             ))
         except Exception as e:
             import traceback

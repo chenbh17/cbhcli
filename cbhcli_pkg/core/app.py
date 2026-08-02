@@ -1,18 +1,10 @@
 """主应用 - CBHCLIApp"""
-import sys
 import os
-import re
 import json
-import base64
-import datetime
 from pathlib import Path
 from typing import Optional
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.styles import Style
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.formatted_text import ANSI
-from prompt_toolkit.filters import Condition
+from cbhcli_pkg.core.input_box import ChatInputBox
 
 from cbhcli_pkg.config.global_config import GlobalConfig
 from cbhcli_pkg.core.agent import AgentManager, AgentConfig, AgentPersona
@@ -23,6 +15,10 @@ from cbhcli_pkg.core.subagent import SubAgentScheduler
 from cbhcli_pkg.core.tool_executor import ToolExecutor
 from cbhcli_pkg.core.ai_handler import AIHandler
 from cbhcli_pkg.core.mcp_manager import MCPManager
+from cbhcli_pkg.core.permissions import PermissionEngine, MODE_META
+from cbhcli_pkg.core.hooks import HookManager
+from cbhcli_pkg.core.checkpoint import CheckpointManager
+from cbhcli_pkg.core.tracer import Tracer
 from cbhcli_pkg.core.constants import (
     C_RESET, C_DIM, C_USER_BG, C_USER_FG, C_AI_HINT, C_SEP,
     DEFAULT_CONTEXT_LIMIT, DEFAULT_COMPRESSION_RATIO
@@ -43,6 +39,13 @@ from cbhcli_pkg.tools.grep import GrepTool
 from cbhcli_pkg.tools.glob_tool import GlobTool
 from cbhcli_pkg.tools.ask_user import AskUserQuestionTool
 from cbhcli_pkg.tools.todo import TodoTool
+from cbhcli_pkg.tools.image import ImageTool
+from cbhcli_pkg.tools.process import ProcessTool
+from cbhcli_pkg.tools.kill_process import KillProcessTool
+from cbhcli_pkg.tools.qqbot_send import QQBotSendTool
+
+# QQ Bot 服务
+from cbhcli_pkg.qqbot.qqbot_service import QQBotService
 
 # cbhpacks 数据科学工具
 from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool
@@ -73,6 +76,10 @@ from cbhcli_pkg.commands.embedding_cmd import register_embedding_commands
 from cbhcli_pkg.commands.mcp_cmd import register_mcp_commands
 from cbhcli_pkg.commands.skills_cmd import register_skills_commands
 from cbhcli_pkg.commands.tools_cmd import register_tools_commands
+from cbhcli_pkg.commands.qqbot_cmd import register_qqbot_commands
+from cbhcli_pkg.commands.fallback_cmd import register_fallback_commands
+from cbhcli_pkg.commands.harness_cmd import register_harness_commands
+from cbhcli_pkg.commands.chain_cmd import register_chain_commands
 
 
 class SlashCommandHelper:
@@ -141,6 +148,69 @@ class SlashCommandHelper:
             ('list', '查看所有工具状态'),
             ('on', '开启工具（交互式多选）'),
             ('off', '关闭工具（交互式多选）'),
+        ],
+        'qqbot': [
+            ('add', '添加 QQ Bot'),
+            ('list', '列出所有 QQ Bot'),
+            ('start', '启动 QQ Bot'),
+            ('stop', '停止 QQ Bot'),
+            ('restart', '重启 QQ Bot'),
+            ('status', '查看 Bot 状态'),
+            ('rm', '删除 QQ Bot'),
+            ('config', '修改 Bot 配置'),
+        ],
+        'fallback': [
+            ('add', '添加备用模型'),
+            ('list', '查看备用模型配置'),
+            ('rm', '移除备用模型'),
+            ('reorder', '重新排序备用模型'),
+            ('clear', '清空备用模型列表'),
+        ],
+        'fallback add': [
+            ('main', '添加主模型备用'),
+            ('vision', '添加视觉模型备用'),
+        ],
+        'fallback rm': [
+            ('main', '移除主模型备用'),
+            ('vision', '移除视觉模型备用'),
+        ],
+        'fallback reorder': [
+            ('main', '重排主模型备用'),
+            ('vision', '重排视觉模型备用'),
+        ],
+        'fallback clear': [
+            ('main', '清空主模型备用'),
+            ('vision', '清空视觉模型备用'),
+        ],
+        'mode': [
+            ('readonly', '只读模式：AI 只能查看不能修改'),
+            ('standard', '标准模式：危险操作逐个确认（默认）'),
+            ('auto', '自动模式：工作区内写操作自动放行'),
+            ('yolo', '最高权限：全部直接执行零确认'),
+            ('list', '查看当前模式与所有模式说明'),
+        ],
+        'permissions': [
+            ('list', '查看权限规则'),
+            ('add', '添加规则: /permissions add <allow|ask|deny> <规则>'),
+            ('rm', '删除规则: /permissions rm <allow|ask|deny> <规则>'),
+        ],
+        'hooks': [
+            ('list', '查看已配置钩子'),
+            ('reload', '重新加载 hooks.json'),
+            ('test', '测试触发钩子: /hooks test <事件名>'),
+        ],
+        'undo': [
+            ('list', '查看可回滚的文件备份'),
+        ],
+        'chain': [
+            ('list', '列出所有链条'),
+            ('add', '创建新链条'),
+            ('rm', '删除链条'),
+            ('use', '激活链条'),
+            ('off', '取消链条绑定'),
+            ('show', '查看链条详情'),
+            ('config', '编辑链条配置'),
+            ('rename', '重命名链条'),
         ],
     }
     
@@ -264,6 +334,9 @@ class CBHCLIApp:
         self.tool_registry.register(GrepTool())
         self.tool_registry.register(GlobTool())
         self.tool_registry.register(AskUserQuestionTool())
+        self.tool_registry.register(ImageTool(self))
+        self.tool_registry.register(ProcessTool())
+        self.tool_registry.register(KillProcessTool())
         self.todo_tool = TodoTool()
         self.tool_registry.register(self.todo_tool)
 
@@ -281,9 +354,19 @@ class CBHCLIApp:
         self.tool_registry.register(ConSqlTool())
         self.tool_registry.register(ConLinuxTool())
         self.tool_registry.register(GetRandomDataTool())
+
+        # QQ Bot 服务和工具
+        self.qqbot_service = QQBotService()
+        self.qqbot_send_tool = QQBotSendTool()
+        self.qqbot_send_tool.set_service(self.qqbot_service)
+        self.tool_registry.register(self.qqbot_send_tool)
         
         # 工具执行器（延迟初始化vector_store后添加memory_search）
         self.tool_executor = ToolExecutor(self.tool_registry)
+
+        # 权限规则引擎（Harness 治理层，全局单例，Shift+Tab 热切换模式）
+        self.permission_engine = PermissionEngine()
+        self.tool_executor.permission_engine = self.permission_engine
     
     def _init_vector_store(self):
         """初始化向量存储（可选）"""
@@ -351,6 +434,10 @@ class CBHCLIApp:
         register_mcp_commands(self.command_parser, self)
         register_skills_commands(self.command_parser, self)
         register_tools_commands(self.command_parser, self)
+        register_qqbot_commands(self.command_parser, self)
+        register_fallback_commands(self.command_parser, self)
+        register_harness_commands(self.command_parser, self)
+        register_chain_commands(self.command_parser, self)
         
         # 注册help命令
         def help_handler(args):
@@ -374,95 +461,11 @@ class CBHCLIApp:
         """初始化UI组件"""
         self.tool_verbose = False
         
-        # 补全状态
-        self._completions = []       # [(display, desc, full_cmd), ...]
-        self._comp_index = -1        # 当前选中项，-1 表示无选中
-        self._comp_dismissed = False  # 用户按 Esc 主动关闭
-        self._comp_last_text = ''     # 上次计算补全时的文本
-        
-        self.prompt_style = Style.from_dict({
-            'prompt': 'bold #00bcd4',
-            'input-border': '#555555',
-            'input-hint': '#888888',
-            'bottom-toolbar': 'noinherit #555555',
-            'bottom-toolbar.text': 'noinherit #555555',
-        })
-        
-        self.prompt_bindings = KeyBindings()
-        
-        # 补全是否正在显示的条件
-        @Condition
-        def _has_completions():
-            return bool(self._completions) and not self._comp_dismissed
-        
-        @self.prompt_bindings.add('c-r')
-        def toggle_verbose(event):
-            """Ctrl+R 切换工具显示详细/简洁模式"""
-            self.tool_verbose = not self.tool_verbose
-            self.tool_executor.set_verbose(self.tool_verbose)
-            mode = "详细" if self.tool_verbose else "简洁"
-            print(f"\n{C_SEP}工具显示: {mode}{C_RESET}")
-        
-        @self.prompt_bindings.add('enter')
-        def submit(event):
-            """Enter：补全菜单有选中项时应用选中项，否则提交"""
-            buf = event.current_buffer
-            if self._completions and self._comp_index >= 0 and not self._comp_dismissed:
-                selected = self._completions[self._comp_index]
-                buf.text = selected[2]  # full_cmd
-                buf.cursor_position = len(buf.text)
-                self._comp_index = -1
-                return
-            buf.validate_and_handle()
-        
-        @self.prompt_bindings.add('c-j')
-        def newline_ctrl_j(event):
-            """Ctrl+J 换行"""
-            event.current_buffer.insert_text('\n')
-        
-        @self.prompt_bindings.add('escape', 'enter')
-        def newline_alt(event):
-            """Alt+Enter 换行"""
-            event.current_buffer.insert_text('\n')
-        
-        @self.prompt_bindings.add('escape', filter=_has_completions)
-        def comp_escape(event):
-            """Esc 关闭补全菜单"""
-            self._comp_dismissed = True
-            self._comp_index = -1
-        
-        @self.prompt_bindings.add('up', filter=_has_completions)
-        def comp_up(event):
-            """上键选择上一项"""
-            if self._comp_index > 0:
-                self._comp_index -= 1
-            else:
-                self._comp_index = len(self._completions) - 1
-        
-        @self.prompt_bindings.add('down', filter=_has_completions)
-        def comp_down(event):
-            """下键选择下一项"""
-            if self._comp_index < len(self._completions) - 1:
-                self._comp_index += 1
-            else:
-                self._comp_index = 0
-        
-        @self.prompt_bindings.add('tab', filter=_has_completions)
-        def comp_tab(event):
-            """Tab 选择下一项"""
-            if self._comp_index < len(self._completions) - 1:
-                self._comp_index += 1
-            else:
-                self._comp_index = 0
-        
         # 斜杠命令补全助手
         self._cmd_helper = SlashCommandHelper(self.command_parser)
         
-        self.prompt_session = PromptSession(
-            style=self.prompt_style,
-            key_bindings=self.prompt_bindings,
-            multiline=True,
-        )
+        # 聊天输入框组件（基于 prompt_toolkit 原生补全系统）
+        self._chat_input = ChatInputBox(self._cmd_helper, self)
     
     def _init_agent(self):
         """初始化Agent"""
@@ -484,6 +487,11 @@ class CBHCLIApp:
         self.mcp_manager: Optional[MCPManager] = None
         self.skill_manager: Optional[SkillManager] = None
         self._agent_indexed: bool = False  # 标记是否已索引
+        
+        # Agent 链条状态
+        self._active_chain = None          # 当前激活的 AgentChain
+        self._chain_active_path: list = None  # 当前执行路径 ["main", "cbhcli", ...]
+        self._chain_manager = None         # ChainManager 延迟初始化
         
         # 尝试加载上次活动的Agent
         active_agent = self.global_config.get_active_agent()
@@ -518,7 +526,8 @@ class CBHCLIApp:
                 self.llm_client = LLMClient(model_config)
                 self.token_counter = get_token_counter(model_config.get("model"))
                 self.context_compressor = ContextCompressor(
-                    self.llm_client, self.token_counter
+                    self.llm_client, self.token_counter,
+                    workspace_path=config.workspace_path
                 )
         
         # 初始化会话历史管理器
@@ -529,6 +538,12 @@ class CBHCLIApp:
         
         # 初始化技能管理器（每个 Agent 独立）
         self.skill_manager = SkillManager(config.workspace_path)
+
+        # Harness 组件（每个 Agent 独立，挂到工具执行器）
+        self.hook_manager = HookManager(config.workspace_path, agent_name)
+        self.checkpoint_manager = CheckpointManager(config.workspace_path)
+        self.tool_executor.hook_manager = self.hook_manager
+        self.tool_executor.checkpoint_manager = self.checkpoint_manager
 
         # 应用 Agent 工具开关设置
         self.tool_registry.set_disabled_tools(config.disabled_tools or [])
@@ -546,7 +561,70 @@ class CBHCLIApp:
                 print(f"⚠️  索引工作空间失败: {e}")
         
         self._reset_session()
+
+        # Agent 链条：恢复持久化的激活状态
+        if not getattr(self, '_active_chain', None):
+            saved_chain_name = self.global_config.get_active_chain(agent_name)
+            if saved_chain_name:
+                from cbhcli_pkg.commands.chain_cmd import _get_chain_manager
+                cm = _get_chain_manager(self)
+                saved_chain = cm.get_chain(saved_chain_name)
+                if saved_chain:
+                    # 校验 Agent 存在性
+                    missing = saved_chain.validate(self.agent_manager)
+                    if not missing and saved_chain.get_root_agent() == agent_name:
+                        from cbhcli_pkg.commands.chain_cmd import _activate_chain
+                        _activate_chain(self, saved_chain)
+                        print(f"{C_DIM}🔗 已恢复链条: {saved_chain_name}{C_RESET}")
+        else:
+            # 已有激活链条：检查是否匹配当前 Agent
+            chain = self._active_chain
+            root = chain.get_root_agent()
+            if agent_name != root:
+                # 切换的 Agent 不是当前链条的元 Agent，取消链条绑定
+                from cbhcli_pkg.commands.chain_cmd import _deactivate_chain
+                _deactivate_chain(self)
+                print(f"{C_DIM}💡 切换 Agent 导致链条绑定已取消{C_RESET}")
+            else:
+                # 重新注入链条信息
+                from cbhcli_pkg.commands.chain_cmd import _inject_chain_prompt, _register_call_agent_tool
+                _inject_chain_prompt(self, chain)
+                _register_call_agent_tool(self, chain)
+
+        # SessionStart 钩子（stdout 打印给用户）
+        if self.hook_manager and self.hook_manager.has_hooks("SessionStart"):
+            decision = self.hook_manager.run_simple(
+                "SessionStart",
+                session_id=self.session.id if self.session else "")
+            for line in decision.outputs:
+                print(f"{C_DIM}[hook:SessionStart] {line}{C_RESET}")
+            for warn in decision.warnings:
+                print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
         return True
+
+    def switch_model(self, model_config: dict):
+        """原地切换模型，保留当前会话全部内容
+
+        供 /model use 调用：仅替换 LLM 客户端及关联组件（token计数/压缩器/
+        上下文窗口限制），会话消息原样保留，系统提示原地更新
+        （模型名称、视觉能力描述可能随模型变化）。
+
+        Args:
+            model_config: 新模型配置字典
+        """
+        self.llm_client = LLMClient(model_config)
+        self.token_counter = get_token_counter(model_config.get("model"))
+        self.context_compressor = ContextCompressor(
+            self.llm_client, self.token_counter,
+            workspace_path=getattr(self.current_agent_config, "workspace_path", None)
+        )
+
+        # 更新上下文窗口的模型限制（新模型的 context_limit 可能不同）
+        if self.context_window:
+            self.context_window.model_limit = self.llm_client.context_limit
+
+        # 原地更新系统提示（会话消息不受影响）
+        self._update_system_prompt()
     
     def _reset_session(self, save_current: bool = True):
         """重置会话
@@ -567,28 +645,37 @@ class CBHCLIApp:
         
         # 重置 Python 会话（清空变量记忆）
         remove_python_session("default")
-        
+
         self.session = Session(agent_name=self.current_agent_name)
-        tool_descriptions = self.tool_registry.get_tool_descriptions()
-        
+
+        # 可观测性 tracer（每会话一个 JSONL 文件，挂到工具执行器）
+        self.tracer = Tracer(self.current_agent_config.workspace_path,
+                             self.session.id)
+        self.tool_executor.tracer = self.tracer
+        self.tool_executor.session_id = self.session.id
+
+        # 权限模式回落默认 + 确认状态随新会话重置
+        if self.permission_engine:
+            self.permission_engine.reset_to_default()
+        self.tool_executor.no_more_confirmations = False
+
         # 获取模型名称
         model_name = ""
         if self.llm_client and hasattr(self.llm_client, 'model_name'):
             model_name = self.llm_client.model_name
         elif self.current_agent_config.primary_model:
             model_name = self.current_agent_config.primary_model
-        
+
         # 读取 memory.md 内容，始终包含在系统提示中
         memory_content = self._load_memory_md()
-        
+
         # 获取已激活技能的提示内容
         active_skills_prompt = ""
         if self.skill_manager:
             active_skills_prompt = self.skill_manager.build_skills_prompt()
-        
+
         supports_vision = self.llm_client.supports_vision if self.llm_client else False
         system_prompt = self.current_persona.build_system_prompt(
-            tool_descriptions,
             agent_name=self.current_agent_name or "",
             model_name=model_name,
             memory_content=memory_content,
@@ -596,6 +683,8 @@ class CBHCLIApp:
             cwd=os.getcwd(),
             supports_vision=supports_vision
         )
+        # 注入当前权限模式说明（readonly/auto/yolo 时告知模型行为边界）
+        system_prompt += self._permission_mode_note()
         system_token_count = self.token_counter.count_tokens(system_prompt)
         self.session.add_message("system", system_prompt, token_count=system_token_count)
         
@@ -626,8 +715,6 @@ class CBHCLIApp:
         if not self.session or not self.current_persona or not self.current_agent_config:
             return
         
-        tool_descriptions = self.tool_registry.get_tool_descriptions()
-        
         # 获取模型名称
         model_name = ""
         if self.llm_client and hasattr(self.llm_client, 'model_name'):
@@ -643,7 +730,6 @@ class CBHCLIApp:
         
         supports_vision = self.llm_client.supports_vision if self.llm_client else False
         system_prompt = self.current_persona.build_system_prompt(
-            tool_descriptions,
             agent_name=self.current_agent_name or "",
             model_name=model_name,
             memory_content=memory_content,
@@ -651,7 +737,9 @@ class CBHCLIApp:
             cwd=os.getcwd(),
             supports_vision=supports_vision
         )
-        
+        # 注入当前权限模式说明（与 _reset_session 保持一致）
+        system_prompt += self._permission_mode_note()
+
         # 原地替换 system 消息
         if self.session.messages and self.session.messages[0].role == "system":
             self.session.messages[0].content = system_prompt
@@ -675,6 +763,42 @@ class CBHCLIApp:
             else:
                 self.context_window.tools_schema_tokens = 0
     
+    # ==================================================================
+    #  权限模式管理（Harness 治理层）
+    # ==================================================================
+
+    def cycle_permission_mode(self) -> str:
+        """Shift+Tab 循环切换权限模式（由输入框快捷键调用）
+
+        Returns:
+            切换后的新模式名
+        """
+        old_mode = self.permission_engine.mode
+        new_mode = self.permission_engine.cycle_mode()
+        if getattr(self, "tracer", None):
+            self.tracer.log_mode_change(old_mode, new_mode)
+        # 模式说明注入系统提示（原地更新，不影响会话）
+        self._update_system_prompt()
+        return new_mode
+
+    def set_permission_mode(self, mode: str) -> bool:
+        """/mode 命令设置权限模式"""
+        if not self.permission_engine or mode not in MODE_META:
+            return False
+        old_mode = self.permission_engine.mode
+        self.permission_engine.set_mode(mode)
+        if getattr(self, "tracer", None):
+            self.tracer.log_mode_change(old_mode, mode)
+        self._update_system_prompt()
+        return True
+
+    def _permission_mode_note(self) -> str:
+        """根据当前权限模式生成注入系统提示的说明文本"""
+        if not getattr(self, "permission_engine", None):
+            return ""
+        from cbhcli_pkg.core.permissions import build_mode_note
+        return build_mode_note(self.permission_engine.mode)
+
     def _load_memory_md(self) -> str:
         """读取 memory.md 文件内容
         
@@ -704,19 +828,306 @@ class CBHCLIApp:
                 pass
         return ""
     
-    def _compress_context(self) -> bool:
-        """压缩上下文"""
+    # ════════════════════════════════════════════════
+    # QQ Bot 消息处理回调
+    # ════════════════════════════════════════════════
+    
+    def _create_qqbot_callback(self, bot_name: str):
+        """创建 QQ Bot 消息处理回调
+        
+        将 QQ 消息转发给指定 Agent 进行 AI 处理，然后将回复发回 QQ。
+        
+        QQ 与 CLI 共享同一个会话 (app.session)，这样：
+        - CLI 和 QQ 的对话上下文互通
+        - /reset /new 在 QQ 端触发时，与 CLI 端行为一致（保存历史 + 新建会话）
+        - 历史会话自动保存到 agent 的 history/ 文件夹
+        
+        Args:
+            bot_name: QQ Bot 名称
+            
+        Returns:
+            回调函数 (QQMessage) -> str
+        """
+        app_ref = self  # 捕获引用
+        
+        def handle_qq_message(qq_msg) -> str:
+            """处理 QQ 消息：转发给 Agent → AI 处理 → 返回回复"""
+            from cbhcli_pkg.core.model import LLMClient
+            
+            # ---- 斜杠命令处理 ----
+            content = qq_msg.content.strip()
+            session_key = (qq_msg.author_id, qq_msg.message_type)
+            
+            if content.startswith('/'):
+                cmd = content.split()[0].lower()
+                
+                if cmd in ('/reset', '/new'):
+                    # 与 CLI 的 /reset /new 行为一致：保存当前会话到 history，然后新建会话
+                    if app_ref.session and app_ref.session_history and len(app_ref.session.messages) > 1:
+                        try:
+                            ctx_msgs = app_ref.session.get_context_messages()
+                            app_ref.session_history.save_session(ctx_msgs, app_ref.session.id)
+                        except Exception:
+                            pass
+                    # 重置会话（会自动保存历史 + 创建新会话 + 重建系统提示）
+                    app_ref._reset_session(save_current=True)
+                    # 清空 message_handler 上下文
+                    bot = app_ref.qqbot_service._instances.get(bot_name)
+                    if bot and bot.message_handler:
+                        bot.message_handler._contexts.pop(session_key, None)
+                    return "✅ 会话已重置，新对话已开启。（历史会话已保存）"
+                
+                elif cmd == '/ctx':
+                    if not app_ref.session:
+                        return "📊 当前无活跃会话。"
+                    import json as _json
+                    total = 0
+                    for m in app_ref.session.messages:
+                        total += app_ref.token_counter.count_tokens(
+                            _json.dumps(m.to_dict(), ensure_ascii=False)
+                        )
+                    model_limit = app_ref.llm_client.context_limit if app_ref.llm_client else 128000
+                    pct = total / model_limit * 100 if model_limit else 0
+                    return f"📊 上下文: {total:,} tokens / {model_limit:,} ({pct:.1f}%)，共 {len(app_ref.session.messages)} 条消息。"
+                
+                elif cmd == '/comp':
+                    if not app_ref.session:
+                        return "📊 当前无活跃会话，无需压缩。"
+                    sess = app_ref.session
+                    # 简单压缩：保留 system + 最近6条
+                    system_msgs = [m for m in sess.messages if m.role == "system"]
+                    other_msgs = [m for m in sess.messages if m.role != "system"]
+                    kept = other_msgs[-6:] if len(other_msgs) > 6 else other_msgs
+                    sess.messages = system_msgs + kept
+                    import json as _json
+                    total = sum(
+                        app_ref.token_counter.count_tokens(_json.dumps(m.to_dict(), ensure_ascii=False))
+                        for m in sess.messages
+                    )
+                    return f"✅ 上下文已压缩，当前 {total} tokens，{len(sess.messages)} 条消息。"
+            
+            # ---- AI 处理 ----
+            # 1. 确定目标 Agent
+            bot_config = app_ref.qqbot_service.config_manager.get(bot_name)
+            target_agent = bot_config.target_agent if bot_config and bot_config.target_agent else app_ref.current_agent_name
+            if not target_agent:
+                return "⚠️ 没有可用的 Agent，请先 /agent use <名称>"
+            
+            # 2. 检查模型和会话
+            if not app_ref.llm_client:
+                return "⚠️ 模型未配置"
+            if not app_ref.session:
+                return "⚠️ 会话未初始化"
+            
+            # 3. 直接使用 app_ref 的会话和模型（与 CLI 共享同一会话）
+            llm = app_ref.llm_client
+            session = app_ref.session
+            
+            # 4. 构建上下文消息
+            context_prefix = (
+                f"[QQ消息 - 请直接文字回复，不要使用工具询问用户]\n"
+                f"来自用户: {qq_msg.author_name}\n"
+                f"消息类型: {'群聊' if qq_msg.message_type == 'group' else '私聊'}\n"
+            )
+            if qq_msg.group_id:
+                context_prefix += f"群ID: {qq_msg.group_id}\n"
+            
+            # 处理附件
+            image_base64_list = []
+            download_dir = Path.home() / ".cbhcli" / "qqbot_downloads"
+            
+            if qq_msg.attachments:
+                download_dir.mkdir(parents=True, exist_ok=True)
+                att_desc_parts = []
+                
+                for att in qq_msg.attachments:
+                    ct = att.get('content_type', '')
+                    fn = att.get('filename', '') or 'unnamed'
+                    url = att.get('url', '')
+                    
+                    local_path = ""
+                    if url:
+                        try:
+                            import requests as _r
+                            file_resp = _r.get(url, timeout=30)
+                            if file_resp.status_code == 200:
+                                safe_fn = fn.replace('/', '_').replace('\\', '_')
+                                local_path = str(download_dir / safe_fn)
+                                counter = 1
+                                while Path(local_path).exists():
+                                    name, ext = safe_fn.rsplit('.', 1) if '.' in safe_fn else (safe_fn, '')
+                                    local_path = str(download_dir / f"{name}_{counter}.{ext}" if ext else f"{name}_{counter}")
+                                    counter += 1
+                                with open(local_path, 'wb') as f:
+                                    f.write(file_resp.content)
+                        except Exception:
+                            local_path = ""
+                    
+                    if ct.startswith('image/'):
+                        att_desc_parts.append(f"[图片: {fn}]")
+                        if local_path:
+                            att_desc_parts[-1] += f" → {local_path}"
+                        if llm.supports_vision and local_path:
+                            try:
+                                import base64 as _b64
+                                with open(local_path, 'rb') as f:
+                                    image_base64_list.append(_b64.b64encode(f.read()).decode('utf-8'))
+                            except Exception:
+                                pass
+                    elif ct.startswith('video/'):
+                        att_desc_parts.append(f"[视频: {fn}]")
+                        if local_path:
+                            att_desc_parts[-1] += f" → {local_path}"
+                    elif ct.startswith('audio/') or ct == 'voice':
+                        # 语音消息：优先用 QQ 官方 ASR，没有则自动调用本地脚本识别
+                        asr_text = att.get('asr_refer_text', '')
+                        if asr_text:
+                            qq_msg.content = asr_text
+                            att_desc_parts.append(f"[语音识别: {asr_text}]")
+                        elif local_path:
+                            # QQ ASR 不可用，自动调用本地识别脚本
+                            try:
+                                import subprocess as _sp
+                                script = "/home/administrator/.cbhcli/agents/qqbot/skills/qq-voice-recognition/script/recognize_qq_voice.py"
+                                result = _sp.run(
+                                    ["python3", script, local_path],
+                                    capture_output=True, text=True, timeout=60
+                                )
+                                if result.returncode == 0 and result.stdout.strip():
+                                    asr_text = result.stdout.strip()
+                                    qq_msg.content = asr_text
+                                    att_desc_parts.append(f"[语音识别: {asr_text}]")
+                                else:
+                                    att_desc_parts.append(f"[语音: {fn}] → {local_path}")
+                            except Exception:
+                                att_desc_parts.append(f"[语音: {fn}] → {local_path}")
+                        else:
+                            att_desc_parts.append(f"[语音: {fn}]")
+                    else:
+                        att_desc_parts.append(f"[文件: {fn}]")
+                        if local_path:
+                            att_desc_parts[-1] += f" → {local_path}"
+                
+                if att_desc_parts:
+                    context_prefix += f"附件已下载到 {download_dir}/:\n"
+                    for p in att_desc_parts:
+                        context_prefix += f"  {p}\n"
+                    context_prefix += "你可以使用 read 工具读取文件内容。\n"
+            
+            context_prefix += f"\n用户消息: {qq_msg.content}"
+            
+            # 5. 创建 AIHandler 并处理（使用 app_ref 的会话，与 CLI 共享）
+            handler = AIHandler(
+                llm_client=llm,
+                session=session,
+                tool_executor=app_ref.tool_executor,
+                token_counter=app_ref.token_counter,
+            )
+            handler.subagent_scheduler = app_ref.subagent_scheduler
+            handler.agent_name = target_agent
+
+            # 注入备用主模型列表（与 CLI handler 保持一致）
+            from cbhcli_pkg.config.global_config import GlobalConfig
+            gc = GlobalConfig()
+            handler.fallback_models = gc.get_fallback_models()
+
+            # 注入上下文压缩相关组件（用于 ReAct 循环内自动压缩）
+            handler.context_compressor = app_ref.context_compressor
+            handler.context_window = app_ref.context_window
+            handler.auto_compress = True
+
+            old_confirm = app_ref.tool_executor.no_more_confirmations
+            app_ref.tool_executor.no_more_confirmations = True
+            
+            try:
+                # 清理孤儿 tool 消息（持久会话中上轮遗留，无前置 tool_calls 会导致 API 400）
+                msgs = session.messages
+                cleaned = []
+                for i, m in enumerate(msgs):
+                    if m.role == "tool":
+                        has_tool_calls = False
+                        for j in range(i - 1, -1, -1):
+                            prev = msgs[j]
+                            if prev.role == "assistant":
+                                if prev.tool_calls:
+                                    has_tool_calls = True
+                                break
+                            elif prev.role == "tool":
+                                continue
+                            else:
+                                break
+                        if not has_tool_calls:
+                            continue
+                    cleaned.append(m)
+                session.messages = cleaned
+
+                # v4.9.5+: process_request 不再接受 images 参数
+                # 如有图片，先手动追加带图 user 消息到会话
+                if image_base64_list:
+                    # 将图片作为单独的 user 消息追加（多模态格式）
+                    img_note = f"[QQ附件图片 {len(image_base64_list)} 张]"
+                    img_msg = Message(
+                        role="user",
+                        content=img_note,
+                        token_count=app_ref.token_counter.count_tokens(img_note),
+                        images=image_base64_list
+                    )
+                    session.messages.append(img_msg)
+
+                response = handler.process_request(context_prefix)
+                reply = response or "（AI 未返回内容）"
+                
+                # 存储 AI 回复到 message_handler 上下文
+                bot = app_ref.qqbot_service._instances.get(bot_name)
+                if bot and bot.message_handler:
+                    from cbhcli_pkg.qqbot.message_handler import QQMessage
+                    ctx_key = (qq_msg.author_id, qq_msg.message_type)
+                    reply_msg = QQMessage(
+                        msg_id="ai_" + qq_msg.msg_id,
+                        content=reply,
+                        author_id=qq_msg.author_id,
+                        author_name="AI",
+                        timestamp="",
+                        event_type="",
+                        message_type=qq_msg.message_type,
+                        role="assistant",
+                    )
+                    bot.message_handler._contexts[ctx_key].append(reply_msg)
+                
+                return reply
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"QQ消息AI处理失败: {e}", exc_info=True)
+                return f"抱歉，处理消息时出错了：{e}"
+            finally:
+                app_ref.tool_executor.no_more_confirmations = old_confirm
+        
+        return handle_qq_message
+    
+
+    def _compress_context(self, instructions: str = "") -> bool:
+        """压缩上下文
+
+        Args:
+            instructions: 可选的压缩指令（保留/丢弃重点），透传给摘要模型
+        """
         if not self.context_compressor or not self.session:
             return False
-        target_tokens = self.context_window.trigger_threshold()
-        return self.context_compressor.compress(self.session, target_tokens)
+        before = self.session.get_total_tokens(self.token_counter)
+        target_tokens = self.context_window.compression_target()
+        success = self.context_compressor.compress(
+            self.session, target_tokens, instructions=instructions or None)
+        if getattr(self, "tracer", None):
+            after = self.session.get_total_tokens(self.token_counter)
+            self.tracer.log_compress(success, before, after)
+        return success
     
     def _check_and_compress_context(self):
         """检查并自动压缩上下文"""
         if not self.context_window or not self.session:
             return
         
-        total_tokens = self.session.get_total_tokens()
+        total_tokens = self.session.get_total_tokens(self.token_counter)
         self.context_window.update(total_tokens)
         
         if (self.current_agent_config and
@@ -765,15 +1176,7 @@ class CBHCLIApp:
                 
                 # 处理AI请求
                 if self.llm_client and self.session:
-                    # 检测图片路径
-                    images = []
-                    if self.llm_client.supports_vision:
-                        image_paths = self._extract_image_paths(user_input)
-                        if image_paths:
-                            images = self._load_images_as_base64(image_paths)
-                            if images:
-                                print(f"\n{C_DIM}📷 检测到 {len(images)} 张图片{C_RESET}")
-                    self._handle_ai_request(user_input, images)
+                    self._handle_ai_request(user_input)
                 else:
                     print(f"\n{C_DIM}当前Agent未配置模型。请使用 /model 命令配置模型。{C_RESET}")
                 
@@ -784,168 +1187,24 @@ class CBHCLIApp:
                 print(f"\n错误: {str(e)}{C_RESET}")
                 continue
     
-    def _extract_image_paths(self, text: str) -> list[str]:
-        """从用户输入中提取图片路径
-
-        触发条件（必须同时满足）：
-        1. 用户有明确的图片识别意图（包含动作词：查看/识别/看看/分析图片等）
-        2. 输入中包含显式图片路径 或 从上下文可找到图片
-
-        Args:
-            text: 用户输入文本
-
-        Returns:
-            图片路径列表
-        """
-        # 意图检测：必须同时包含动作词和对象词（允许中间有路径等文字）
-        # 例如: "识别/path/to/image.png图片" -> 动作词"识别" + 对象词"图片"
-        action_words = ['识别', '查看', '看看', '分析', '读取', '看一下', '这是什么']
-        object_words = ['图片', '图像', '截图', '照片', '图表']
-        has_action = any(w in text for w in action_words)
-        has_object = any(w in text for w in object_words)
-        has_vision_intent = has_action and has_object
-
-        if not has_vision_intent:
-            return []
-
-        # 模式1: 匹配显式图片路径
-        image_paths = []
-        path_patterns = [
-            r'(/[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
-            r'(~/[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
-            r'(\./[\w\u4e00-\u9fff./\ -]+\.(?:jpg|jpeg|png|gif|bmp|webp))',
-        ]
-
-        for pattern in path_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                expanded = os.path.expanduser(match.strip())
-                if os.path.exists(expanded):
-                    image_paths.append(expanded)
-
-        if image_paths:
-            return image_paths
-
-        # 模式2: 从上下文搜索图片
-        return self._search_images_in_context(text)
-
-    def _search_images_in_context(self, text: str) -> list[str]:
-        """从对话上下文中搜索图片
-
-        当用户要求查看图片但没有显式指定路径时，从会话历史中找到图片目录并搜索
-        """
-        IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
-
-        # 支持"当前路径/当前目录"
-        current_dir_keywords = ['当前路径', '当前目录', '当前文件夹', '这个目录']
-        use_cwd = any(kw in text for kw in current_dir_keywords)
-
-        # 支持"这些/所有"
-        all_keywords = ['这些', '所有', '全部', '上面', '刚才']
-        want_all = any(kw in text for kw in all_keywords)
-
-        # 从会话历史中收集图片路径
-        recent_images_from_history = []
-        recent_image_dir = None
-
-        if self.session:
-            for msg in reversed(self.session.messages):
-                content = msg.content if isinstance(msg.content, str) else ''
-                for ext in IMAGE_EXTENSIONS:
-                    pattern = r'(/[\w\u4e00-\u9fff./\ -]+' + re.escape(ext) + r')'
-                    matches = re.findall(pattern, content, re.IGNORECASE)
-                    for match in matches:
-                        match = match.strip()
-                        if os.path.exists(match) and match not in recent_images_from_history:
-                            recent_images_from_history.append(match)
-                            if not recent_image_dir:
-                                recent_image_dir = os.path.dirname(match)
-
-        # "这些/所有" 直接返回历史中的图片
-        if want_all and len(recent_images_from_history) > 1:
-            return recent_images_from_history
-
-        # 确定搜索目录
-        search_dir = None
-        if use_cwd:
-            search_dir = os.getcwd()
-        elif recent_image_dir and os.path.isdir(recent_image_dir):
-            search_dir = recent_image_dir
-
-        if not search_dir:
-            return []
-
-        # 搜索目录中的图片
-        all_images = []
-        try:
-            for f in os.listdir(search_dir):
-                if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
-                    all_images.append(os.path.join(search_dir, f))
-        except PermissionError:
-            return []
-
-        if not all_images:
-            return []
-
-        if want_all:
-            return all_images
-
-        # 关键词匹配
-        matched = []
-        for img_path in all_images:
-            filename = os.path.splitext(os.path.basename(img_path))[0]
-            if filename in text:
-                matched.append(img_path)
-            else:
-                for i in range(len(filename) - 1):
-                    substr = filename[i:i+2]
-                    if '\u4e00' <= substr[0] <= '\u9fff' and '\u4e00' <= substr[1] <= '\u9fff':
-                        if substr in text:
-                            matched.append(img_path)
-                            break
-
-        if matched:
-            return matched
-
-        # 无匹配返回全部
-        return all_images
-
-    def _load_images_as_base64(self, image_paths: list[str]) -> list[str]:
-        """将图片文件加载为base64编码
-
-        Args:
-            image_paths: 图片文件路径列表
-
-        Returns:
-            base64编码的图片数据列表
-        """
-        import mimetypes
-        
-        base64_images = []
-        for path in image_paths:
-            try:
-                # 检测图片类型
-                mime_type, _ = mimetypes.guess_type(path)
-                if not mime_type or not mime_type.startswith('image/'):
-                    print(f"\n{C_DIM}⚠️  跳过非图片文件: {path}{C_RESET}")
-                    continue
-                
-                # 读取并编码图片
-                with open(path, 'rb') as f:
-                    image_data = f.read()
-                    base64_data = base64.b64encode(image_data).decode('utf-8')
-                    base64_images.append(base64_data)
-                    
-            except Exception as e:
-                print(f"\n{C_DIM}⚠️  加载图片失败 {path}: {str(e)}{C_RESET}")
-        
-        return base64_images
-
-    def _handle_ai_request(self, user_input: str, images: list[str] = None):
+    def _handle_ai_request(self, user_input: str):
         """处理AI请求 - 委托给AIHandler"""
         # 检查上下文压缩
         self._check_and_compress_context()
-        
+
+        # UserPromptSubmit 钩子：stdout 追加为用户上下文（如 git 分支状态）
+        if getattr(self, "hook_manager", None) and \
+                self.hook_manager.has_hooks("UserPromptSubmit"):
+            decision = self.hook_manager.run_simple(
+                "UserPromptSubmit",
+                extra_args={"prompt": user_input},
+                session_id=self.session.id if self.session else "")
+            extra = decision.merged_output()
+            if extra:
+                user_input = f"{user_input}\n\n[钩子补充上下文]\n{extra}"
+            for warn in decision.warnings:
+                print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
+
         # 创建AI处理器
         handler = AIHandler(
             self.llm_client,
@@ -953,16 +1212,39 @@ class CBHCLIApp:
             self.tool_executor,
             self.token_counter
         )
-        
+
         # 注入子Agent调度器
         handler.subagent_scheduler = self.subagent_scheduler
         handler.agent_name = self.current_agent_name or "main"
-        
+
+        # 注入备用主模型列表
+        from cbhcli_pkg.config.global_config import GlobalConfig
+        gc = GlobalConfig()
+        handler.fallback_models = gc.get_fallback_models()
+
+        # 注入上下文压缩相关组件（用于 ReAct 循环内自动压缩）
+        handler.context_compressor = self.context_compressor
+        handler.context_window = self.context_window
+        handler.auto_compress = (
+            self.current_agent_config.auto_compress
+            if self.current_agent_config else True
+        )
+
         # 设置记忆更新回调
         handler.on_memory_update(self._update_memory)
-        
+
         # 处理请求
-        handler.process_request(user_input, images=images if images else None)
+        handler.process_request(user_input)
+
+        # Stop 钩子：AI 回复完成后触发（通知/自动保存等）
+        if getattr(self, "hook_manager", None) and \
+                self.hook_manager.has_hooks("Stop"):
+            decision = self.hook_manager.run_simple(
+                "Stop", session_id=self.session.id if self.session else "")
+            for line in decision.outputs:
+                print(f"{C_DIM}[hook:Stop] {line}{C_RESET}")
+            for warn in decision.warnings:
+                print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
     
     def _update_memory(self, user_input: str, ai_response: str):
         """更新记忆回调 - 仅用于保存会话历史
@@ -972,16 +1254,82 @@ class CBHCLIApp:
         """
         pass  # 会话历史在 _reset_session 时自动保存
     
+    # 权限模式在欢迎面板中的圆点颜色（ANSI）
+    _MODE_ANSI = {
+        "readonly": "\033[94m",   # 亮蓝
+        "standard": "\033[92m",   # 亮绿
+        "auto": "\033[93m",       # 亮黄
+        "yolo": "\033[91m",       # 亮红
+    }
+
     def _show_welcome(self):
-        """显示欢迎信息"""
+        """显示欢迎信息（ASCII 艺术字 + 信息面板）
+
+        全部使用宽度安全的字符（█/╗/● 等宽1字符），动态内容用
+        text_width.display_width（字素簇感知）计算补齐，杜绝 emoji
+        宽度歧义导致的边框错位。
+        """
         from cbhcli_pkg import __version__
-        tw = self._get_terminal_width()
-        print(f"\n{C_SEP}{'═' * tw}{C_RESET}")
-        print(f"  CBHCLI v{__version__} - AI命令行助手")
-        print(f"{C_DIM}  输入 'quit' 退出 | /help 查看帮助{C_RESET}")
-        if self.current_agent_name:
-            print(f"{C_DIM}  当前Agent: {self.current_agent_name}{C_RESET}")
-        print(f"{C_SEP}{'═' * tw}{C_RESET}\n")
+        from cbhcli_pkg.core.text_width import display_width as _dw
+
+        # CBHCLI 艺术字（46 列宽，纯宽1字符）
+        art = [
+            " ██████╗██████╗ ██╗  ██╗ ██████╗██╗     ██╗",
+            "██╔════╝██╔══██╗██║  ██║██╔════╝██║     ██║",
+            "██║     ██████╔╝███████║██║     ██║     ██║",
+            "██║     ██╔══██╗██╔══██║██║     ██║     ██║",
+            "╚██████╗██████╔╝██║  ██║╚██████╗███████╗██║",
+            " ╚═════╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝",
+        ]
+        C_ART = "\033[96m"      # 亮青
+        C_TXT = "\033[97m"      # 亮白
+        C_VAL = "\033[36m"      # 青
+
+        agent = self.current_agent_name or "main"
+        model_name = ""
+        if self.llm_client and hasattr(self.llm_client, 'model_name'):
+            model_name = self.llm_client.model_name
+        elif self.current_agent_config and self.current_agent_config.primary_model:
+            model_name = self.current_agent_config.primary_model
+        mode = self.permission_engine.mode \
+            if getattr(self, "permission_engine", None) else "standard"
+        mode_meta = MODE_META[mode]
+        mode_ansi = self._MODE_ANSI.get(mode, "")
+
+        # 信息行（分段着色；纯文本部分用于宽度计算）
+        info1 = [(f"v{__version__} · AI 驱动的终端助手", C_DIM)]
+        info2 = [("Agent ", C_DIM), (agent, C_VAL),
+                 ("  │  模型 ", C_DIM), (model_name or "未配置", C_VAL),
+                 ("  │  权限 ", C_DIM), ("●", mode_ansi),
+                 (f" {mode_meta['label']}", C_TXT)]
+        info3 = [("quit 退出 · /help 帮助 · Shift+Tab 切换权限模式", C_DIM)]
+
+        # 内容宽度 = 艺术字、信息行中最宽者
+        def _segs_width(segs):
+            return _dw("".join(t for t, _ in segs))
+
+        content_w = max(
+            max(_dw(line) for line in art),
+            _segs_width(info1), _segs_width(info2), _segs_width(info3),
+        )
+        content_w = min(content_w, self._get_terminal_width() - 6)
+
+        def _row(segments, color: str = "") -> str:
+            body_plain = "".join(t for t, _ in segments)
+            pad = max(0, content_w - _dw(body_plain))
+            body = "".join(
+                f"{c}{t}{C_RESET}" if c else t for t, c in segments)
+            return f"{C_SEP}│{C_RESET} {body}{' ' * pad} {C_SEP}│{C_RESET}"
+
+        border = "─" * (content_w + 2)
+        print(f"\n{C_SEP}╭{border}╮{C_RESET}")
+        for line in art:
+            print(_row([(line, C_ART)]))
+        print(_row([("", "")]))  # 空行
+        print(_row(info1))
+        print(_row(info2))
+        print(_row(info3))
+        print(f"{C_SEP}╰{border}╯{C_RESET}\n")
     
     @staticmethod
     def _get_terminal_width() -> int:
@@ -993,115 +1341,7 @@ class CBHCLIApp:
     
     def _get_input(self) -> str:
         """获取用户输入（带输入框）"""
-        agent = self.current_agent_name or ""
-        tw = self._get_terminal_width()
-        
-        # === 状态栏：模型名 | 上下文占比 | 当前路径 ===
-        model_name = "未配置模型"
-        if self.llm_client and hasattr(self.llm_client, 'model_name'):
-            model_name = self.llm_client.model_name
-        elif self.current_agent_config and self.current_agent_config.primary_model:
-            model_name = self.current_agent_config.primary_model
-        
-        ctx_info = ""
-        if self.session and self.context_window:
-            total_tokens = self.session.get_total_tokens()
-            self.context_window.update(total_tokens)
-            pct = self.context_window.usage_percentage() * 100
-            limit = self.context_window.model_limit
-            ctx_info = f"{total_tokens:,}/{limit:,} ({pct:.1f}%)"
-        
-        cwd = os.getcwd()
-        
-        status_parts = []
-        status_parts.append(f"\033[1;36m{model_name}{C_RESET}")
-        if ctx_info:
-            status_parts.append(f"{C_DIM}ctx: {ctx_info}{C_RESET}")
-        status_parts.append(f"{C_DIM}{cwd}{C_RESET}")
-        print(f"  {' | '.join(status_parts)}")
-        
-        # === 已激活技能显示 ===
-        if self.skill_manager:
-            active_names = self.skill_manager.get_active_skill_names()
-            if active_names:
-                skills_str = ', '.join(active_names)
-                print(f"  \033[1;33mskills:\033[0m {C_DIM}{skills_str}{C_RESET}")
-        
-        # === 顶部边框 ===
-        title = f" {agent} "
-        hint = " Enter:发送 | Alt+Enter:换行 "
-        title_len = self._display_width(title)
-        hint_len = self._display_width(hint)
-        mid_len = max(tw - 2 - 2 - title_len - 2 - hint_len, 1)
-        print(
-            f"{C_SEP}╭──\033[1;36m{title}{C_SEP}"
-            f"{'─' * mid_len}"
-            f"{C_DIM}{hint}{C_SEP}──╮{C_RESET}"
-        )
-        
-        prompt_str = ANSI(f"{C_SEP}│{C_RESET} ")
-        
-        # === 重置补全状态 ===
-        self._completions = []
-        self._comp_index = -1
-        self._comp_dismissed = False
-        self._comp_last_text = ''
-        
-        # === 底部边框 + 补全菜单（固定行数，避免输入框跳动）===
-        MAX_COMP_LINES = 10  # 补全区域固定行数
-        bottom_line = '╰' + '─' * (tw - 2) + '╯'
-        
-        def _bottom_toolbar():
-            # 获取当前输入文本
-            try:
-                text = self.prompt_session.app.current_buffer.text
-            except Exception:
-                text = ''
-            
-            # 文本变化时重新计算补全，并重置选中和 dismissed
-            if text != self._comp_last_text:
-                self._comp_last_text = text
-                self._comp_dismissed = False
-                self._comp_index = -1
-                self._completions = self._cmd_helper.compute(text)
-            
-            # 构建 toolbar 内容：底部边框（第1行）
-            result = [('class:bottom-toolbar', bottom_line)]
-            
-            show_comps = self._completions and not self._comp_dismissed
-            visible = self._completions[:MAX_COMP_LINES] if show_comps else []
-            
-            # 修正 index 越界
-            if self._comp_index >= len(self._completions):
-                self._comp_index = -1
-            
-            # 填充固定行数（有补全时显示内容，无内容时空行占位）
-            for i in range(MAX_COMP_LINES):
-                result.append(('', '\n'))
-                if i < len(visible):
-                    display, desc, _full_cmd = visible[i]
-                    if i == self._comp_index:
-                        line = f'  {display:<20s} {desc}'
-                        result.append(('bold bg:#00bcd4 #000000', line))
-                    else:
-                        result.append(('#aaaaaa', f'  {display:<20s} '))
-                        result.append(('#666666', desc))
-                # 没有内容的行不输出任何字符，仅占位换行
-            
-            return result
-        
-        try:
-            user_input = self.prompt_session.prompt(
-                prompt_str,
-                style=self.prompt_style,
-                prompt_continuation=prompt_str,
-                bottom_toolbar=_bottom_toolbar,
-            )
-            return user_input.strip()
-        except EOFError:
-            return "quit"
-        except KeyboardInterrupt:
-            return ""
+        return self._chat_input.prompt()
     
     @staticmethod
     def _display_width(text: str) -> int:
@@ -1114,27 +1354,5 @@ class CBHCLIApp:
             return len(text)
     
     def _print_user_input(self, user_input: str):
-        """清除输入框，替换为高亮显示的用户输入"""
-        # prompt_toolkit 提交后会移除 bottom_toolbar，
-        # 终端上剩余：状态栏(1行) + [技能行(0或1行)] + 顶部边框(1行) + 输入内容(N行)
-        input_lines = user_input.count('\n') + 1
-        total_lines = input_lines + 2  # +1 status bar + 1 top border
-        
-        # 如果有已激活技能，多一行技能显示
-        if self.skill_manager and self.skill_manager.get_active_skill_names():
-            total_lines += 1
-        
-        # 向上移动并清除输入框区域
-        for _ in range(total_lines):
-            sys.stdout.write("\033[1A\033[2K")
-        sys.stdout.write("\r")
-        
-        # 打印高亮的用户输入
-        agent = self.current_agent_name or ""
-        prefix = f"[{agent}] " if agent else ""
-        
-        lines = user_input.split('\n')
-        first_line = lines[0]
-        print(f"{C_USER_BG}{C_USER_FG}▌ {prefix}> {first_line}{C_RESET}")
-        for line in lines[1:]:
-            print(f"{C_USER_BG}{C_USER_FG}  {' ' * len(prefix)}  {line}{C_RESET}")
+        """打印用户输入回显（提交后高亮显示）"""
+        self._chat_input.print_user_echo(user_input)

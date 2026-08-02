@@ -13,10 +13,11 @@
 import os
 import json
 import pandas as pd
-from cbhcli_pkg.tools.registry import BaseTool, ToolResult
+from cbhcli_pkg.tools.registry import ToolResult
+from cbhcli_pkg.tools.cbhpacks_session import CbhpacksSessionTool
 
 
-class ConSqlTool(BaseTool):
+class ConSqlTool(CbhpacksSessionTool):
     """cbhpacks 数据库连接工具"""
 
     @property
@@ -42,6 +43,7 @@ class ConSqlTool(BaseTool):
             "  - to_hive: 依赖 con_linux（Linux服务器SSH连接）用于文件传输\n"
             "  - rfms_sql: 生成的SQL需通过con_hive执行\n"
             "  - get_create_table/to_hive 需要CSV数据文件作为输入\n"
+            "  - 查询返回的DataFrame自动注入 python 会话变量 sql_result，可在 python 工具中直接使用\n"
         )
 
     @property
@@ -274,10 +276,17 @@ class ConSqlTool(BaseTool):
             else:
                 return ToolResult(success=False, output="", error=f"未知方法: {method}")
 
+            # 查询结果注入 python 会话（DataFrame 类型才注入）
+            exposed = {}
+            if isinstance(result, pd.DataFrame):
+                exposed['sql_result'] = result
+                self._expose(**exposed)
+
             output = (
                 f"📊 cbhpacks_con_sql.{method} 执行完成\n\n"
                 f"📁 输出文件:\n" + ("\n".join(output_files) if output_files else "  无文件输出") + "\n\n"
                 f"📋 结果:\n{result_text}"
+                + (f"\n\n💡 已注入 python 会话变量: {', '.join(exposed.keys())}" if exposed else "")
             )
             return ToolResult(success=True, output=output)
 

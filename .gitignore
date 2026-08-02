@@ -44,3 +44,11 @@ Thumbs.db
 # Unrelated files
 restart_jupyter.sh
 test_v3.py
+
+# Runtime & temp fix files
+nohup.out
+cbhcli_v5.0.0_*.patch
+cbhcli_v5.0.0_*.tar.gz
+cbhcli_v5.0.0_*.txt
+cbhcli_v5.0.2_web_memory_fix.md
+v5.0.3更新日志.md

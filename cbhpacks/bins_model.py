@@ -407,6 +407,8 @@ class bins_model(get_bins):  # 继承自get_bins类
             woe_final['woe'] = np.log(woe_final['badattr']/woe_final['goodattr'])  # 计算每个箱体的woe值
             woe_final['iv_bin']=(woe_final['badattr']-woe_final['goodattr'])*woe_final['woe']
             iv = ((woe_final['badattr']-woe_final['goodattr'])*woe_final['woe']).sum()
+            if iv == np.inf or iv == -np.inf:
+                iv=0
             woe_final['ks_bin'] = np.abs(woe_final['badattr_cum'] - woe_final['goodattr_cum'])
             woe_final['lift']=woe_final['bad_rate']/bad_total_rate
             woe_final['iv']=iv
@@ -471,6 +473,8 @@ class bins_model(get_bins):  # 继承自get_bins类
             woe_final['woe'] = np.log(woe_final['badattr']/woe_final['goodattr'])  # 计算每个箱体的woe值
             woe_final['iv_bin']=(woe_final['badattr']-woe_final['goodattr'])*woe_final['woe']
             iv = ((woe_final['badattr']-woe_final['goodattr'])*woe_final['woe']).sum()
+            if iv == np.inf or iv == -np.inf:
+                iv=0
             woe_final['ks_bin'] = np.abs(woe_final['badattr_cum'] - woe_final['goodattr_cum'])
             woe_final['lift']=woe_final['bad_rate']/bad_total_rate
             woe_final['iv']=iv
@@ -537,6 +541,8 @@ class bins_model(get_bins):  # 继承自get_bins类
                     merge_df['badattr_cum'] = merge_df['badattr'].cumsum()
                     merge_df['goodattr_cum'] = merge_df['goodattr'].cumsum()
                     iv = ((merge_df['badattr']-merge_df['goodattr'])*merge_df['woe']).sum()
+                    if iv == np.inf or iv == -np.inf:
+                        iv=0
                     merge_df['iv']=iv
                     merge_df['ks'] = merge_df['ks_bin'].max()
                     merge_df['ks_bin'] = np.abs(merge_df['badattr_cum'] - merge_df['goodattr_cum'])
