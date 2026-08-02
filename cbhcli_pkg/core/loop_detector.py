@@ -11,8 +11,12 @@ A. 工具调用循环（ToolCallTracker）
      ③ abort  —— 单请求内干预达上限，跳出 ReAct 循环告知用户
 
 B. 文本生成循环（TextLoopDetector）
-   - 流式输出中尾部块（默认 150 字符）在已生成内容中出现 ≥3 次 → 判定复读
+   - 流式输出中尾部双块（默认 2×150 字符）在最近窗口内重复出现 → 判定复读
    - 用于 reasoning/content 流：截断输出，提示模型简明继续
+   - v5.1.7 修复误报：单块 150 字符在全文统计，正常思考中"先设计后实现"
+     重复写出的模板/骨架片段（如 HTML 头部）会被误判。改为双块整体匹配
+     + 近邻窗口统计，且尾部双块需在窗口内重复 ≥15 次才触发（极度保守），
+     模板回述不再误报，只有连续大量复读才触发
 """
 from __future__ import annotations
 
@@ -31,8 +35,9 @@ LOOP_TRACK_WINDOW = 20         # 签名滑动窗口大小
 
 # 文本循环阈值
 TEXT_LOOP_BLOCK_SIZE = 150     # 复读判定块大小（字符）
-TEXT_LOOP_MAX_REPEAT = 3       # 块出现几次 → 判定复读
+TEXT_LOOP_MAX_REPEAT = 15      # 尾部双块在窗口内出现几次（含自身）→ 判定复读
 TEXT_LOOP_MIN_LEN = 600        # 文本少于此长度不做检测（避免误报）
+TEXT_LOOP_WINDOW = 5000        # 只统计最近窗口内的重复（须 ≥ 双块×15 次才可触发）
 
 # 干预时不计入循环的工具（Todo 等计划工具同参数重复属正常）
 _LOOP_EXEMPT_TOOLS = {"Todo", "ask_user"}
@@ -127,14 +132,20 @@ class ToolCallTracker:
 class TextLoopDetector:
     """文本复读检测器（流式）
 
-    维护规范化后的累计文本；每次 feed 检查尾部块是否在历史内容中
-    重复出现 ≥ TEXT_LOOP_MAX_REPEAT 次。
+    检测"连续复读"而非"内容重复"：
+    - 取尾部 2×block_size 双块（默认 300 字符），要求双块整体在最近
+      TEXT_LOOP_WINDOW 窗口内重复出现。真正的复读循环是连续输出相同
+      内容，双块必然完全匹配；而正常思考中"先设计后实现"的模板回述
+      （如重复 HTML 骨架头部）只有头部单块相同、后续内容不同，双块不匹配。
+    - 只在最近窗口内统计，思考中相隔上万字符的模板重复不算循环。
     """
 
     def __init__(self, block_size: int = TEXT_LOOP_BLOCK_SIZE,
-                 max_repeat: int = TEXT_LOOP_MAX_REPEAT):
+                 max_repeat: int = TEXT_LOOP_MAX_REPEAT,
+                 window: int = TEXT_LOOP_WINDOW):
         self.block_size = block_size
         self.max_repeat = max_repeat
+        self.window = window
         self._text: list[str] = []
         self._len = 0
         self.triggered = False
@@ -153,12 +164,15 @@ class TextLoopDetector:
             return False
 
         full = self._normalize("".join(self._text))
-        if len(full) < self.block_size * self.max_repeat:
+        if len(full) < self.block_size * 2:
             return False
 
-        tail = full[-self.block_size:]
-        # 统计尾部块在全文中出现次数（含尾部自身）
-        count = full.count(tail)
+        # 尾部双块（2×block_size 字符）：连续两块整体匹配才算复读，
+        # 避免单块撞上模板/固定格式片段（如 HTML 头部）造成误报
+        tail = full[-self.block_size * 2:]
+        # 近邻窗口：只统计最近 window 字符内的出现次数（含尾部自身）
+        window = full if len(full) <= self.window else full[-self.window:]
+        count = window.count(tail)
         if count >= self.max_repeat:
             self.triggered = True
             return True
@@ -170,12 +184,12 @@ class TextLoopDetector:
         if not self.triggered:
             return full
         normalized = self._normalize(full)
-        tail = normalized[-self.block_size:]
-        # 找到第一次重复出现的位置，从那里截断（保留一个块）
+        tail = normalized[-self.block_size * 2:]
+        # 找到第一次重复出现的位置，从那里截断（保留一个双块）
         first = normalized.find(tail)
         if first > 0:
             # 按原文比例近似截断（规范化后长度与原文不同，做保守截断）
             ratio = first / max(1, len(normalized))
-            cut = int(len(full) * ratio) + self.block_size
+            cut = int(len(full) * ratio) + self.block_size * 2
             return full[:cut]
         return full
