@@ -839,7 +839,11 @@ class CBHCLIApp:
             if self._compress_context():
                 print("上下文已压缩")
             else:
-                print("压缩失败")
+                err = getattr(self.context_compressor, "last_error", None)
+                if err:
+                    print(f"压缩失败: {err}")
+                else:
+                    print("压缩失败")
     
     def run(self):
         """主运行循环"""

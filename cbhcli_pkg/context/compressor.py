@@ -19,6 +19,7 @@ from typing import Optional
 from cbhcli_pkg.core.session import Session, Message
 from cbhcli_pkg.core.model import LLMClient
 from cbhcli_pkg.context.token_counter import TokenCounter
+from cbhcli_pkg.core.constants import SUMMARY_MAX_TOKENS
 
 # 摘要输入中单条消息的最大字符数（防止超大工具输出撑爆摘要请求）
 MAX_MSG_CHARS = 2000        # user/assistant 消息
@@ -110,6 +111,8 @@ class ContextCompressor:
         self.llm_client = llm_client
         self.token_counter = token_counter
         self.workspace_path = workspace_path
+        # 最近一次压缩失败的原因（供调用方展示），成功时重置为 None
+        self.last_error: Optional[str] = None
 
     # ======================================================================
     # 压缩主流程
@@ -169,8 +172,15 @@ class ContextCompressor:
             summary_budget = target_tokens - kept_tokens
             summary_budget = max(512, summary_budget)
 
-            summary = self._generate_summary(middle_text, instructions,
-                                             max_tokens=summary_budget)
+            try:
+                summary = self._generate_summary(middle_text, instructions,
+                                                 max_tokens=summary_budget)
+            except Exception as e:
+                # 摘要生成失败：不替换会话消息（保持原样），记录错误并返回 False。
+                # 绝不能把失败占位文本当成正常摘要塞进会话，否则会污染上下文。
+                self.last_error = str(e)
+                return False
+            self.last_error = None
 
             # 构建新的消息列表
             new_messages = system_messages.copy()
@@ -288,14 +298,19 @@ class ContextCompressor:
             {"role": "user", "content": f"请总结以下对话:\n\n{text}"}
         ]
 
-        try:
-            kwargs = {"temperature": 0.3}
-            if max_tokens:
-                kwargs["max_tokens"] = max_tokens
-            summary = self.llm_client.chat(messages, **kwargs)
-            return summary
-        except Exception as e:
-            return f"[压缩失败: {str(e)}]\n\n{text[:500]}..."
+        # 封顶 max_tokens：摘要预算（窗口30%-保留token）可能超过 API 的 max_tokens
+        # 上限（如 131072）导致 400 invalid_parameter_error。SUMMARY_MAX_TOKENS(64k)
+        # 对结构化摘要足够，且兼容主流 API。
+        if max_tokens:
+            max_tokens = min(max_tokens, SUMMARY_MAX_TOKENS)
+        else:
+            max_tokens = SUMMARY_MAX_TOKENS
+
+        kwargs = {"temperature": 0.3, "max_tokens": max_tokens}
+        # 失败时直接抛出异常（不再返回 [压缩失败...] 占位文本），由 compress() 捕获
+        # 后保持会话原样并返回 False，避免失败被伪装成"压缩成功"污染上下文。
+        summary = self.llm_client.chat(messages, **kwargs)
+        return summary
 
     # ======================================================================
     # 压缩备份（/undo-compress 可撤销）

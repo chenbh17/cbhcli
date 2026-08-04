@@ -7,6 +7,9 @@ DEFAULT_CONTEXT_LIMIT = 128000
 DEFAULT_COMPRESSION_RATIO = 0.8
 COMPRESSION_TARGET_RATIO = 0.3  # 压缩后目标 token 比例（压缩到窗口的 30%，避免压缩后立即再次触发）
 MIN_MESSAGES_FOR_COMPRESSION = 6
+# 摘要生成的 max_tokens 硬上限：摘要预算（窗口30%-保留token）可能超过 API 的 max_tokens
+# 上限（如 131072）导致 400 错误，故封顶到此值。64k 对结构化摘要足够且兼容主流 API。
+SUMMARY_MAX_TOKENS = 65536
 
 # =============================================================================
 # 思考内容显示

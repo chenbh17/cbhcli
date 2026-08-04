@@ -1,9 +1,24 @@
 """LLM客户端 - 统一API调用封装"""
 import requests
 import json
+import signal
 from typing import Iterator, Optional
 
 from cbhcli_pkg.core.constants import API_TIMEOUT
+
+
+def _ensure_sigint_handler():
+    """确保 SIGINT 由 Python 默认处理器接管（Ctrl+C 抛 KeyboardInterrupt）。
+
+    某些依赖（如 chromadb 的 Rust/Tokio 内核）启动后台运行时会把 SIGINT
+    置为 SIG_IGN，导致流式响应期间 Ctrl+C 无法中断。这里在每次阻塞读取前
+    重新声明默认处理器，保证可中断。
+    """
+    try:
+        if signal.getsignal(signal.SIGINT) is signal.SIG_IGN:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+    except Exception:
+        pass
 
 
 class LLMClient:
@@ -244,6 +259,8 @@ class LLMClient:
         if response.status_code != 200:
             raise Exception(f"API请求失败: {response.status_code} - {response.text}")
         
+        # 阻塞读取前确保 Ctrl+C 可中断（对抗 Rust 运行时设置的 SIG_IGN）
+        _ensure_sigint_handler()
         for line in response.iter_lines():
             if line:
                 line_str = line.decode('utf-8')

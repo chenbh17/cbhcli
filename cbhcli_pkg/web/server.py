@@ -96,7 +96,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.1.7")
+app = FastAPI(title="CBHCLI Web", version="5.1.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2186,7 +2186,9 @@ async def _react_loop(cs: WebChatSession):
                     yield _sse({"type": "compressed",
                                 "content": f"上下文已压缩 ({cs.context_window.get_status_text()})"})
                 else:
-                    yield _sse({"type": "compress_failed", "content": "压缩失败，继续执行"})
+                    err = getattr(cs.context_compressor, "last_error", None)
+                    msg = f"压缩失败: {err}，继续执行" if err else "压缩失败，继续执行"
+                    yield _sse({"type": "compress_failed", "content": msg})
 
         messages = cs.session.get_context_messages()
         # 防御性修复：补全缺失 tool 消息 / 移动插队的 user 消息
@@ -3162,6 +3164,11 @@ async def chat_compress(req: Request):
         raise HTTPException(500, f"压缩失败: {e}")
 
     if not success:
+        # 区分"压缩失败"和"无需压缩"：last_error 有值说明摘要生成真的失败了
+        err = getattr(cs.context_compressor, "last_error", None)
+        if err:
+            return {"message": f"压缩失败: {err}", "compressed": False,
+                    "usage": cs.usage_stats()}
         return {"message": "上下文较短，无需压缩", "compressed": False,
                 "usage": cs.usage_stats()}
 

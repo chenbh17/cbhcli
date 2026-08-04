@@ -153,6 +153,10 @@ def register_session_commands(parser, app):
                 return f"✅ 上下文已压缩（按指令: {instructions}）"
             return "✅ 上下文已压缩"
         else:
+            # 区分"压缩失败"和"无需压缩"：last_error 有值说明摘要生成真的失败了
+            err = getattr(app.context_compressor, "last_error", None)
+            if err:
+                return f"❌ 压缩失败: {err}"
             return "ℹ️  上下文较短,无需压缩"
 
     parser.register(SlashCommand(

@@ -44,6 +44,3 @@ Thumbs.db
 # Unrelated files
 restart_jupyter.sh
 test_v3.py
-
-# Runtime
-nohup.out

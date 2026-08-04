@@ -134,7 +134,7 @@ def _add_model(app):
     # reasoning_effort 参数：thinking=off 时不能配置（DeepSeek 等 API 报 400）
     reasoning_effort = None
     while True:
-        reasoning_effort_str = ask_text("reasoning_effort 参数 (如 low/medium/high/max，留空不传): ").strip()
+        reasoning_effort_str = ask_text("reasoning_effort 参数 (如 minimum/low/medium/high/xhigh/max，留空不传): ").strip()
         if not reasoning_effort_str:
             break
         if reasoning_effort_str.lower() == 'none':
@@ -486,7 +486,7 @@ def _config_model(app, param):
     current_reasoning_effort = model_config.get('reasoning_effort')
     reasoning_display = str(current_reasoning_effort) if current_reasoning_effort is not None else "不传该参数"
     while True:
-        reasoning_str = ask_text(f"reasoning_effort 参数 (当前: {reasoning_display}, 如 low/medium/high/max, 输入 none 清除): ").strip()
+        reasoning_str = ask_text(f"reasoning_effort 参数 (当前: {reasoning_display}, 如 minimum/low/medium/high/xhigh/max, 输入 none 清除): ").strip()
         if not reasoning_str:
             break
         if reasoning_str.lower() in ('none', '-'):

@@ -1,4 +1,4 @@
-# CBHCLI v5.1.7 - AI驱动的终端助手
+# CBHCLI v5.1.8 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -38,6 +38,7 @@
 - **Web 端 reasoning_effort 下拉框含 max 选项（v5.1.5）** - Web 模型配置界面 reasoning_effort 下拉框新增 `max` 选项（与 CLI 对齐），支持更深度的推理强度配置
 - **上下文压缩四项优化（v5.1.6）** - ① 压缩目标可控：修复 target_tokens 死参数，压缩后降到窗口 30%（摘要 max_tokens 预算限制 + 超目标迭代降级保留轮数）；② 摘要提示词对标 Claude Code：CRITICAL 约束 + analysis/summary 双块 + 9 章节结构化模板；③ 压缩可撤销：自动备份到 history/compressions/，`/undo-compress` 一键恢复压缩前原始消息；④ 摘要输入保留工具调用链（`[工具 terminal 结果]`）+ 大输出截断
 - **文本复读检测误报修复（v5.1.7）** - TextLoopDetector 改为双块整体匹配（尾部 2×150 字符）+ 近邻窗口（最近 5000 字符）统计，且重复 ≥15 次才判定复读（连续重复总长 <4500 字符永不触发）。修复正常思考中"先设计后实现"重复写出的模板/骨架片段（如 HTML 头部）被误判死循环、思考被截断的问题；真正的连续大量复读仍会正常熔断。改 loop_detector.py 1 个文件，CLI/Web 调用方零改动
+- **上下文压缩失败修复（v5.1.8）** - 修复 `/comp` 压缩"假装成功"的严重 bug：① 摘要 max_tokens 封顶到 64k（`SUMMARY_MAX_TOKENS=65536`），消除大窗口模型（context_limit≥44万）下预算超过 API max_tokens 上限（131072）导致的 400 错误；② 摘要生成失败不再返回 `[压缩失败...]` 占位文本塞进会话，改为抛异常 + `compress()` 捕获后保持会话原样、记录 `last_error`、返回 False，杜绝失败污染上下文；③ CLI/Web 各调用点失败时展示具体原因（补可观测性）。改 6 个文件
 
 ### 17大内置工具 + Web 专属工具
 | 工具 | 功能 |
@@ -142,7 +143,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.1.7-py3-none-any.whl
+pip install dist/cbhcli-5.1.8-py3-none-any.whl
 ```
 
 ### 可选依赖

@@ -528,7 +528,9 @@ class AIHandler:
             self.context_window.update(new_tokens)
             print(f"{self._c_dim}   ✅ 上下文已压缩 ({self.context_window.get_status_text()}){C_RESET}")
         else:
-            print(f"{self._c_dim}   ⚠️  压缩失败（消息太少或生成摘要异常），继续执行{C_RESET}")
+            err = getattr(self.context_compressor, "last_error", None)
+            reason = f": {err}" if err else "（消息太少或生成摘要异常）"
+            print(f"{self._c_dim}   ⚠️  压缩失败{reason}，继续执行{C_RESET}")
 
     # ==================================================================
     #  工具执行（基于 Function Calling 结构化数据）
