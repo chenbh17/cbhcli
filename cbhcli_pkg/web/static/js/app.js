@@ -2722,20 +2722,22 @@ function showModelForm(m) {
   thinkingSel.value = m.thinking === undefined || m.thinking === null ? "" : String(m.thinking);
   const reasoningSel = el("select", { class: "select" });
   reasoningSel.append(el("option", { value: "" }, "（不传）"));
+  reasoningSel.append(el("option", { value: "minimum" }, "minimum"));
   reasoningSel.append(el("option", { value: "low" }, "low"));
   reasoningSel.append(el("option", { value: "medium" }, "medium"));
   reasoningSel.append(el("option", { value: "high" }, "high"));
+  reasoningSel.append(el("option", { value: "xhigh" }, "xhigh"));
   reasoningSel.append(el("option", { value: "max" }, "max"));
   reasoningSel.value = m.reasoning_effort || "";
   const reasoningHint = el("div", { class: "form-hint" },
-    "留空不传；推理强度 low / medium / high / max");
+    "留空不传；推理强度 minimum / low / medium / high / xhigh / max");
   // thinking=off 时不能配置 reasoning_effort（DeepSeek 等 API 报 400）
   const syncReasoningState = () => {
     const off = thinkingSel.value === "false";
     reasoningSel.disabled = off;
     reasoningHint.textContent = off
       ? "⚠️ thinking 已关闭(off)，不能配置 reasoning_effort（API 会报 400）"
-      : "留空不传；推理强度 low / medium / high / max";
+      : "留空不传；推理强度 minimum / low / medium / high / xhigh / max";
   };
   thinkingSel.addEventListener("change", syncReasoningState);
   syncReasoningState();

@@ -1,0 +1,112 @@
+cbhcli v5.0.0 修复补丁 — 无效工具调用无限循环问题
+=====================================================
+
+修复日期: 2025-07-28
+适用版本: cbhcli v5.0.0
+修复文件: cbhcli_pkg/core/ai_handler.py
+修复问题: AI 返回无效 tool_calls 时导致的无限循环/"卡住"问题
+
+--------------------------------------------------------------------------------
+问题描述
+--------------------------------------------------------------------------------
+
+当 AI 返回的 tool_calls 全部无法解析（工具名错误/重复调用）时，
+`_execute_tools` 方法直接 `return`，没有任何消息加入会话。
+
+结果：下一轮 ReAct 循环使用相同上下文，AI 可能返回相同无效 tool_calls，
+导致无限循环，表现为"卡住/停了"。
+
+--------------------------------------------------------------------------------
+修改位置
+--------------------------------------------------------------------------------
+
+文件: cbhcli_pkg/core/ai_handler.py
+位置: 第 417 行（`if not valid_calls:` 之后）
+
+--------------------------------------------------------------------------------
+修改前（第 417-418 行）
+--------------------------------------------------------------------------------
+
+```python
+        if not valid_calls:
+            return
+```
+
+--------------------------------------------------------------------------------
+修改后（第 417-447 行，新增 31 行）
+--------------------------------------------------------------------------------
+
+```python
+        if not valid_calls:
+            # 所有工具调用都无法解析（工具名错误/重复），必须向会话添加提示
+            # 否则下一轮循环用相同上下文，AI 可能返回相同无效 tool_calls → 无限循环
+            invalid_names = [tc["name"] for tc in tool_calls]
+            error_msg = (
+                f"⚠️ 工具调用失败：以下工具名无法识别或重复调用：{', '.join(invalid_names)}\n"
+                f"可用工具：{', '.join(self.tool_executor.tool_registry.list_tools())}\n"
+                f"请使用正确的工具名重新调用。"
+            )
+            print(f"\n{C_ERROR}{error_msg}{C_RESET}")
+            # 添加 assistant 消息（含 tool_calls）和 tool 错误消息，保持 OAI 消息序列完整
+            assistant_msg = Message(
+                role="assistant",
+                content=ai_response if ai_response else "",
+                token_count=self.token_counter.count_tokens(ai_response or ""),
+                tool_calls=[{
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc.get("arguments", {}))}
+                } for tc in tool_calls],
+                reasoning_content=reasoning_content or None
+            )
+            self.session.messages.append(assistant_msg)
+            for tc in tool_calls:
+                tool_msg = Message(
+                    role="tool",
+                    content=error_msg,
+                    token_count=self.token_counter.count_tokens(error_msg),
+                    tool_call_id=tc["id"]
+                )
+                tool_msg.metadata = {"tool_name": tc["name"], "success": False}
+                self.session.messages.append(tool_msg)
+            return
+```
+
+--------------------------------------------------------------------------------
+行数变化
+--------------------------------------------------------------------------------
+
++31 行（原 557 行 → 新 588 行）
+
+--------------------------------------------------------------------------------
+应用方法
+--------------------------------------------------------------------------------
+
+方法 1: 使用 patch 命令（推荐）
+```bash
+cd /path/to/cbhcli-latest-Copy1
+patch -p1 < cbhcli_v5.0.0_ai_handler_fix.patch
+```
+
+方法 2: 手动修改
+按上述【修改后】内容，在 `if not valid_calls:` 和 `return` 之间插入新代码块。
+
+--------------------------------------------------------------------------------
+验证方法
+--------------------------------------------------------------------------------
+
+```bash
+grep -c "以下工具名无法识别或重复调用" cbhcli_pkg/core/ai_handler.py
+# 应输出: 1
+```
+
+--------------------------------------------------------------------------------
+重新打包安装
+--------------------------------------------------------------------------------
+
+```bash
+cd /path/to/cbhcli-latest-Copy1
+rm -rf dist/*.whl build *.egg-info
+python -m build --wheel --no-isolation
+pip install dist/cbhcli-5.0.0-py3-none-any.whl --force-reinstall --no-deps
+```

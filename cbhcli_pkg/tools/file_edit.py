@@ -75,9 +75,12 @@ def _char_escape_variants(s: str) -> list:
     idxs = []
     for i, ch in enumerate(s):
         o = ord(ch)
-        if o > 127 and not (0x4E00 <= o <= 0x9FFF) and not (0x3000 <= o <= 0x303F):
+        if o > 127 and not (0x4E00 <= o <= 0x9FFF) and not (0x3000 <= o <= 0x303F) and not (0xFF00 <= o <= 0xFFEF):
             idxs.append(i)
     if not idxs:
+        return []
+    # 组合爆炸防护：4^N 组合，N>10 时 4^N>100万次循环，直接跳过
+    if len(idxs) > 10:
         return []
     variants = []
     # 每个候选 2 位状态：0=原样 1=大写转义 2=小写转义（3^k 组合）
