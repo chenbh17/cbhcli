@@ -242,13 +242,254 @@ function sanitizeHtml(html) {
   return doc.body.innerHTML;
 }
 
+/* ---- LaTeX 公式渲染（KaTeX，v5.1.9）：渲染正文 $/$$/\[/\( 公式，代码块一律保护 ---- */
+function renderTex(tex, display) {
+  if (!window.katex) return escapeHtml((display ? "$$" : "$") + tex + (display ? "$$" : "$"));
+  try {
+    return katex.renderToString(tex, {
+      displayMode: display,
+      throwOnError: false,
+      strict: false,
+      output: "html"
+    });
+  } catch {
+    return escapeHtml((display ? "$$" : "$") + tex + (display ? "$$" : "$"));
+  }
+}
+
+// 单遍扫描：保护代码块/行内代码，把公式抽成占位符（避免 marked 破坏 _ * 等符号）
+function extractMath(text, maths) {
+  const re =
+    /(```[\s\S]*?```|~~~[\s\S]*?~~~)|(`[^`\n]*`)|(\$\$[\s\S]+?\$\$)|(\\\[[\s\S]+?\\\])|(\$[^\s$`][^$\n]*?[^\s$`]\$|\$[^\s$`]\$)|(\\\(.+?\\\))/g;
+  return text.replace(re, (m, fence, inlineCode, dispA, dispB, inlA, inlB) => {
+    if (fence !== undefined || inlineCode !== undefined) return m; // 代码原样保留
+    let tex = "", display = false;
+    if (dispA !== undefined) { tex = dispA.slice(2, -2); display = true; }
+    else if (dispB !== undefined) { tex = dispB.slice(2, -2); display = true; }
+    else if (inlA !== undefined) { tex = inlA.slice(1, -1); display = false; }
+    else if (inlB !== undefined) { tex = inlB.slice(2, -2); display = false; }
+    else return m;
+    maths.push({ tex: tex.trim(), display });
+    const ph = `@@CBHMATH${maths.length - 1}@@`;
+    return display ? `\n\n${ph}\n\n` : ph;
+  });
+}
+
 function renderMd(text) {
   if (!text) return "";
   if (!window.marked) return escapeHtml(text);
   try {
-    return sanitizeHtml(marked.parse(text));
+    const maths = [];
+    const prepared = extractMath(text, maths);
+    let html = marked.parse(prepared);
+    if (maths.length) {
+      html = html.replace(/(<p>)?@@CBHMATH(\d+)@@(<\/p>)?/g, (m, _p, idx) => {
+        const seg = maths[Number(idx)];
+        if (!seg) return m;
+        const rendered = renderTex(seg.tex, seg.display);
+        return seg.display
+          ? `<div class="cbh-math-block">${rendered}</div>`
+          : `<span class="cbh-math-inline">${rendered}</span>`;
+      });
+    }
+    return sanitizeHtml(html);
   } catch {
     return escapeHtml(text);
+  }
+}
+
+/* ---- Mermaid / ECharts 图表渲染（v5.2.0）----
+ * 流式过程中 ```mermaid / ```echarts 代码块按代码显示，回复完成（done）或恢复历史时
+ * 调用 renderDiagrams 将代码块原地替换为 SVG / ECharts 图表。渲染失败一律保留代码块。
+ * 纯前端离线渲染（vendor/mermaid + vendor/echarts），无 Python 依赖、无需联网。 */
+let _mermaidInited = false;
+let _diagSeq = 0;
+const _mermaidSvgCache = new Map(); // 源码 -> svg（避免历史/重复渲染时重复计算）
+const _diagLibLoading = {};         // 懒加载 Promise 缓存
+
+// 静态资源版本号：从已加载的 app.js 的 ?v= 参数推导，保证缓存失效一致
+function _staticVer() {
+  const s = document.querySelector('script[src*="/js/app.js"]');
+  const m = s && s.src.match(/[?&]v=([^&]+)/);
+  return m ? "?v=" + m[1] : "";
+}
+
+// 懒加载图表库（检测到图表块才注入脚本，避免拖慢首屏）
+function loadDiagLib(name) {
+  if (_diagLibLoading[name]) return _diagLibLoading[name];
+  const ready = name === "mermaid" ? window.mermaid : window.echarts;
+  if (ready) return (_diagLibLoading[name] = Promise.resolve());
+  const src = name === "mermaid"
+    ? "/vendor/mermaid/mermaid.min.js" + _staticVer()
+    : "/vendor/echarts/echarts.min.js" + _staticVer();
+  _diagLibLoading[name] = new Promise((resolve) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => { console.error(`加载 ${name} 失败:`, src); resolve(); };
+    document.head.appendChild(s);
+  });
+  return _diagLibLoading[name];
+}
+
+function ensureMermaidInit() {
+  if (_mermaidInited || !window.mermaid) return;
+  try {
+    window.mermaid.initialize({
+      startOnLoad: false,
+      theme: "dark",
+      securityLevel: "strict", // 内置 DOMPurify 消毒，防 XSS
+      logLevel: "fatal"
+    });
+    _mermaidInited = true;
+  } catch (e) {
+    console.error("mermaid initialize 失败:", e);
+  }
+}
+
+// 解析 echarts option：JSON 优先 → JS 求值兜底（支持函数/尾逗号）→ "option = {...}" 形式
+function parseEchartsOption(src) {
+  let s = String(src).trim().replace(/;+\s*$/, ""); // 去尾部多余分号
+  try { return JSON.parse(s); } catch (_) {}
+  try { return new Function("return (" + s + ")")(); } catch (_) {}
+  const m = s.match(/^(?:var|let|const)?\s*[A-Za-z_$][\w$]*\s*=\s*([\s\S]+)$/);
+  if (m) {
+    try { return new Function("return (" + m[1] + ")")(); } catch (_) {}
+  }
+  return null;
+}
+
+// 判断解析结果是否像 echarts option（含 series，echarts 的强特征）
+function looksLikeEcharts(opt) {
+  return !!opt && typeof opt === "object" && !Array.isArray(opt) && "series" in opt &&
+    (Array.isArray(opt.series) || (opt.series && typeof opt.series === "object"));
+}
+
+// 收集 echarts 代码块：显式 echarts/echart 标签，或 json/javascript/js 标签且内容像 echarts option
+function collectEchartsBlocks(container) {
+  const blocks = [];
+  container.querySelectorAll("pre code").forEach(code => {
+    const pre = code.closest("pre");
+    if (!pre || pre.dataset.diagDone) return;
+    const m = (code.className || "").match(/language-([\w+#-]+)/);
+    const lang = m ? m[1].toLowerCase() : "";
+    const src = (code.textContent || "").trim();
+    if (!src) return;
+    if (lang === "echarts" || lang === "echart") {
+      blocks.push({ pre, src });
+    } else if (lang === "json" || lang === "javascript" || lang === "js") {
+      if (looksLikeEcharts(parseEchartsOption(src))) blocks.push({ pre, src });
+    }
+  });
+  return blocks;
+}
+
+// mermaid 安全渲染：清理残留临时元素 + 失败重试一次，成功结果按源码缓存
+async function renderMermaidSafe(src) {
+  if (_mermaidSvgCache.has(src)) return _mermaidSvgCache.get(src);
+  const id = "cbh-mmd-" + (++_diagSeq);
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      document.getElementById(id)?.remove();
+      document.getElementById("d" + id)?.remove();
+      const out = await window.mermaid.render(id, src);
+      if (out && out.svg) {
+        _mermaidSvgCache.set(src, out.svg);
+        return out.svg;
+      }
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("mermaid render 无输出");
+}
+
+// 构建「图片 / 代码」切换包装器；onShowImg 在切回图片视图时回调（echarts 需 resize）
+function buildDiagramWrap(src, onShowImg) {
+  const wrap = el("div", { class: "cbh-diagram-wrap" });
+  const btnImg = el("button", { class: "cbh-diagram-tab active", type: "button" }, "图片");
+  const btnCode = el("button", { class: "cbh-diagram-tab", type: "button" }, "代码");
+  const toolbar = el("div", { class: "cbh-diagram-toolbar" }, btnImg, btnCode);
+
+  const imgView = el("div", { class: "cbh-diagram-view cbh-diagram-img" });
+  const codeView = el("div", { class: "cbh-diagram-view cbh-diagram-code" });
+  const codeEl = el("code");
+  codeEl.textContent = src;
+  const copyBtn = el("button", { class: "code-copy-btn", type: "button" }, "复制");
+  copyBtn.addEventListener("click", () => {
+    copyText(src)
+      .then(() => { copyBtn.textContent = "已复制"; setTimeout(() => (copyBtn.textContent = "复制"), 1200); })
+      .catch(() => { copyBtn.textContent = "复制失败"; setTimeout(() => (copyBtn.textContent = "复制"), 1200); });
+  });
+  const preEl = el("pre", null, codeEl, copyBtn);
+  codeView.append(preEl);
+  codeView.style.display = "none";
+
+  wrap.append(toolbar, imgView, codeView);
+  const show = (img) => {
+    imgView.style.display = img ? "" : "none";
+    codeView.style.display = img ? "none" : "";
+    btnImg.classList.toggle("active", img);
+    btnCode.classList.toggle("active", !img);
+    if (img && onShowImg) { try { onShowImg(); } catch (_) {} }
+  };
+  btnImg.addEventListener("click", () => show(true));
+  btnCode.addEventListener("click", () => show(false));
+  return { wrap, imgView };
+}
+
+async function renderDiagrams(container) {
+  if (!container) return;
+
+  // ---- mermaid ----
+  const mmdBlocks = Array.from(container.querySelectorAll("pre code.language-mermaid"))
+    .map(code => ({ pre: code.closest("pre"), src: (code.textContent || "").trim() }))
+    .filter(b => b.pre && !b.pre.dataset.diagDone && b.src);
+  if (mmdBlocks.length) await loadDiagLib("mermaid");
+  if (mmdBlocks.length && window.mermaid) {
+    ensureMermaidInit();
+    for (const { pre, src } of mmdBlocks) {
+      if (!pre.isConnected) continue;
+      pre.dataset.diagDone = "1";
+      try {
+        const svg = await renderMermaidSafe(src);
+        const { wrap, imgView } = buildDiagramWrap(src);
+        imgView.classList.add("cbh-mermaid");
+        imgView.innerHTML = svg;
+        pre.replaceWith(wrap);
+      } catch (e) {
+        console.warn("mermaid 渲染失败，保留代码块:", e);
+      }
+    }
+  }
+
+  // ---- echarts ----
+  const ecBlocks = collectEchartsBlocks(container);
+  if (ecBlocks.length) await loadDiagLib("echarts");
+  if (ecBlocks.length && window.echarts) {
+    for (const { pre, src } of ecBlocks) {
+      if (!pre.isConnected) continue;
+      pre.dataset.diagDone = "1";
+      const option = parseEchartsOption(src);
+      if (!looksLikeEcharts(option)) {
+        console.warn("echarts option 解析失败，保留代码块");
+        continue;
+      }
+      try {
+        let chart = null;
+        const { wrap, imgView } = buildDiagramWrap(src, () => { if (chart) chart.resize(); });
+        const box = el("div", { class: "cbh-echarts" });
+        imgView.append(box);
+        pre.replaceWith(wrap);
+        chart = window.echarts.init(box, "dark");
+        chart.setOption(option);
+        if (window.ResizeObserver) {
+          const ro = new ResizeObserver(() => { try { chart.resize(); } catch (_) {} });
+          ro.observe(box);
+        }
+      } catch (e) {
+        console.warn("echarts 渲染失败:", e);
+      }
+    }
   }
 }
 
@@ -1571,6 +1812,8 @@ async function runStream(userContent, images) {
     closeReasoning();
     setStreaming(false);
     if (finishUsage) updateCtxMeter(finishUsage);
+    // 回复完成后渲染 mermaid / echarts 图表（流式中先显示代码）
+    void renderDiagrams(aiBody);
     refreshStatus();
     scrollBottom();
     chatUI.input.focus();
@@ -1681,6 +1924,8 @@ function renderRestoredMessages(messages) {
         el("div", { class: "msg-ai-avatar" }, "❯"), body));
     }
   }
+  // 恢复的历史消息中渲染 mermaid / echarts 图表
+  void renderDiagrams(col);
   scrollBottom();
 }
 
@@ -3594,6 +3839,8 @@ async function showHistoryDetail(agent, sessionInfo) {
       }, el("div", { class: "md-content", html: renderMd(m.content || "") }))));
   }
   if (!body.children.length) body.append(emptyState("无可显示的消息"));
+  // 历史详情中渲染 mermaid / echarts 图表
+  void renderDiagrams(body);
 
   openModal({
     title: `会话详情 — ${fmtTime(sessionInfo.created_at) || sessionInfo.filename}`,
