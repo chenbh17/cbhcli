@@ -96,7 +96,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.2.1")
+app = FastAPI(title="CBHCLI Web", version="5.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -138,6 +138,12 @@ def get_config() -> GlobalConfig:
     global _global_config
     if _global_config is None:
         _global_config = GlobalConfig()
+    else:
+        # 跨进程配置同步：CLI/Web/Jupyter 任一进程改动后按 mtime 刷新（v5.2.2）
+        try:
+            _global_config.reload_if_changed()
+        except Exception:
+            pass
     return _global_config
 
 
@@ -844,6 +850,12 @@ def _get_mcp_manager(agent_name: str) -> MCPManager:
     if agent_name not in _mcp_managers:
         workspace = _get_agent_workspace(agent_name)
         _mcp_managers[agent_name] = MCPManager(agent_name, workspace, ToolRegistry())
+    else:
+        # 跨进程 MCP 同步：其他进程改动 mcp.json 后按 mtime 刷新（v5.2.2）
+        try:
+            _mcp_managers[agent_name].reload_if_changed()
+        except Exception:
+            pass
     return _mcp_managers[agent_name]
 
 
@@ -1767,6 +1779,12 @@ def _get_chain_manager():
     global _chain_manager_instance
     if _chain_manager_instance is None:
         _chain_manager_instance = ChainManager()
+    else:
+        # 跨进程链条同步：其他进程改动 agent_chains.json 后按 mtime 刷新（v5.2.2）
+        try:
+            _chain_manager_instance.reload_if_changed()
+        except Exception:
+            pass
     return _chain_manager_instance
 
 _chain_manager_instance = None

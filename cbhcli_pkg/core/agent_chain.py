@@ -171,6 +171,31 @@ class ChainManager:
         self._chains: dict[str, AgentChain] = {}
         self._lock = threading.Lock()
         self._load()
+        self._mtime = self._file_mtime()
+
+    def _file_mtime(self) -> float:
+        try:
+            return self.config_path.stat().st_mtime if self.config_path.exists() else 0.0
+        except Exception:
+            return 0.0
+
+    def reload_if_changed(self) -> bool:
+        """agent_chains.json 被其他进程修改时重载（跨进程链条同步，v5.2.2）。"""
+        m = self._file_mtime()
+        if m == self._mtime:
+            return False
+        self._mtime = m
+        fresh: dict[str, AgentChain] = {}
+        if self.config_path.exists():
+            try:
+                data = json.loads(self.config_path.read_text(encoding='utf-8'))
+                for name, chain_data in data.get("chains", {}).items():
+                    fresh[name] = AgentChain.from_dict(chain_data)
+            except Exception:
+                return False
+        with self._lock:
+            self._chains = fresh
+        return True
 
     def _load(self):
         """从文件加载链条配置"""
@@ -193,6 +218,7 @@ class ChainManager:
             json.dumps(data, indent=2, ensure_ascii=False),
             encoding='utf-8'
         )
+        self._mtime = self._file_mtime()
 
     def list_chains(self) -> list[AgentChain]:
         """列出所有链条"""
