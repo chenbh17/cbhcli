@@ -16,7 +16,37 @@ class GlobalConfig:
     def __init__(self):
         CBHCLI_DIR.mkdir(parents=True, exist_ok=True)
         self.config = self._load_config()
-    
+        self._mtime = self._file_mtime()
+
+    def _file_mtime(self) -> float:
+        try:
+            return CONFIG_FILE.stat().st_mtime if CONFIG_FILE.exists() else 0.0
+        except Exception:
+            return 0.0
+
+    def reload_if_changed(self) -> bool:
+        """config.json 被其他进程修改时重载（跨进程配置同步，v5.2.2）。
+
+        CLI / Web / Jupyter 是独立进程，各自缓存配置；任一进程改动写回磁盘后，
+        其他进程通过本方法按 mtime 感知并刷新内存副本。仅在文件成功解析为 dict
+        时才替换，避免读到半写状态。
+        """
+        m = self._file_mtime()
+        if m == self._mtime:
+            return False
+        self._mtime = m  # 先更新，避免对损坏文件反复重试
+        if not CONFIG_FILE.exists():
+            return False
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                fresh = json.load(f)
+            if isinstance(fresh, dict):
+                self.config = fresh
+                return True
+        except Exception:
+            pass
+        return False
+
     def _load_config(self) -> dict:
         """加载配置"""
         if CONFIG_FILE.exists():
@@ -54,6 +84,7 @@ class GlobalConfig:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=2, ensure_ascii=False)
+        self._mtime = self._file_mtime()
     
     # 模型管理
     def get_models(self) -> list[dict]:

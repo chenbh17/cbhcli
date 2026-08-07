@@ -34,10 +34,54 @@ class MCPManager:
         # 活跃的 MCP 客户端和工具
         self._clients: dict[str, MCPClient] = {}  # name -> client
         self._mcp_tools: dict[str, MCPToolAdapter] = {}  # mcp_tool_name -> adapter
-        
+
         # 加载配置
         self._load_config()
-    
+        self._mtime = self._file_mtime()
+
+    def _file_mtime(self) -> float:
+        try:
+            return self.config_file.stat().st_mtime if self.config_file.exists() else 0.0
+        except Exception:
+            return 0.0
+
+    def reload_if_changed(self) -> bool:
+        """mcp.json 被其他进程修改时重载（跨进程 MCP 配置同步，v5.2.2）。
+
+        重新读取服务器列表：移除已删除服务器的客户端/工具，连接新增服务器。
+        连接为尽力而为（失败不抛错，list_servers 会标记未连接）。
+        """
+        m = self._file_mtime()
+        if m == self._mtime:
+            return False
+        self._mtime = m
+        fresh_servers: list[dict] = []
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    fresh_servers = json.load(f).get("servers", [])
+            except Exception:
+                return False
+        old_names = {s["name"] for s in self._servers}
+        self._servers = fresh_servers
+        new_names = {s["name"] for s in self._servers}
+        # 断开并注销已被删除的服务器
+        for name in list(self._clients.keys()):
+            if name not in new_names:
+                try:
+                    self._unregister_server_tools(name)
+                except Exception:
+                    pass
+                self._clients.pop(name, None)
+        # 连接新增的服务器（尽力而为）
+        for s in self._servers:
+            if s["name"] not in old_names or s["name"] not in self._clients:
+                try:
+                    self._connect_server(s)
+                except Exception:
+                    pass
+        return True
+
     def _load_config(self):
         """加载 MCP 配置并自动连接所有服务器"""
         if self.config_file.exists():
@@ -65,6 +109,7 @@ class MCPManager:
         data = {"servers": self._servers}
         with open(self.config_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        self._mtime = self._file_mtime()
     
     def add_server(self, name: str, url: str, headers: Optional[dict] = None,
                    enabled_tools: Optional[list[str]] = None) -> str:
