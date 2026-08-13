@@ -9,6 +9,17 @@
    可通过 /undo-compress 恢复。
 4. 摘要输入格式：tool 消息带工具名（[工具 xxx 结果]），assistant 带调用链标记，
    大输出截断防止摘要请求输入超长。
+
+v5.2.3 压缩失忆问题修复：
+5. SUMMARY_MARKER 标记 + 恢复历史会话（/resume、chat/load）保留摘要消息，
+   修复"压缩过的会话恢复后摘要被丢弃 → agent 失忆"。
+6. 摘要请求显式关闭思考模式（thinking=disabled），避免思考 token 耗尽摘要
+   max_tokens 预算导致压缩失败/超时。
+7. 摘要 max_tokens 再封顶到模型配置的 max_tokens（模型输出上限），
+   避免对输出上限小的模型系统性 400。
+8. 空/过短摘要视为失败不插入（防止空摘要顶替历史造成静默失忆）。
+9. 摘要输入附上保留的 recent 消息概要，避免"当前状态/下一步"与保留消息矛盾。
+10. 摘要措辞强化：明确告知模型摘要即其记忆，必须据此继续任务。
 """
 import json
 import re
@@ -26,6 +37,13 @@ MAX_MSG_CHARS = 2000        # user/assistant 消息
 MAX_TOOL_MSG_CHARS = 600    # tool 消息（工具输出通常冗长）
 # 备份保留份数
 MAX_BACKUPS = 10
+# 历史摘要消息的首行标记（v5.2.3）：
+# 1. compress() 生成的摘要 system 消息以此开头；
+# 2. /resume、chat/load 等恢复历史会话时据此保留摘要（只跳过主系统提示，
+#    不能把摘要也丢了，否则恢复压缩过的会话 = agent 丢失全部早期记忆）。
+SUMMARY_MARKER = "[历史对话摘要]"
+# 摘要最短有效长度：短于此视为生成失败（空摘要插入会话 = agent 静默失忆）
+MIN_SUMMARY_CHARS = 20
 
 
 def _split_at_boundary(messages: list, split_idx: int) -> tuple:
@@ -162,8 +180,12 @@ class ContextCompressor:
             if not middle_messages:
                 break
 
-            # 生成中间部分的摘要（格式化为带工具名/调用链的文本）
+            # 生成中间部分的摘要（格式化为带工具名/调用链的文本）。
+            # v5.2.3：同时附上保留的 recent 消息概要，让摘要模型知道哪些内容被原样保留，
+            # 避免摘要的"当前状态/下一步"与保留消息矛盾（如声称已完成的任务"待完成"）。
             middle_text = self._format_middle_text(middle_messages)
+            recent_text = (self._format_middle_text(recent_messages)
+                           if recent_messages else "")
 
             # 计算摘要预算：目标 - 保留部分（系统提示 + 最早 + 最近），至少 512
             kept_tokens = self.token_counter.count_messages_tokens(
@@ -174,21 +196,36 @@ class ContextCompressor:
 
             try:
                 summary = self._generate_summary(middle_text, instructions,
-                                                 max_tokens=summary_budget)
+                                                 max_tokens=summary_budget,
+                                                 recent_text=recent_text)
             except Exception as e:
                 # 摘要生成失败：不替换会话消息（保持原样），记录错误并返回 False。
                 # 绝不能把失败占位文本当成正常摘要塞进会话，否则会污染上下文。
                 self.last_error = str(e)
+                return False
+            # v5.2.3：空/过短摘要视为失败。空摘要插入会话会顶替掉全部中间历史，
+            # 造成 agent 静默失忆（思考模型耗尽 max_tokens 等场景可能返回空内容）。
+            if not summary or len(summary.strip()) < MIN_SUMMARY_CHARS:
+                self.last_error = "摘要生成结果为空或过短，为防止丢失记忆已放弃本次压缩"
                 return False
             self.last_error = None
 
             # 构建新的消息列表
             new_messages = system_messages.copy()
             new_messages.extend(early_messages)
+            # v5.2.3：摘要措辞强化——明确告知模型"这是你的记忆，必须据此继续任务"，
+            # 减少模型忽视中间位置 system 摘要、声称失忆的情况。
+            summary_content = (
+                f"{SUMMARY_MARKER}\n"
+                "【重要】早期对话历史已被压缩为以下摘要，这份摘要就是你对早期对话的完整记忆。\n"
+                "你必须依据摘要中的信息（任务目标、文件路径、决策、当前进度、下一步计划）继续任务，\n"
+                "禁止声称自己失忆、被压缩、不记得任务内容或进度。\n\n"
+                f"{summary}"
+            )
             summary_msg = Message(
                 role="system",
-                content=f"[历史对话摘要]\n{summary}",
-                token_count=self.token_counter.count_tokens(summary) + 20
+                content=summary_content,
+                token_count=self.token_counter.count_tokens(summary_content) + 20
             )
             new_messages.append(summary_msg)
             new_messages.extend(recent_messages)
@@ -258,7 +295,8 @@ class ContextCompressor:
     # ======================================================================
 
     def _generate_summary(self, text: str, instructions: str = None,
-                          max_tokens: Optional[int] = None) -> str:
+                          max_tokens: Optional[int] = None,
+                          recent_text: str = "") -> str:
         system_prompt = """CRITICAL: 你只能输出纯文本，禁止调用任何工具。你已拥有所需全部上下文。
 你的回复必须包含两个部分：
 
@@ -283,6 +321,7 @@ class ContextCompressor:
 - 丢弃中间试错过程、调试输出、冗余讨论
 - 使用简洁的要点式描述，不要完整复述对话
 - 没有对应内容时该章节写"无"
+- 若提供了"原样保留的最近消息"，第 8/9 章节必须与其保持一致：保留消息中已完成的工作不得写成"待完成"，也不得把保留消息之外的内容声称为"用户最后请求"
 </summary>"""
 
         # 用户压缩指令（保留/丢弃重点），优先级最高
@@ -293,20 +332,44 @@ class ContextCompressor:
                 f"用户明确要求丢弃的信息一律不得出现在摘要中。"
             )
 
+        # v5.2.3：附上保留的 recent 消息概要（不在摘要范围内），
+        # 供摘要模型判断真实进度，避免"当前状态/下一步"与保留消息矛盾。
+        user_content = f"请总结以下对话:\n\n{text}"
+        if recent_text:
+            user_content += (
+                "\n\n【以下最近消息被原样保留，不在总结范围内，"
+                "仅供你判断当前状态和下一步时参考】\n" + recent_text
+            )
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请总结以下对话:\n\n{text}"}
+            {"role": "user", "content": user_content}
         ]
 
         # 封顶 max_tokens：摘要预算（窗口30%-保留token）可能超过 API 的 max_tokens
         # 上限（如 131072）导致 400 invalid_parameter_error。SUMMARY_MAX_TOKENS(64k)
         # 对结构化摘要足够，且兼容主流 API。
+        # v5.2.3：再封顶到模型配置的 max_tokens（若用户设置了，通常就是该模型的
+        # 输出上限，如 32000），否则摘要请求对这些模型会系统性 400 失败。
+        cap = SUMMARY_MAX_TOKENS
+        model_max = getattr(self.llm_client, "max_tokens", None)
+        if model_max:
+            cap = min(cap, int(model_max))
         if max_tokens:
-            max_tokens = min(max_tokens, SUMMARY_MAX_TOKENS)
+            max_tokens = min(max_tokens, cap)
         else:
-            max_tokens = SUMMARY_MAX_TOKENS
+            max_tokens = cap
 
         kwargs = {"temperature": 0.3, "max_tokens": max_tokens}
+        # v5.2.3：摘要请求显式关闭思考模式（仅当模型配置了 thinking 参数时覆盖，
+        # 未配置的 API 不受影响）。原因：
+        # 1. 思考模型的 reasoning token 计入 max_tokens 预算，思考耗尽预算时
+        #    content=None → 压缩失败（摘要这种简单任务不需要深度思考）；
+        # 2. 高强度思考 + 非流式请求容易超过 API_TIMEOUT(120s) 超时失败。
+        # 注意：thinking=disabled 时不能再带 reasoning_effort（DeepSeek 400），
+        # 由 LLMClient.chat() 检测到 kwargs 显式 disabled 后自动移除。
+        if getattr(self.llm_client, "thinking", None) is not None:
+            kwargs["thinking"] = {"type": "disabled"}
         # 失败时直接抛出异常（不再返回 [压缩失败...] 占位文本），由 compress() 捕获
         # 后保持会话原样并返回 False，避免失败被伪装成"压缩成功"污染上下文。
         summary = self.llm_client.chat(messages, **kwargs)

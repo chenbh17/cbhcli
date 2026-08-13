@@ -21,6 +21,23 @@ def _ensure_sigint_handler():
         pass
 
 
+def _is_thinking_disabled(value) -> bool:
+    """判断 thinking 参数值是否表示"禁用思考"（兼容 布尔/dict/字符串 形式）
+
+    v5.2.3：调用方（如上下文压缩摘要）可通过 kwargs 显式传入 thinking=disabled
+    覆盖模型配置。此时必须同步移除 reasoning_effort——DeepSeek 等 API 在
+    thinking disabled 时携带 reasoning_effort 会报 400
+    ("thinking options type cannot be disabled when reasoning_effort...")。
+    """
+    if value is False:
+        return True
+    if isinstance(value, dict):
+        return value.get("type") == "disabled"
+    if isinstance(value, str):
+        return value.strip().lower() in ("false", "off", "0", "no", "n", "disabled")
+    return False
+
+
 class LLMClient:
     """统一的LLM API客户端"""
     
@@ -185,6 +202,10 @@ class LLMClient:
         }
         if self.max_tokens and "max_tokens" not in kwargs:
             payload["max_tokens"] = self.max_tokens
+        # v5.2.3：调用方显式覆盖 thinking 为 disabled（如压缩摘要请求）时，
+        # 移除与之冲突的 reasoning_effort（DeepSeek 400: thinking disabled 时不能携带）
+        if "thinking" in kwargs and _is_thinking_disabled(kwargs["thinking"]):
+            payload.pop("reasoning_effort", None)
         
         response = self._session.post(
             f"{self.base_url}/chat/completions",
@@ -235,6 +256,9 @@ class LLMClient:
         # 调用方显式传入的 max_tokens（kwargs）优先于模型配置
         if self.max_tokens and "max_tokens" not in kwargs:
             payload["max_tokens"] = self.max_tokens
+        # v5.2.3：调用方显式覆盖 thinking 为 disabled 时，移除冲突的 reasoning_effort
+        if "thinking" in kwargs and _is_thinking_disabled(kwargs["thinking"]):
+            payload.pop("reasoning_effort", None)
         
         response = self._session.post(
             f"{self.base_url}/chat/completions",
