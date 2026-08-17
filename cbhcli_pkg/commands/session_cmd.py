@@ -1,6 +1,7 @@
 """会话和上下文命令处理"""
 from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
+from cbhcli_pkg.context.compressor import SUMMARY_MARKER
 
 
 def register_session_commands(parser, app):
@@ -91,23 +92,32 @@ def register_session_commands(parser, app):
                 pass
         
         # 在当前 session 上原地恢复（不创建新会话）
-        # 清空当前消息，保留 system 消息
-        app.session.reset()
+        # 清空当前消息，只保留首条主系统提示（含最新 skills/tools/memory）。
+        # 注意：当前会话自己的"历史对话摘要"不能带进被恢复的会话，故不用
+        # session.reset()（它会保留全部 system 消息），只保留 messages[0]（v5.2.3）
+        if app.session.messages and app.session.messages[0].role == "system":
+            app.session.messages = [app.session.messages[0]]
+        else:
+            app.session.messages = []
         app.session.tool_call_count = 0
-        
-        # 重新加载历史消息（跳过 system 消息，因为 reset 已保留）
+
+        # 重新加载历史消息：跳过 system 消息（旧主系统提示用新建的），
+        # 但保留"历史对话摘要"——摘要是 agent 对早期对话的记忆，
+        # 丢弃它会导致恢复压缩过的会话后 agent 失忆（v5.2.3 修复）
         for msg in messages:
-            if msg.get("role") != "system":
-                content = msg.get("content") or ""
-                app.session.add_message(
-                    role=msg["role"],
-                    content=content,
-                    token_count=app.token_counter.count_tokens(content),
-                    metadata=msg,
-                    tool_call_id=msg.get("tool_call_id"),
-                    tool_calls=msg.get("tool_calls"),
-                    reasoning_content=msg.get("reasoning_content")
-                )
+            role = msg.get("role")
+            content = msg.get("content") or ""
+            if role == "system" and not content.startswith(SUMMARY_MARKER):
+                continue
+            app.session.add_message(
+                role=role,
+                content=content,
+                token_count=app.token_counter.count_tokens(content),
+                metadata=msg,
+                tool_call_id=msg.get("tool_call_id"),
+                tool_calls=msg.get("tool_calls"),
+                reasoning_content=msg.get("reasoning_content")
+            )
         
         # 统计恢复的消息
         user_count = sum(1 for m in messages if m.get("role") == "user")

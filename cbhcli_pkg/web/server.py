@@ -66,7 +66,7 @@ from cbhcli_pkg.core.loop_detector import ToolCallTracker, TextLoopDetector
 from cbhcli_pkg.vector.store import VectorStore
 from cbhcli_pkg.vector.indexer import MemoryIndexer
 from cbhcli_pkg.context.token_counter import get_token_counter
-from cbhcli_pkg.context.compressor import ContextCompressor
+from cbhcli_pkg.context.compressor import ContextCompressor, SUMMARY_MARKER
 
 
 def _fix_unicode_escapes(obj):
@@ -96,7 +96,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.2.2")
+app = FastAPI(title="CBHCLI Web", version="5.2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2178,6 +2178,9 @@ async def _react_loop(cs: WebChatSession):
     # Harness：死循环检测器（每个用户请求独立）+ 权限引擎
     loop_tracker = ToolCallTracker()
     loop_aborted = False
+    # v5.2.3：压缩失败冷却——失败后本请求内不再重试，避免系统性失败导致
+    # 每轮 ReAct 循环都浪费一次摘要 API 调用（最坏卡满 API_TIMEOUT）
+    compress_failed = False
     engine = cs.permission_engine or get_permission_engine()
 
     for round_idx in range(MAX_TOOL_ROUNDS):
@@ -2186,7 +2189,8 @@ async def _react_loop(cs: WebChatSession):
             return
 
         # ---- ReAct 循环内自动压缩 ----
-        if cs.auto_compress and cs.context_compressor and cs.context_window:
+        if (cs.auto_compress and cs.context_compressor and cs.context_window
+                and not compress_failed):
             total_tokens = cs.session.get_total_tokens(cs.token_counter)
             cs.context_window.update(total_tokens)
             if cs.context_window.needs_compression():
@@ -2204,8 +2208,10 @@ async def _react_loop(cs: WebChatSession):
                     yield _sse({"type": "compressed",
                                 "content": f"上下文已压缩 ({cs.context_window.get_status_text()})"})
                 else:
+                    compress_failed = True
                     err = getattr(cs.context_compressor, "last_error", None)
-                    msg = f"压缩失败: {err}，继续执行" if err else "压缩失败，继续执行"
+                    msg = (f"压缩失败: {err}，继续执行（本次请求内不再重试）" if err
+                           else "压缩失败，继续执行（本次请求内不再重试）")
                     yield _sse({"type": "compress_failed", "content": msg})
 
         messages = cs.session.get_context_messages()
@@ -3143,10 +3149,14 @@ async def chat_load(req: Request):
     cs = WebChatSession.create(agent_name, model_name)
     for msg in hist_messages:
         role = msg.get("role", "")
-        if role == "system":
-            continue  # 保留新建系统提示（含最新 skills/tools.md）
+        content = msg.get("content", "") or ""
+        # 跳过 system 消息（保留新建系统提示，含最新 skills/tools.md），
+        # 但保留上下文压缩生成的历史摘要消息——摘要是 agent 对早期对话的记忆，
+        # 丢弃它会导致恢复压缩过的会话后 agent 失忆（v5.2.3 修复）
+        if role == "system" and not content.startswith(SUMMARY_MARKER):
+            continue
         cs.session.add_message(
-            role, msg.get("content", "") or "",
+            role, content,
             tool_call_id=msg.get("tool_call_id"),
             tool_calls=msg.get("tool_calls"),
             reasoning_content=msg.get("reasoning_content"),

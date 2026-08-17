@@ -247,6 +247,9 @@ class AIHandler:
         self._loop_tracker = ToolCallTracker()
         self._loop_aborted = False
 
+        # v5.2.3：压缩失败冷却标记（每个用户请求独立）——失败后本请求内不再重试
+        self._compress_failed_this_request = False
+
         # --- ReAct 循环 ---
         for round_idx in range(MAX_TOOL_ROUNDS):
             # 检查上下文是否接近上限，自动压缩
@@ -508,6 +511,12 @@ class AIHandler:
         if not self.auto_compress:
             return
 
+        # v5.2.3：压缩失败冷却——失败后本请求内不再重试，避免系统性失败
+        # （如摘要预算超模型输出上限）导致每轮 ReAct 循环都浪费一次 API 调用
+        # （最坏情况每次卡满 API_TIMEOUT）。下一个用户请求会重新尝试。
+        if getattr(self, "_compress_failed_this_request", False):
+            return
+
         # 使用 token_counter 精确计算（含消息结构开销）
         total_tokens = self.session.get_total_tokens(self.token_counter)
         self.context_window.update(total_tokens)
@@ -528,9 +537,10 @@ class AIHandler:
             self.context_window.update(new_tokens)
             print(f"{self._c_dim}   ✅ 上下文已压缩 ({self.context_window.get_status_text()}){C_RESET}")
         else:
+            self._compress_failed_this_request = True
             err = getattr(self.context_compressor, "last_error", None)
             reason = f": {err}" if err else "（消息太少或生成摘要异常）"
-            print(f"{self._c_dim}   ⚠️  压缩失败{reason}，继续执行{C_RESET}")
+            print(f"{self._c_dim}   ⚠️  压缩失败{reason}，继续执行（本次请求内不再重试）{C_RESET}")
 
     # ==================================================================
     #  工具执行（基于 Function Calling 结构化数据）
