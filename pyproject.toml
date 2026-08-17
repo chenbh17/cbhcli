@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cbhcli"
-version = "5.2.3"
+version = "5.2.4"
 authors = [
     {name = "陈丙寰", email = "13943034070@163.com"},
 ]

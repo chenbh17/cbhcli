@@ -193,6 +193,11 @@ class LLMClient:
         Returns:
             AI响应文本
         """
+        # v5.2.4：skip_thinking=True 表示本次请求完全不携带 thinking/reasoning_effort。
+        # 调用方哨兵参数，先 pop 出 kwargs 防止混入 payload。用于压缩摘要请求：
+        # 部分 API 不支持 thinking.type=disabled（400），摘要这类简单请求直接
+        # 不带这两个参数对所有模型最兼容。
+        skip_thinking = kwargs.pop("skip_thinking", False)
         payload = {
             "model": self.model_name,
             "messages": self._clean_messages(messages),
@@ -202,6 +207,9 @@ class LLMClient:
         }
         if self.max_tokens and "max_tokens" not in kwargs:
             payload["max_tokens"] = self.max_tokens
+        if skip_thinking:
+            payload.pop("thinking", None)
+            payload.pop("reasoning_effort", None)
         # v5.2.3：调用方显式覆盖 thinking 为 disabled（如压缩摘要请求）时，
         # 移除与之冲突的 reasoning_effort（DeepSeek 400: thinking disabled 时不能携带）
         if "thinking" in kwargs and _is_thinking_disabled(kwargs["thinking"]):
@@ -245,6 +253,8 @@ class LLMClient:
             - ("content", content): 正常回答内容
             - ("tool_calls", json_str): 工具调用（JSON字符串）
         """
+        # v5.2.4：skip_thinking 哨兵（同 chat()，见上方注释）
+        skip_thinking = kwargs.pop("skip_thinking", False)
         payload = {
             "model": self.model_name,
             "messages": self._clean_messages(messages),
@@ -256,6 +266,9 @@ class LLMClient:
         # 调用方显式传入的 max_tokens（kwargs）优先于模型配置
         if self.max_tokens and "max_tokens" not in kwargs:
             payload["max_tokens"] = self.max_tokens
+        if skip_thinking:
+            payload.pop("thinking", None)
+            payload.pop("reasoning_effort", None)
         # v5.2.3：调用方显式覆盖 thinking 为 disabled 时，移除冲突的 reasoning_effort
         if "thinking" in kwargs and _is_thinking_disabled(kwargs["thinking"]):
             payload.pop("reasoning_effort", None)

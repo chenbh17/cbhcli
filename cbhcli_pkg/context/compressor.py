@@ -13,8 +13,8 @@
 v5.2.3 压缩失忆问题修复：
 5. SUMMARY_MARKER 标记 + 恢复历史会话（/resume、chat/load）保留摘要消息，
    修复"压缩过的会话恢复后摘要被丢弃 → agent 失忆"。
-6. 摘要请求显式关闭思考模式（thinking=disabled），避免思考 token 耗尽摘要
-   max_tokens 预算导致压缩失败/超时。
+6. 摘要请求完全不携带 thinking/reasoning_effort（v5.2.4；v5.2.3 曾传
+   thinking=disabled，但部分 API 不支持该参数直接 400，见 _generate_summary 注释）。
 7. 摘要 max_tokens 再封顶到模型配置的 max_tokens（模型输出上限），
    避免对输出上限小的模型系统性 400。
 8. 空/过短摘要视为失败不插入（防止空摘要顶替历史造成静默失忆）。
@@ -360,16 +360,20 @@ class ContextCompressor:
         else:
             max_tokens = cap
 
-        kwargs = {"temperature": 0.3, "max_tokens": max_tokens}
-        # v5.2.3：摘要请求显式关闭思考模式（仅当模型配置了 thinking 参数时覆盖，
-        # 未配置的 API 不受影响）。原因：
+        kwargs = {"temperature": 0.3, "max_tokens": max_tokens,
+                  "skip_thinking": True}
+        # （v5.2.3 历史注记：当时曾对摘要请求显式关闭思考模式，v5.2.4 已改为
+        # 完全不带思考参数，见下方 v5.2.4 注释。当时关思考的理由：）
         # 1. 思考模型的 reasoning token 计入 max_tokens 预算，思考耗尽预算时
         #    content=None → 压缩失败（摘要这种简单任务不需要深度思考）；
         # 2. 高强度思考 + 非流式请求容易超过 API_TIMEOUT(120s) 超时失败。
-        # 注意：thinking=disabled 时不能再带 reasoning_effort（DeepSeek 400），
-        # 由 LLMClient.chat() 检测到 kwargs 显式 disabled 后自动移除。
-        if getattr(self.llm_client, "thinking", None) is not None:
-            kwargs["thinking"] = {"type": "disabled"}
+        # v5.2.4：不再传 thinking={"type":"disabled"}——部分 API（如智谱 GLM）
+        # 不支持 thinking.type=disabled，会直接 400 报错：
+        #   "thinking.type `disabled` is not supported by this model"
+        # 改为上面的 skip_thinking=True 哨兵（由 LLMClient.chat() 处理）：
+        # 无论模型配置了什么 thinking/reasoning_effort，摘要请求一律不带这两个参数。
+        # 副作用：默认开思考的模型思考 token 计入摘要预算，若耗尽导致 content 为空，
+        # 会由 MIN_SUMMARY_CHARS 空摘要检查拒绝压缩（保真不污染），属可接受降级。
         # 失败时直接抛出异常（不再返回 [压缩失败...] 占位文本），由 compress() 捕获
         # 后保持会话原样并返回 False，避免失败被伪装成"压缩成功"污染上下文。
         summary = self.llm_client.chat(messages, **kwargs)
