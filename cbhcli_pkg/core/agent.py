@@ -211,6 +211,17 @@ Agent 链条允许你编排多个用户 Agent 之间的调用关系，实现跨 
 激活链条后，元 Agent 的系统提示中会注入下游 Agent 的描述和调用说明，
 可通过 call_agent 工具调用下游 Agent（以各自完整身份执行任务）。
 
+## 一次性非交互执行（cbhcli exec）
+cbhcli exec 是终端一次性执行入口（对标 claude -p / codex exec）：下发任务 -> AI 自动完成工具循环 -> 结果输出 -> 进程退出，用于 shell 脚本/CI/管道：
+- cbhcli exec "任务描述"                              # 默认静音，stdout 只含最终结果
+- echo "内容" | cbhcli exec "处理指令"                # 管道输入（自动读 stdin）
+- cbhcli exec -v "任务描述"                           # --verbose 显示过程输出(走 stderr)
+- cbhcli exec --agent 名 --model 名 --mode 模式 "任务"  # 模式: readonly/standard/auto/yolo
+- cbhcli exec -c "继续上次任务"                       # 续接最近会话（--resume 会话ID 恢复指定会话）
+- cbhcli exec --output-format json "任务" | jq .result  # 结构化输出供脚本消费
+退出码：0=成功 1=执行错误 2=权限拒绝/用法错误 130=中断。
+用户想在脚本/CI/管道中调用 cbhcli 时推荐此入口；完整参数让用户执行 cbhcli exec -h 查看。
+
 ## 记录信息
 当用户要求记录信息时：
 1. 判断类型(记忆/知识/技能)

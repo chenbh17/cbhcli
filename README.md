@@ -1,4 +1,4 @@
-# CBHCLI v5.2.4 - AI驱动的终端助手
+# CBHCLI v5.2.5 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -112,6 +112,25 @@ cbhcli web
 cbhcli web -p 18888
 ```
 
+### 一次性非交互执行（headless 模式）
+`cbhcli exec` 对标 `claude -p` / `codex exec`：终端一次性下发任务 -> ReAct 工具循环自动完成 -> 结果输出到 stdout -> 进程退出。适用于 shell 脚本、CI/CD、管道集成。
+
+```bash
+cbhcli exec "列出当前目录的 py 文件并统计总行数"           # 默认 yolo 零确认 + 默认静音
+echo "总结这些提交" | cbhcli exec                        # stdin 管道，stdout 只含最终结果
+cbhcli exec -v "任务..."                                 # --verbose 显示过程输出(走 stderr)
+cbhcli exec --agent main --model glm-4.7 --mode auto "..."  # 指定 Agent/模型/权限模式
+cbhcli exec -c "继续上次任务"                               # 续接最近一次会话
+cbhcli exec --resume <SESSION_ID> "..."                     # 恢复指定会话后执行
+cbhcli exec --output-format json "..." | jq .result         # 结构化输出供脚本消费
+```
+
+- **stdout/stderr 分离**：默认静音，stdout 只含最终回答；`--verbose/-v` 时过程输出实时走 stderr（终端同屏不重复打印最终回答，管道场景仍保证 stdout 有结果）
+- **默认权限模式 yolo**（零确认放行），收紧用 `--mode standard/auto/readonly`（此时需确认的操作一律拒绝，退出码 2）
+- **交互工具自动禁用**：ask_user 等在 headless 下从工具列表移除，全程不会阻塞等待终端输入
+- **会话默认保存**到 history（`--no-save` 关闭），配合 `-c`/`--resume` 可多步续接
+- **退出码**：0=成功 | 1=执行错误 | 2=用法错误或权限拒绝 | 130=用户中断
+
 ### 高级功能
 - **多步规划** - 复杂任务自动拆解为 Todo 计划列表，逐步执行并追踪进度
 - **自我反思** - 工具执行失败时自动分析原因并重试（最多3次）
@@ -143,7 +162,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.2.4-py3-none-any.whl
+pip install dist/cbhcli-5.2.5-py3-none-any.whl
 ```
 
 ### 可选依赖
