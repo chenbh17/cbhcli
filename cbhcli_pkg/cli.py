@@ -11,6 +11,13 @@ def print_help():
     print("用法: cbhcli [选项]")
     print("\n子命令:")
     print("  web              启动 Web 管理界面 (cbhcli web -p 18888)")
+    print("  exec             一次性非交互执行任务（headless 模式，用于脚本/CI/管道）")
+    print("                     cbhcli exec \"任务...\"              # 默认静音，stdout 只含结果")
+    print("                     echo \"任务...\" | cbhcli exec       # stdin 管道")
+    print("                     cbhcli exec -v \"任务...\"           # -v 显示过程输出(stderr)")
+    print("                     cbhcli exec --agent xxx --model xxx --mode yolo \"任务...\"")
+    print("                     cbhcli exec -c \"继续上次任务\"    # 续接最近会话")
+    print("                     cbhcli exec --output-format json \"任务...\" | jq .result")
     print("\n选项:")
     print("  --version, -v    显示版本信息")
     print("  --help, -h       显示此帮助消息")
@@ -137,23 +144,30 @@ def print_help():
 
 def main():
     """主入口函数"""
+    # exec 子命令（一次性非交互执行）：基于原始 argv 直接分发，
+    # 绕过顶层 parser 对 -h/-v 的抢先消费，保证 cbhcli exec -h 正确显示 exec 帮助
+    argv = sys.argv[1:]
+    if argv and argv[0] == 'exec':
+        _run_exec(argv[1:])
+        return
+
     parser = argparse.ArgumentParser(
         prog='cbhcli',
         description='AI驱动的终端助手',
         add_help=False
     )
-    
+
     parser.add_argument('--version', '-v', action='store_true',
                        help='显示版本信息')
     parser.add_argument('--help', '-h', action='store_true',
                        help='显示帮助消息')
-    
+
     args, unknown_args = parser.parse_known_args()
-    
+
     if args.version:
         print(f"cbhcli version {__version__}")
         return
-    
+
     if args.help:
         print_help()
         return
@@ -179,6 +193,48 @@ def main():
     except Exception as e:
         print(f"\n❌ 错误: {str(e)}")
         sys.exit(1)
+
+
+def _run_exec(args: list):
+    """一次性非交互执行任务（headless 模式）
+
+    对标 claude -p / codex exec：任务 -> ReAct 循环 -> 结果到 stdout -> 退出。
+    退出码：0=成功 | 1=执行错误 | 2=用法错误或权限拒绝 | 130=用户中断
+    """
+    parser = argparse.ArgumentParser(
+        prog='cbhcli exec',
+        description='一次性非交互执行任务（headless 模式，用于脚本/CI/管道集成）',
+    )
+    parser.add_argument('prompt', nargs='?', default=None,
+                        help='任务描述；缺省且 stdin 非 TTY 时自动读 stdin，"-" 显式读 stdin')
+    parser.add_argument('--agent', default=None,
+                        help='使用指定 Agent（默认上次激活的 Agent）')
+    parser.add_argument('--model', default=None,
+                        help='本次临时使用指定模型（不写入持久化配置）')
+    parser.add_argument('--mode', choices=['readonly', 'standard', 'auto', 'yolo'],
+                        default='yolo', help='权限模式（默认: yolo 零确认）')
+    parser.add_argument('--max-turns', type=int, default=999,
+                        help='ReAct 循环最大轮次保护（默认: 999）')
+    parser.add_argument('--output-format', choices=['text', 'json'],
+                        default='text', help='text=只输出最终回答；json=输出结构化结果')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='显示过程输出（工具执行/思考过程实时走 stderr）；'
+                             '默认静音，stdout 只含最终结果（管道友好）')
+    parser.add_argument('--continue', '-c', dest='continue_session',
+                        action='store_true',
+                        help='续接该 Agent 最近一次历史会话后执行')
+    parser.add_argument('--resume', dest='resume_session', default=None,
+                        metavar='SESSION_ID',
+                        help='恢复指定历史会话后执行（会话ID或文件名）')
+    parser.add_argument('--no-save', action='store_true',
+                        help='本次会话不写入 history')
+    parser.add_argument('--cwd', default=None,
+                        help='启动前切换到指定工作目录')
+
+    ns = parser.parse_args(args)
+
+    from cbhcli_pkg.core.exec_runner import run_exec
+    sys.exit(run_exec(ns))
 
 
 def _run_web(args: list):

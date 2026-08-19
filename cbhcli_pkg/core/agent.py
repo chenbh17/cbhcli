@@ -130,8 +130,8 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /tools [list|on|off] - 工具开关管理
 - /fallback [add|list|rm|reorder|clear] - 备用模型管理
 - /mcp [add|list|rm|refresh|tools|on|off] - MCP服务器管理
-- /qqbot [add|list|start|stop|restart|status|rm|config] - QQ Bot管理
 - /chain [list|add|rm|use|off|show|config|rename] - Agent链条管理（无参数进入交互引导）
+- /qqbot [add|list|start|stop|restart|status|rm|config] - QQ Bot管理
 - quit - 退出程序
 
 ## 权限模式（Harness 治理层）
@@ -212,12 +212,16 @@ Agent 链条允许你编排多个用户 Agent 之间的调用关系，实现跨 
 激活链条后，元 Agent 的系统提示中会注入下游 Agent 的描述和调用说明，
 可通过 call_agent 工具调用下游 Agent（以各自完整身份执行任务）。
 
-## 记录信息
-当用户要求记录信息时：
-1. 判断类型(记忆/知识/技能)
-2. 长期记忆 → 追加到 memory.md（用户明确要求时）
-3. 知识文件 → 保存到 knowledge/
-4. 使用 write/edit 追加，不覆盖
+## 一次性非交互执行（cbhcli exec）
+cbhcli exec 是终端一次性执行入口（对标 claude -p / codex exec）：下发任务 -> AI 自动完成工具循环 -> 结果输出 -> 进程退出，用于 shell 脚本/CI/管道：
+- cbhcli exec "任务描述"                              # 默认静音，stdout 只含最终结果
+- echo "内容" | cbhcli exec "处理指令"                # 管道输入（自动读 stdin）
+- cbhcli exec -v "任务描述"                           # --verbose 显示过程输出(走 stderr)
+- cbhcli exec --agent 名 --model 名 --mode 模式 "任务"  # 模式: readonly/standard/auto/yolo
+- cbhcli exec -c "继续上次任务"                       # 续接最近会话（--resume 会话ID 恢复指定会话）
+- cbhcli exec --output-format json "任务" | jq .result  # 结构化输出供脚本消费
+退出码：0=成功 1=执行错误 2=权限拒绝/用法错误 130=中断。
+用户想在脚本/CI/管道中调用 cbhcli 时推荐此入口；完整参数让用户执行 cbhcli exec -h 查看。
 
 ## QQ Bot 管理
 - /qqbot add <名称> <AppID> <AppSecret> [agent] - 添加 QQ Bot
@@ -228,6 +232,13 @@ Agent 链条允许你编排多个用户 Agent 之间的调用关系，实现跨 
 - /qqbot status - 查看 Bot 状态
 - /qqbot rm <名称> - 删除 QQ Bot
 - /qqbot config <名称> - 修改 Bot 配置
+
+## 记录信息
+当用户要求记录信息时：
+1. 判断类型(记忆/知识/技能)
+2. 长期记忆 → 追加到 memory.md（用户明确要求时）
+3. 知识文件 → 保存到 knowledge/
+4. 使用 write/edit 追加，不覆盖
 
 ## 注意事项
 - 文件操作使用绝对路径
