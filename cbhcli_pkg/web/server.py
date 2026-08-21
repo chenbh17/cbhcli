@@ -96,7 +96,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.2.5")
+app = FastAPI(title="CBHCLI Web", version="5.2.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2166,8 +2166,39 @@ def _fill_aborted_tool_msgs(cs: WebChatSession, valid_calls: list):
             tool_call_id=tc["id"])
 
 
+def _autosave_web_session(cs: "WebChatSession") -> None:
+    """每轮对话结束自动保存会话到 history（v5.2.6）
+
+    覆盖 _react_loop 全部出口：done / aborted / error / 死循环熔断 /
+    达到最大轮数 / SSE 连接断开（客户端 aclose 生成器触发 finally）。
+    同 session_id 幂等覆盖同一文件，Web/Jupyter 服务重启或崩溃时
+    最多丢失正在生成的当前轮，已完成的对话轮均已落盘。
+    """
+    try:
+        if cs and cs.session and len(cs.session.messages) > 1:
+            cfg = cs.agent_config or _get_agent_config(getattr(cs, "agent_name", ""))
+            if cfg:
+                SessionHistoryManager(cfg.workspace_path).save_session(
+                    cs.session.get_context_messages(), cs.session.id)
+    except Exception:
+        pass  # 保存失败不影响对话
+
+
 async def _react_loop(cs: WebChatSession):
-    """完整 ReAct 循环（与 CLI ai_handler 对齐），产生 SSE 事件。"""
+    """完整 ReAct 循环（与 CLI ai_handler 对齐），产生 SSE 事件。
+
+    v5.2.6：wrapper 层 try/finally 保证每轮对话结束（含全部出口与
+    SSE 连接断开）自动保存会话到 history，实际循环在 _react_loop_inner。
+    """
+    try:
+        async for ev in _react_loop_inner(cs):
+            yield ev
+    finally:
+        _autosave_web_session(cs)
+
+
+async def _react_loop_inner(cs: WebChatSession):
+    """（v5.2.6 由 _react_loop 包装）完整 ReAct 循环，产生 SSE 事件。"""
     failure_counts: dict[str, int] = {}
     openai_tools = cs.tool_registry.get_openai_tools()
     stream_kwargs = {"temperature": API_TEMPERATURE}

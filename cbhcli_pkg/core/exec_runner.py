@@ -120,6 +120,12 @@ def _build_app(args, state: dict):
 
     _install_patches(app, state, args)
     _restore_history(app, args)
+
+    # --no-save：同时关闭每轮自动保存（v5.2.6 起 _handle_ai_request 的
+    # finally 会每轮自动落盘，--no-save 语义需一并覆盖，保证完全不留痕）
+    if getattr(args, "no_save", False):
+        app.autosave_history = False
+
     return app
 
 

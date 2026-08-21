@@ -9,8 +9,9 @@ class SessionHistoryManager:
     """管理会话历史的保存和恢复
     
     会话文件保存在 agent 工作空间目录下的 history/ 文件夹中。
-    每次 /new 或 /reset 时自动保存当前会话。
-    用户可以使用 /resume 命令恢复之前的会话。
+    v5.2.6 起每轮对话结束自动保存（同 session_id 幂等覆盖同一文件），
+    应用异常退出（崩溃/kill/断网）时最多丢失正在生成的当前轮。
+    /new 或 /reset 时保存当前会话；/resume 可恢复历史会话。
     """
     
     def __init__(self, agent_workspace: Path):
@@ -22,25 +23,47 @@ class SessionHistoryManager:
         self.history_dir.mkdir(parents=True, exist_ok=True)
     
     def save_session(self, messages: list[dict], session_id: str = "") -> str:
-        """保存会话到 history 文件夹
-        
+        """保存会话到 history 文件夹（同 session_id 幂等覆盖）
+
+        v5.2.6 起支持每轮对话自动保存：同一 session_id 再次保存时直接
+        覆盖更新已有文件（保留首次 created_at），而不是新建文件。
+        因此一个会话对应一个文件，/new、quit、每轮自动保存等多次
+        调用不会产生重复文件。
+
         Args:
             messages: 会话消息列表（API 格式）
             session_id: 会话ID，如果为空则自动生成
-            
+
         Returns:
             保存的文件路径
         """
         if not messages:
             return ""
-        
-        # 生成文件名：时间戳_会话ID
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
         if not session_id:
             session_id = datetime.now().strftime("%H%M%S")
-        
-        filename = f"{timestamp}_{session_id}.json"
-        filepath = self.history_dir / filename
+
+        # 幂等定位：查找同 session_id 的已有文件（文件名格式 时间戳_会话ID.json）
+        created_at = datetime.now().isoformat()
+        filepath = None
+        if not any(c in session_id for c in "*?[]"):
+            existing = sorted(
+                self.history_dir.glob(f"*_{session_id}.json"), reverse=True)
+            if existing:
+                filepath = existing[0]
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        old_data = json.load(f)
+                    # 保留首次保存时间（会话创建时间语义）
+                    created_at = old_data.get("created_at", created_at)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        if filepath is None:
+            # 生成新文件名：时间戳_会话ID
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{timestamp}_{session_id}.json"
+            filepath = self.history_dir / filename
         
         # 提取用户输入作为会话标题（处理多模态content格式）
         first_user_msg = ""
@@ -74,7 +97,7 @@ class SessionHistoryManager:
         # 保存会话数据
         session_data = {
             "id": session_id,
-            "created_at": datetime.now().isoformat(),
+            "created_at": created_at,
             "title": first_user_msg or "空会话",
             "message_count": len(cleaned_messages),
             "messages": cleaned_messages

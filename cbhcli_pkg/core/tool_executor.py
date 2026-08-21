@@ -308,11 +308,11 @@ class ToolExecutor:
                         with open(path, 'r', encoding='utf-8') as f:
                             content = f.read()
 
-                        # 统一查找（精确/空白宽容/Unicode转义宽容），
+                        # 统一查找（v5.2.7 五级链：精确/空白/转义/折叠/模糊），
                         # 宽容匹配时 old_str 可能与文件实际内容不同，
                         # 用文件实际匹配的文本渲染预览
                         from cbhcli_pkg.tools.file_edit import find_edit_matches
-                        spans, matched_text = find_edit_matches(content, old_str)
+                        spans, matched_text, _method = find_edit_matches(content, old_str)
                         if spans:
                             pos = spans[0][0]
                             # 计算行号

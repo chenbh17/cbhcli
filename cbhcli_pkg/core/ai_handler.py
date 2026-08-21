@@ -396,6 +396,9 @@ class AIHandler:
                     # 思考内容复读检测
                     if reasoning_loop.feed(content):
                         text_loop_hit = True
+                        # v5.2.7：先清思考状态行再打印，防提示行打在
+                        # 状态行下方导致状态行残留
+                        self.thinking_display.suspend_status()
                         print(f"\n{self._c_dim}⚠️ 检测到思考过程陷入重复，已截断{C_RESET}")
                         stream.close()
                         break
@@ -433,12 +436,20 @@ class AIHandler:
                     if content_loop.feed(content):
                         text_loop_hit = True
                         ai_response = content_loop.truncated_text()
+                        self.thinking_display.suspend_status()
                         print(f"\n{self._c_dim}⚠️ 检测到回复内容陷入重复，已截断{C_RESET}")
                         stream.close()
                         break
 
             # 流式结束 — 完成 Markdown 渲染（清除纯文本+前缀，重新渲染）
             md_renderer.flush()
+
+            # v5.2.7：流结束后立即关闭思考显示（必须在打印 🔧 工具调用行
+            # 之前--旧版在流末尾才 finish，reasoning->tool_calls 无 content
+            # 的流中 🔧 的 \n 会把光标推离思考区域，finish 擦除错位导致
+            # 思考内容"换行重复显示"）
+            if self.thinking_display.is_thinking:
+                self.thinking_display.finish_thinking()
 
             # 构造结构化 tool_calls
             tool_calls = []
@@ -469,9 +480,8 @@ class AIHandler:
                     self.tool_executor.tracer.log_loop(
                         "text_loop", detail="流式输出复读截断")
 
-            # 确保在流式结束时关闭思考显示（如果仍在思考中）
-            if is_reasoning and self.thinking_display.is_thinking:
-                self.thinking_display.finish_thinking()
+            # v5.2.7：finish 已提前到打印 🔧 之前（见 md_renderer.flush() 后），
+            # 此处无需再关闭
 
             print()
 
@@ -485,7 +495,7 @@ class AIHandler:
             # 确保在异常情况下也能关闭渲染器和思考显示
             if md_renderer.started:
                 md_renderer.cleanup()
-            if is_reasoning and self.thinking_display.is_thinking:
+            if self.thinking_display.is_thinking:
                 self.thinking_display.finish_thinking()
             raise
 
