@@ -126,6 +126,146 @@ def _find_unicode_escape_spans(content: str, old_str: str) -> list[tuple[int, in
     return []
 
 
+# ======================================================================
+# v5.2.7：折叠归一化宽容匹配（全角/半角、中英文引号、连字符、零宽字符）
+# ======================================================================
+
+# 1:1 折叠映射（保持字符位置一一对应，匹配后可精确映射回原文区间）
+_FOLD_STATIC = {
+    # 中文引号 -> 英文引号
+    '“': '"', '”': '"', '‘': "'", '’': "'",
+    # 连字符/破折号家族 -> '-'
+    '–': '-', '—': '-', '―': '-', '−': '-',
+}
+# 零宽/不可见字符（匹配时直接跳过，1:0 映射）
+_INVISIBLE_CHARS = {chr(0x200B), chr(0x200C), chr(0x200D),
+                    chr(0xFEFF), chr(0x2060)}
+
+
+def _fold_char(ch: str) -> str:
+    """单字符折叠：全角ASCII->半角、中文引号->英文、破折号->'-'、零宽->''"""
+    o = ord(ch)
+    if ch in _FOLD_STATIC:
+        return _FOLD_STATIC[ch]
+    if 0xFF01 <= o <= 0xFF5E:          # 全角 ASCII 区
+        return chr(o - 0xFEE0)
+    if o == 0x3000:                     # 全角空格
+        return ' '
+    if ch in _INVISIBLE_CHARS:
+        return ''
+    return ch
+
+
+def _folded_index(s: str) -> tuple:
+    """返回 (folded_str, pos_map)：folded 第 i 个字符对应 s 的原字符下标。"""
+    chars, pos = [], []
+    for i, ch in enumerate(s):
+        f = _fold_char(ch)
+        if f:
+            chars.append(f)
+            pos.append(i)
+    return ''.join(chars), pos
+
+
+def _find_folded_spans(content: str, old_str: str) -> list:
+    """折叠归一化匹配：两侧都折叠后查找，命中区间精确映射回原文。
+
+    解决 LLM 对形似字符的幻觉：文件半角而 old_str 写成全角（或反之）、
+    中英文引号混用、em-dash/en-dash/连字符混淆、文件含零宽字符而
+    old_str 没抄到 等精确匹配失败的场景。
+    """
+    folded_old, _ = _folded_index(old_str)
+    if not folded_old:
+        return []
+    folded_content, pos_map = _folded_index(content)
+    spans = []
+    start = 0
+    while True:
+        p = folded_content.find(folded_old, start)
+        if p == -1:
+            break
+        s = pos_map[p]
+        e = pos_map[p + len(folded_old) - 1] + 1
+        spans.append((s, e))
+        start = p + 1
+    return spans
+
+
+# ======================================================================
+# v5.2.7：difflib 相似度模糊兜底（LLM 幻觉的最后防线）
+# ======================================================================
+
+def _line_offsets(lines: list) -> list:
+    """行起始字符偏移表（offsets[i] = 第 i 行起点，末尾附全文长度）"""
+    offsets = [0]
+    for ln in lines:
+        offsets.append(offsets[-1] + len(ln) + 1)
+    return offsets
+
+
+def _find_fuzzy_span(content: str, old_str: str,
+                     min_ratio: float = 0.85) -> dict:
+    """difflib 模糊匹配：在文件行窗口中找与 old_str 最相似的片段。
+
+    所有精确/宽容匹配失败后，LLM 的 old_str 与目标文本往往仍高度相似
+    （个别字符幻觉）。此函数用 SequenceMatcher.ratio() 定位最相似窗口。
+
+    Returns:
+        dict: {'span': (s, e), 'ratio': r, 'runnerup': r2,
+               'start_line': 行号1基, 'n_lines': 窗口行数, 'window': 窗口文本}
+        未找到（无探针命中 / 相似度过低）返回 None
+    """
+    from difflib import SequenceMatcher
+    if len(old_str) < 12:            # 过短易误匹配，不做模糊兜底
+        return None
+    lines = content.split('\n')
+    n_old = old_str.count('\n') + 1
+    # 探针：old_str 头/中/尾三个 ~10 字符片段，行级预筛控制性能
+    probes = []
+    L = len(old_str)
+    for frac in (0.0, 0.4, 0.8):
+        p = old_str[int(L * frac): int(L * frac) + 10]
+        if len(p) >= 6 and p not in probes:
+            probes.append(p)
+    if not probes:
+        return None
+    hit_lines = set()
+    for i, line in enumerate(lines):
+        for p in probes:
+            if p in line:
+                hit_lines.add(i)
+                break
+    if not hit_lines:
+        return None
+    # 候选窗口：以命中行为结尾的 n_old 行窗口（起点枚举去重）
+    max_start = max(0, len(lines) - n_old)
+    candidates = set()
+    for h in hit_lines:
+        lo = max(0, h - n_old + 1)
+        hi = min(h, max_start)
+        for st in range(lo, hi + 1):
+            candidates.add(st)
+    best = None       # (ratio, start_line)
+    second = 0.0
+    for st in sorted(candidates):
+        window = '\n'.join(lines[st:st + n_old])
+        r = SequenceMatcher(None, old_str, window, autojunk=False).ratio()
+        if best is None or r > best[0]:
+            second = best[0] if best else 0.0
+            best = (r, st)
+        elif r > second:
+            second = r
+    if best is None or best[0] < min_ratio:
+        return None
+    offsets = _line_offsets(lines)
+    r, st = best
+    s = offsets[st]
+    e = offsets[min(st + n_old, len(lines))]
+    return {'span': (s, e), 'ratio': r, 'runnerup': second,
+            'start_line': st + 1, 'n_lines': n_old,
+            'window': '\n'.join(lines[st:st + n_old])}
+
+
 def _find_best_line_repr(content: str, old_str: str, max_lines: int = 5) -> list:
     """匹配失败时，找与 old_str 最相似的若干行，返回 (行号, repr) 列表。
 
@@ -158,21 +298,34 @@ def find_edit_matches(content: str, old_str: str) -> tuple:
             matched_text: 文件中实际匹配到的文本（宽容匹配时可能与 old_str 不同，
                           用于预览显示文件真实内容）
     """
+    # v5.2.7 五级匹配链：精确 -> 空白宽容 -> Unicode 转义宽容 -> 折叠归一化 -> difflib 模糊
     spans = _find_exact_spans(content, old_str)
     if spans:
-        return spans, old_str
+        return spans, old_str, "exact"
 
     spans = _find_flex_spans(content, old_str)
     if spans:
         s, e = spans[0]
-        return spans, content[s:e]
+        return spans, content[s:e], "flex"
 
     spans = _find_unicode_escape_spans(content, old_str)
     if spans:
         s, e = spans[0]
-        return spans, content[s:e]
+        return spans, content[s:e], "escape"
 
-    return [], old_str
+    # 折叠归一化：全角/半角、中英文引号、连字符家族、零宽字符
+    spans = _find_folded_spans(content, old_str)
+    if spans:
+        s, e = spans[0]
+        return spans, content[s:e], "fold"
+
+    # difflib 模糊兜底：仅当最佳窗口显著高于第二名（无歧义）才采用
+    fuzzy = _find_fuzzy_span(content, old_str)
+    if fuzzy and fuzzy['runnerup'] < fuzzy['ratio'] - 0.03:
+        s, e = fuzzy['span']
+        return [(s, e)], content[s:e], "fuzzy"
+
+    return [], old_str, "none"
 
 
 class EditTool(BaseTool):
@@ -244,20 +397,13 @@ class EditTool(BaseTool):
             with open(path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            # 1) 精确匹配
-            matches = _find_exact_spans(content, old_str)
-            flex_used = False
-            escape_used = False
-
-            # 2) 精确失败 → 空白字符宽容匹配（空格/非断行空格互通）
-            if not matches:
-                matches = _find_flex_spans(content, old_str)
-                flex_used = bool(matches)
-
-            # 3) 精确失败 → Unicode 转义宽容匹配（字面转义序列 ↔ 实际字符）
-            if not matches:
-                matches = _find_unicode_escape_spans(content, old_str)
-                escape_used = bool(matches)
+            # v5.2.7 五级匹配链（统一入口 find_edit_matches，预览与执行结果一致）：
+            # 精确 / 空白宽容 / Unicode 转义宽容 / 折叠归一化 / difflib 模糊
+            matches, matched_text, match_method = find_edit_matches(content, old_str)
+            flex_used = match_method == "flex"
+            escape_used = match_method == "escape"
+            fold_used = match_method == "fold"
+            fuzzy_used = match_method == "fuzzy"
 
             # 检查匹配数量
             if len(matches) == 0:
@@ -275,7 +421,22 @@ class EditTool(BaseTool):
                 if chr(0xA0) in content:
                     error_msg += ("\n\n提示: 文件包含非断行空格(U+00A0)，"
                                   "可能还存在其他不可见字符差异，建议用 read 查看原文后复制粘贴")
-                error_msg += "\n（已尝试空白字符/Unicode 转义宽容匹配，仍未命中）"
+                error_msg += ("\n（已尝试空白/Unicode转义/折叠归一化(全角半角·中英引号·"
+                              "破折号·零宽字符)宽容匹配，仍未命中）")
+
+                # v5.2.7 模糊诊断：展示最相似窗口，帮 AI 一发命中
+                fuzzy = _find_fuzzy_span(content, old_str, min_ratio=0.60)
+                if fuzzy:
+                    pct = fuzzy['ratio'] * 100
+                    error_msg += (f"\n\n[模糊匹配诊断] 最相似位置: 行 {fuzzy['start_line']}"
+                                  f"~{fuzzy['start_line'] + fuzzy['n_lines'] - 1}"
+                                  f"（相似度 {pct:.0f}%）")
+                    error_msg += f"\n  该处实际内容(repr): {fuzzy['window'][:150]!r}"
+                    if fuzzy['ratio'] >= 0.85:
+                        error_msg += ("\n  （相似度已达标但存在并列候选或窗口歧义，未自动替换；"
+                                      "请用 read 查看该行后按实际字符重试）")
+                    else:
+                        error_msg += "\n  （相似度不足，请对照实际内容修正 old_str）"
 
                 # 诊断：展示 old_str 与文件最相似行的 repr（真实转义层级对比）
                 best_lines = _find_best_line_repr(content, old_str)
@@ -353,6 +514,10 @@ class EditTool(BaseTool):
                 output_lines.append("ℹ️  已使用空白字符宽容匹配（空格/非断行空格视为相同）")
             if escape_used:
                 output_lines.append("ℹ️  已使用 Unicode 转义宽容匹配（字面转义序列与实际字符互通）")
+            if fold_used:
+                output_lines.append("ℹ️  已使用折叠归一化宽容匹配（全角/半角、中英文引号、破折号、零宽字符视为相同），实际替换的是文件原文")
+            if fuzzy_used:
+                output_lines.append(f"⚠️  已使用模糊匹配（old_str 与文件不完全一致，已替换文件中最相似片段），请检查结果是否符合预期")
 
             if line_change != 0:
                 output_lines.append(f"📊 行数变化: {'+' if line_change > 0 else ''}{line_change} 行")

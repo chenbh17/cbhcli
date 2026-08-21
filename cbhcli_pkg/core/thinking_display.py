@@ -1,20 +1,36 @@
-"""思考内容滚动显示模块（手动 ANSI 区域重绘，resize 安全）
+"""思考内容滚动显示模块（v5：滚动窗口重绘 + 破坏点防御清单）
 
-为什么放弃 rich.Live（v4.9.9 重写）：
-    Live 按"自然行数"上移光标擦除。终端变窄后，已打印的长行被终端
-    reflow（1 行软换成 N 行），物理行数 > 自然行数，擦除不足 →
-    每来一个 chunk 就残留一行 💭 思考中...（连续重复）。
+## 显示形态（用户要求）
 
-本方案的精确性来自三点：
-1. 区域每行都硬换行到 region_width（≤ 终端宽度），自然行数=物理行数，
-   光标上移 \\033[{n}A + 擦除到屏幕尾 \\033[J 的数学完全精确；
-2. region_width 在区域建立时固定为 min(终端宽度, 100)。终端宽度不变
-   或变宽时，已打印行绝不会被 reflow（长度 ≤ region_width ≤ 当前宽度），
-   原地重绘永远安全；
-3. 仅当终端变得比 region_width 更窄（内容可能已被 reflow，强行擦除
-   可能误删上方 AI 回答），放弃擦除：旧区域作为一次性快照留存，光标
-   已在区域下方，直接以新宽度重建区域。每次收窄最多 1 个快照，
-   不会出现连续重复。
+    💭 思考中... 12s          <- 头行（1 物理行，秒数随 chunk 实时更新）
+    <最后 max_lines 行思考内容>  <- 滚动窗口：新行进来，最旧的行被顶出窗口
+
+新内容到达 -> 窗口上移一行 -> 看到最新 8 行在滚动，旧行不占屏幕。
+
+## 演进史与教训（v2 -> v4 -> v5）
+
+- v2（v4.9.9）：窗口重绘（上移 N 行 + 擦除 + 重画）。数学自洽，但依赖隐式
+  契约「窗口存续期间没有其他输出把光标推走、终端宽度不变」。
+- v2 的重复 bug 实锤（2026-08 用户报告）：reasoning->tool_calls（无 content）
+  的流中，ai_handler 在流结束后打印 `\n🔧 工具名(...)` 时窗口仍存活，光标
+  被多推 2 行；finish 的 \033[{N}A 上移数错位 -> 窗口头部残留 + 新窗口画在
+  下方 = 同段思考显示两遍。
+- v4（v5.2.7）：append-only 全打印。零重复机制上成立，但用户否决显示形态
+  （思考全文全部打印，不是有限行数滚动窗口）。
+- v5（本版）：恢复 v2 滚动窗口形态 + v5.2.7 实锤修复的破坏点 + 新防御。
+  rich.Live 不可用：其内部同为"上移擦除"式重绘，同病。
+
+## 破坏点防御清单（v5 全部覆盖）
+
+1. 🔧 工具行 print：ai_handler 已把 finish_thinking 提前到打印 🔧 之前
+   （v5.2.7，见 ai_handler._stream_with_model 流结束段）；
+2. 复读警告 print（思考流中）：ai_handler 打印前调用 suspend_status()
+   擦除活动窗口 -> 警告行打在窗口外 -> 后续 add_content 重建窗口；
+3. resize 变窄：region_width 策略（v2 保留）--窗口行宽 <= region_width，
+   终端变窄时旧窗口行已被 reflow，放弃擦除留一次性快照，以新宽度重建，
+   每次收窄最多 1 份快照，不会连续重复；
+4. 终端过矮（高度 <= max_lines+2）：收缩窗口行数，防窗口本身超屏滚动；
+5. enabled=False（exec headless / 并行子 Agent）：完全 no-op。
 
 无后台线程：重绘由流式 chunk 驱动，头行实时显示已思考秒数。
 """
@@ -46,10 +62,10 @@ def _display_width(text: str) -> int:
 
 
 def _hard_wrap_line(text: str, max_width: int) -> List[str]:
-    """将一行文本按终端宽度硬换行，返回每行恰好 ≤ max_width 的行列表。
+    """将一行文本按终端宽度硬换行，返回每行恰好 <= max_width 的行列表。
 
     这是精确擦除的核心：每个自然行 = 一个物理屏幕行，
-    光标移动/区域擦除的行数计算不再受 soft-wrap 干扰。
+    光标移动/窗口擦除的行数计算不再受 soft-wrap 干扰。
     """
     if max_width <= 0:
         return [text]
@@ -98,14 +114,14 @@ def _truncate_to_width(text: str, max_width: int) -> str:
 
 
 class ThinkingDisplay:
-    """思考内容滚动显示管理器（手动 ANSI 区域重绘）
+    """思考内容滚动窗口管理器（v5：窗口重绘 + 破坏点防御）
 
-    区域结构：
-        💭 思考中... 12s        ← 头行（1 物理行，实时秒数）
-        <最近 max_lines 行思考内容>  ← 每行硬换行到 region_width
+    窗口结构：
+        💭 思考中... 12s        <- 头行（1 物理行，实时秒数）
+        <最近 max_lines 行思考内容>  <- 每行硬换行到 region_width
 
-    不变量：区域每行 ≤ region_width ≤ 当前终端宽度 → 无 soft-wrap →
-    打印 N 行后光标恰在区域下方 N 行处，\\033[{N}A + \\033[J 精确擦除。
+    不变量：窗口每行 <= region_width <= 当前终端宽度 -> 无 soft-wrap ->
+    打印 N 行后光标恰在窗口下方 N 行处，\033[{N}A + \033[J 精确擦除。
     """
 
     def __init__(self, max_lines: int = 8, label: str = ""):
@@ -113,10 +129,11 @@ class ThinkingDisplay:
         self.label = label
         self.full_text = ""
         self.is_thinking = False
-        # 并行子Agent等输出被捕获的场景下设为 False（禁用原地重绘）
+        # 并行子Agent等输出被捕获的场景下设为 False（禁用窗口重绘）
         self.enabled: bool = True
-        self._region_lines: int = 0   # 当前区域物理行数（0=无活动区域）
-        self._region_width: int = 0   # 区域建立时固定的换行宽度
+        self._region_lines: int = 0   # 当前窗口物理行数（0=无活动窗口）
+        self._region_width: int = 0   # 窗口建立时固定的换行宽度
+        self._window_lines: int = max_lines  # 当前窗口内容行数（高度自适应后可收缩）
         self._start: float = 0.0
 
     # ------------------------------------------------------------------
@@ -129,6 +146,12 @@ class ThinkingDisplay:
         except (ValueError, OSError):
             return 80
 
+    def _get_term_height(self) -> int:
+        try:
+            return os.get_terminal_size().lines
+        except (ValueError, OSError):
+            return 24
+
     @staticmethod
     def _out(s: str):
         sys.stdout.write(s)
@@ -137,6 +160,11 @@ class ThinkingDisplay:
     def _new_region_width(self) -> int:
         w = self._get_term_width()
         return max(_MIN_REGION_WIDTH, min(w, _MAX_REGION_WIDTH))
+
+    def _fit_window_lines(self) -> int:
+        """终端过矮时收缩窗口行数，防窗口本身超屏滚动导致擦除错位"""
+        h = self._get_term_height()
+        return max(3, min(self.max_lines, h - 2))
 
     # ------------------------------------------------------------------
     #  渲染
@@ -150,7 +178,7 @@ class ThinkingDisplay:
         return _truncate_to_width(text, self._region_width)
 
     def _content_lines(self) -> List[str]:
-        """窗口化内容：硬换行后取最后 max_lines 行"""
+        """窗口化内容：硬换行后取最后 _window_lines 行"""
         if not self.full_text:
             return ["..."]
         text = self.full_text.strip("\n")
@@ -159,10 +187,16 @@ class ThinkingDisplay:
         lines: List[str] = []
         for natural_line in text.split("\n"):
             lines.extend(_hard_wrap_line(natural_line, self._region_width))
-        return lines[-self.max_lines:]
+        return lines[-self._window_lines:]
+
+    def _erase_window(self):
+        """擦除活动窗口（\033[{N}A + \033[J），置空活动状态"""
+        if self._region_lines:
+            self._out(f"\033[{self._region_lines}A\033[J")
+            self._region_lines = 0
 
     def _draw(self, final: bool = False):
-        """重绘区域：先上移擦除旧区域，再逐行打印新区域"""
+        """重绘窗口：先上移擦除旧窗口，再逐行打印新窗口"""
         if self._region_lines:
             self._out(f"\033[{self._region_lines}A\033[J")
         lines = [self._header(final=final)] + self._content_lines()
@@ -181,6 +215,7 @@ class ThinkingDisplay:
         self.full_text = ""
         self._start = time.monotonic()
         self._region_width = self._new_region_width()
+        self._window_lines = self._fit_window_lines()
         self._region_lines = 0
         self._draw()
 
@@ -191,13 +226,27 @@ class ThinkingDisplay:
 
         current_width = self._get_term_width()
         if current_width < self._region_width:
-            # 终端窄于区域宽度：已打印行可能已被 reflow，强行擦除可能
-            # 误删上方内容。放弃擦除，旧区域留作快照（每次收窄最多一次），
-            # 以新宽度在下方重建区域。
+            # 终端变窄：已打印行可能已被 reflow，强行擦除可能误删上方内容。
+            # 放弃擦除，旧窗口留作一次性快照（每次收窄最多一份），
+            # 以新宽度在下方重建窗口。
             self._region_lines = 0
             self._region_width = max(_MIN_REGION_WIDTH,
                                      min(current_width, _MAX_REGION_WIDTH))
+        # 高度自适应（终端变矮 -> 收缩窗口；变高 -> 恢复但不超过 max_lines）
+        new_window = self._fit_window_lines()
+        if new_window != self._window_lines:
+            self._window_lines = new_window
         self._draw()
+
+    def suspend_status(self):
+        """擦除活动窗口（v5 语义：供外部在流式过程中打印提示行前调用）。
+
+        外部 print 会把光标推离窗口，后续重绘的上移数将错位导致残留；
+        先擦除窗口置空状态，外部行打在窗口外，后续 add_content 自动重建。
+        """
+        if not self.enabled:
+            return
+        self._erase_window()
 
     def finish_thinking(self):
         if not self.is_thinking:
@@ -215,23 +264,28 @@ class ThinkingDisplay:
             self._out(f"\033[{self._region_lines}A\033[J")
         lines = [self._header(final=True)] + self._content_lines()
         self._out("".join(f"{C_DIM}{line}{C_RESET}\n" for line in lines))
-        # 区域转为静态历史，不再管理
+        # 窗口转为静态历史，不再管理
         self._region_lines = 0
         self._start = 0.0
 
     def cleanup(self):
         """强制清理终端状态（Ctrl+C 中断等异常场景）"""
         self.is_thinking = False
-        if self._region_lines:
+        if self._region_lines and self.enabled:
             try:
                 self._out(f"\033[{self._region_lines}A\033[J")
             except Exception:
                 pass
-            self._region_lines = 0
+        self._region_lines = 0
         self._start = 0.0
-        # 确保光标可见
-        sys.stdout.write("\033[?25h")
-        sys.stdout.flush()
+        if not self.enabled:
+            return  # 捕获场景（subagent/exec）不写 ANSI，防乱码
+        try:
+            # 确保光标可见
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     #  信息查询

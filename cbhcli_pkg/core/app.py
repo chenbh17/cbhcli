@@ -481,6 +481,8 @@ class CBHCLIApp:
         
         self.session: Optional[Session] = None
         self.context_window: Optional[ContextWindow] = None
+        # 每轮对话自动保存开关（exec --no-save 时关闭，v5.2.6）
+        self.autosave_history: bool = True
         self.llm_client: Optional[LLMClient] = None
         self.context_compressor: Optional[ContextCompressor] = None
         self.session_history: Optional[SessionHistoryManager] = None
@@ -510,6 +512,15 @@ class CBHCLIApp:
         Returns:
             是否加载成功
         """
+        # 切换 Agent 时：先把当前会话保存到【旧】Agent 的 history（v5.2.6 修复：
+        # 旧逻辑在下方先重建 session_history 指向新 Agent 工作空间，再由
+        # _reset_session 保存旧会话，导致旧会话被误存到新 Agent 的 history
+        # 目录，回头在旧 Agent 的 /history 里找不到这段对话）
+        # 必须在旧组件（session_history 尚指向旧 Agent）被替换之前执行。
+        prev_agent = self.current_agent_name
+        if prev_agent and prev_agent != agent_name:
+            self._autosave_session()
+
         config = self.agent_manager.load_agent(agent_name)
         if not config:
             return False
@@ -560,7 +571,8 @@ class CBHCLIApp:
             except Exception as e:
                 print(f"⚠️  索引工作空间失败: {e}")
         
-        self._reset_session()
+        # 会话已在函数开头保存到旧 Agent 的 history，此处跳过再保存
+        self._reset_session(save_current=False)
 
         # Agent 链条：恢复持久化的激活状态
         if not getattr(self, '_active_chain', None):
@@ -1190,7 +1202,24 @@ class CBHCLIApp:
             except Exception as e:
                 print(f"\n错误: {str(e)}{C_RESET}")
                 continue
-    
+
+    def _autosave_session(self):
+        """每轮对话结束自动保存会话到 history（v5.2.6）
+
+        同 session_id 幂等覆盖同一文件，多次保存不产生重复文件。
+        覆盖场景：正常回复完成、Ctrl+C 中断（process_request 内部已捕获）、
+        请求异常等--应用崩溃/kill/关终端时最多丢正在生成的当前轮。
+        """
+        if not self.autosave_history:
+            return
+        try:
+            if getattr(self, "session", None) and getattr(self, "session_history", None) \
+                    and len(self.session.messages) > 1:
+                self.session_history.save_session(
+                    self.session.get_context_messages(), self.session.id)
+        except Exception:
+            pass  # 保存失败不影响对话
+
     def _handle_ai_request(self, user_input: str):
         """处理AI请求 - 委托给AIHandler"""
         # 检查上下文压缩
@@ -1237,18 +1266,23 @@ class CBHCLIApp:
         # 设置记忆更新回调
         handler.on_memory_update(self._update_memory)
 
-        # 处理请求
-        handler.process_request(user_input)
+        try:
+            # 处理请求
+            handler.process_request(user_input)
 
-        # Stop 钩子：AI 回复完成后触发（通知/自动保存等）
-        if getattr(self, "hook_manager", None) and \
-                self.hook_manager.has_hooks("Stop"):
-            decision = self.hook_manager.run_simple(
-                "Stop", session_id=self.session.id if self.session else "")
-            for line in decision.outputs:
-                print(f"{C_DIM}[hook:Stop] {line}{C_RESET}")
-            for warn in decision.warnings:
-                print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
+            # Stop 钩子：AI 回复完成后触发（通知/自动保存等）
+            if getattr(self, "hook_manager", None) and \
+                    self.hook_manager.has_hooks("Stop"):
+                decision = self.hook_manager.run_simple(
+                    "Stop", session_id=self.session.id if self.session else "")
+                for line in decision.outputs:
+                    print(f"{C_DIM}[hook:Stop] {line}{C_RESET}")
+                for warn in decision.warnings:
+                    print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
+        finally:
+            # 每轮对话结束自动保存（v5.2.6）：正常/中断/异常出口统一落盘，
+            # 应用崩溃或被 kill 时最多丢失正在生成的当前轮
+            self._autosave_session()
     
     def _update_memory(self, user_input: str, ai_response: str):
         """更新记忆回调 - 仅用于保存会话历史
