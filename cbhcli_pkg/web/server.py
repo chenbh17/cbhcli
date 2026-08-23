@@ -12,6 +12,7 @@ import threading
 import os
 import uuid
 import base64
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -96,7 +97,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.2.7")
+app = FastAPI(title="CBHCLI Web", version="5.2.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -132,6 +133,56 @@ def get_permission_engine() -> PermissionEngine:
 _chat_sessions: dict[str, 'WebChatSession'] = {}
 # MCP 管理器缓存（管理 API 专用，带独立注册表）: agent_name -> MCPManager
 _mcp_managers: dict[str, MCPManager] = {}
+
+# ---- 工作空间（v5.2.8）----
+# 服务器启动目录（工作空间浏览的根目录，会话按工作空间分组）
+_SERVER_ROOT = Path(os.getcwd()).resolve()
+# 当前打开的工作空间目录（打开工作空间时 os.chdir 切换，工具/Agent 随之生效）
+_current_workspace: str = str(_SERVER_ROOT)
+
+
+# 已打开工作空间的持久化记录（打开过即常驻侧边栏，不因切换/重启消失）
+_WS_LIST_FILE = CBHCLI_DIR / "web_workspaces.json"
+
+
+def _load_opened_workspaces() -> list:
+    try:
+        with open(_WS_LIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [p for p in data if isinstance(p, str)]
+    except Exception:
+        return []
+
+
+def _record_opened_workspace(path: str) -> None:
+    """记录最近打开的工作空间（最新在前，最多 50 条）。"""
+    try:
+        lst = [p for p in _load_opened_workspaces() if p != path]
+        lst.insert(0, path)
+        with open(_WS_LIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(lst[:50], f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _set_current_workspace(path: str) -> None:
+    """切换当前工作空间：chdir 服务器进程 + 记录状态 + 刷新活跃会话系统提示。
+
+    v5.2.8 修正：只重建系统提示（cwd 是进程级全局），**不改写各活跃会话
+    的 workspace 归属标签**——否则切换工作空间会把别的文件夹下的会话
+    "带入"新文件夹（下次保存时归档到错误分组）。
+    """
+    global _current_workspace
+    target = Path(path).resolve()
+    os.chdir(target)
+    _current_workspace = str(target)
+    _record_opened_workspace(_current_workspace)
+    # Agent 系统提示含 cwd，切换后重建使 Agent 知道新工作空间
+    for cs in list(_chat_sessions.values()):
+        try:
+            cs._rebuild_system_prompt()
+        except Exception:
+            pass
 
 
 def get_config() -> GlobalConfig:
@@ -437,6 +488,11 @@ class WebChatSession:
         # Agent 链条状态
         self.active_chain = None
         self.chain_active_path = None
+
+        # 会话所属工作空间（v5.2.8，保存历史时写入用于按工作空间分组）
+        self.workspace = _current_workspace
+        # 自定义会话标题（v5.2.8 侧边栏重命名；为空时用首条用户消息）
+        self.custom_title = ""
 
         # asyncio 原语（在首次使用时绑定到运行中的事件循环）
         self.respond_queue: Optional[asyncio.Queue] = None
@@ -2130,8 +2186,10 @@ async def _stream_round(cs: WebChatSession, messages: list, stream_kwargs: dict,
             if not fb_config:
                 continue
             fallback_tried.add(fb_name)
+            # v5.2.8：携带详细报错信息（与 CLI 一致，不再只显示"调用失败"）
             yield _sse({"type": "fallback",
-                        "content": f"主模型调用失败，切换到备用模型 '{fb_name}'..."})
+                        "content": f"主模型调用失败: {stream_error}，"
+                                   f"切换到备用模型 '{fb_name}'..."})
             active_client = LLMClient(fb_config)
             switched = True
             break
@@ -2179,7 +2237,9 @@ def _autosave_web_session(cs: "WebChatSession") -> None:
             cfg = cs.agent_config or _get_agent_config(getattr(cs, "agent_name", ""))
             if cfg:
                 SessionHistoryManager(cfg.workspace_path).save_session(
-                    cs.session.get_context_messages(), cs.session.id)
+                    cs.session.get_context_messages(), cs.session.id,
+                    workspace=getattr(cs, "workspace", "") or "",
+                    title=getattr(cs, "custom_title", "") or "")
     except Exception:
         pass  # 保存失败不影响对话
 
@@ -3016,7 +3076,9 @@ async def reset_chat(req: Request):
                 history_mgr = SessionHistoryManager(agent_config.workspace_path)
                 try:
                     history_mgr.save_session(
-                        cs.session.get_context_messages(), cs.session.id)
+                        cs.session.get_context_messages(), cs.session.id,
+                        workspace=getattr(cs, "workspace", "") or "",
+                        title=getattr(cs, "custom_title", "") or "")
                 except Exception:
                     pass
 
@@ -3064,7 +3126,9 @@ async def chat_switch_model(req: Request):
                 agent_config = _get_agent_config(agent_name)
                 if agent_config:
                     SessionHistoryManager(agent_config.workspace_path).save_session(
-                        existing.session.get_context_messages(), existing.session.id)
+                        existing.session.get_context_messages(), existing.session.id,
+                        workspace=getattr(existing, "workspace", "") or "",
+                        title=getattr(existing, "custom_title", "") or "")
             except Exception:
                 pass
 
@@ -3119,6 +3183,7 @@ def chat_status(agent_name: str, model_name: str):
             "active": False, "message_count": 0, "token_estimate": 0,
             "ctx_percentage": 0.0, "model_limit": 0, "remaining_tokens": 0,
             "tool_call_count": 0, "cwd": os.getcwd(),
+            "workspace": _current_workspace,
         }
         try:
             saved_chain = get_config().get_active_chain(agent_name)
@@ -3128,6 +3193,8 @@ def chat_status(agent_name: str, model_name: str):
         return result
     stats = cs.usage_stats()
     stats.update({"active": True, "cwd": os.getcwd(),
+                  "workspace": _current_workspace,
+                  "session_id": cs.session.id,
                   "busy": bool(cs.lock and cs.lock.locked())})
     # 链条激活状态（前端据此更新按钮）
     if cs.active_chain:
@@ -3147,38 +3214,48 @@ def chat_messages(agent_name: str, model_name: str):
     return {"messages": cs.export_messages()}
 
 
-@app.post("/api/chat/load")
-async def chat_load(req: Request):
-    """加载历史会话为当前会话（完整重建压缩组件，修复旧版缺陷）。"""
-    body = await req.json()
-    agent_name = body.get("agent_name", "")
-    model_name = body.get("model_name", "")
-    filename = body.get("filename", "")
+def _load_session_core(agent_name: str, model_name: str, filename: str):
+    """加载历史会话为当前会话（v5.2.8，chat_load 与 workspace/open 共用）。
 
-    if not agent_name or not model_name or not filename:
-        raise HTTPException(400, "缺少 agent_name / model_name / filename")
-
+    【保留原会话 id/创建时间/工作空间/标题】：后续自动保存幂等覆盖同一文件，
+    对该会话的新问答都记录在该会话下（点击会话=直接跳转，不产生副本）。
+    切换时【不保存旧会话】（每轮已自动保存落盘），仅中断。返回 (cs, data)。
+    """
     agent_config = _get_agent_config(agent_name)
     if not agent_config:
         raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
     history_mgr = SessionHistoryManager(agent_config.workspace_path)
-    hist_messages = history_mgr.load_session(filename)
-    if hist_messages is None:
+    data = history_mgr.load_session_full(filename)
+    if data is None:
         raise HTTPException(404, "会话不存在")
 
-    # 先保存并移除旧会话
     key = _get_session_key(agent_name, model_name)
     old = _chat_sessions.pop(key, None)
-    if old and old.session and len(old.session.messages) > 1:
+    if old:
+        old.abort = True
+
+    cs = WebChatSession.create(agent_name, model_name)
+    orig_id = data.get("id") or ""
+    if orig_id:
+        cs.session.id = orig_id
         try:
-            history_mgr.save_session(old.session.get_context_messages(), old.session.id)
+            if cs.tracer:
+                cs.tracer.session_id = orig_id
         except Exception:
             pass
-
-    # 全新会话（含全部组件），再注入历史消息
-    cs = WebChatSession.create(agent_name, model_name)
-    for msg in hist_messages:
+        try:
+            cs.app_proxy.tool_executor.session_id = orig_id
+        except Exception:
+            pass
+    try:
+        if data.get("created_at"):
+            cs.session.created_at = datetime.fromisoformat(data["created_at"])
+    except Exception:
+        pass
+    cs.workspace = data.get("workspace") or str(_SERVER_ROOT)
+    cs.custom_title = data.get("title") or ""
+    for msg in data.get("messages", []):
         role = msg.get("role", "")
         content = msg.get("content", "") or ""
         # 跳过 system 消息（保留新建系统提示，含最新 skills/tools.md），
@@ -3193,10 +3270,374 @@ async def chat_load(req: Request):
             reasoning_content=msg.get("reasoning_content"),
         )
     _chat_sessions[key] = cs
+    return cs, data
+
+
+@app.post("/api/chat/load")
+async def chat_load(req: Request):
+    """加载历史会话为当前会话（完整重建压缩组件，修复旧版缺陷）。"""
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    model_name = body.get("model_name", "")
+    filename = body.get("filename", "")
+    session_id = (body.get("session_id") or "").strip()
+
+    if not agent_name or not model_name or (not filename and not session_id):
+        raise HTTPException(400, "缺少 agent_name / model_name / filename")
+
+    # v5.2.8：无文件名时按会话 id 定位（服务器重启后前端自动找回原会话）
+    if not filename and session_id and not any(c in session_id for c in "*?[]"):
+        agent_config = _get_agent_config(agent_name)
+        if agent_config:
+            hist_dir = SessionHistoryManager(
+                agent_config.workspace_path).history_dir
+            found = sorted(hist_dir.glob(f"*_{session_id}.json"), reverse=True)
+            if found:
+                filename = found[0].name
+    if not filename:
+        raise HTTPException(404, "会话不存在")
+
+    cs, data = _load_session_core(agent_name, model_name, filename)
+
+    # v5.2.8：加载会话时同步切换到其所属工作空间（Agent 随之知道新工作目录）
+    ws = (body.get("workspace") or "").strip() or cs.workspace
+    if ws and Path(ws).is_dir():
+        try:
+            _set_current_workspace(ws)
+        except Exception:
+            pass
 
     return {"message": "会话已加载",
             "messages": cs.export_messages(),
-            "usage": cs.usage_stats()}
+            "usage": cs.usage_stats(),
+            "workspace": _current_workspace}
+
+
+# ===================================================================
+#  工作空间管理（v5.2.8：侧边栏会话按工作空间分组）
+# ===================================================================
+
+def _is_under(p: Path, root: Path) -> bool:
+    try:
+        p.relative_to(root)
+        return True
+    except Exception:
+        return False
+
+
+def _ws_display_name(path: str) -> str:
+    """工作空间显示名：相对服务器根目录的路径（根目录本身用目录名）。"""
+    try:
+        rel = Path(path).resolve().relative_to(_SERVER_ROOT)
+        if str(rel) == ".":
+            return _SERVER_ROOT.name or str(_SERVER_ROOT)
+        return str(rel)
+    except Exception:
+        return Path(path).name or str(path)
+
+
+@app.get("/api/workspace/info")
+def workspace_info(agent_name: str):
+    """工作空间列表：按工作空间目录分组，组内为该目录下的会话（含活跃会话）。"""
+    history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
+    saved = history_mgr.list_sessions(limit=500)
+
+    groups: "dict[str, dict]" = {}
+
+    def group_of(ws: str) -> dict:
+        ws = ws or str(_SERVER_ROOT)
+        if ws not in groups:
+            groups[ws] = {"path": ws, "name": _ws_display_name(ws),
+                          "sessions": []}
+        return groups[ws]
+
+    # 活跃会话（内存中，优先于历史文件展示）
+    seen_ids = set()
+    for cs in list(_chat_sessions.values()):
+        if cs.agent_name != agent_name or not cs.session:
+            continue
+        title = getattr(cs, "custom_title", "") or ""
+        if not title:
+            title = "新会话"
+            for m in cs.session.messages:
+                if m.role == "user" and (m.content or "").strip():
+                    # 压缩换行/连续空白，避免侧边栏/列表标题折行
+                    title = " ".join(m.content.split())[:50]
+                    break
+        seen_ids.add(cs.session.id)
+        group_of(getattr(cs, "workspace", "") or "")["sessions"].append({
+            "filename": "", "id": cs.session.id, "title": title,
+            "created_at": cs.session.created_at.isoformat(),
+            "message_count": len(cs.session.messages),
+            "workspace": getattr(cs, "workspace", "") or str(_SERVER_ROOT),
+            "model": cs.model_name, "active": True,
+        })
+
+    # 历史会话（与活跃会话同 id 的跳过，活跃条目更新）
+    for s in saved:
+        if s.get("id") in seen_ids:
+            continue
+        entry = dict(s)
+        entry["active"] = False
+        group_of(s.get("workspace", "") or "")["sessions"].append(entry)
+
+    # 确保当前工作空间 + 历史打开过的工作空间始终在列表中
+    # （打开过的工作空间常驻侧边栏，不因切换到新工作空间而消失）
+    opened = [p for p in _load_opened_workspaces() if Path(p).is_dir()]
+    group_of(_current_workspace)
+    for p in opened:
+        group_of(p)
+
+    # 组内按时间倒序
+    for g in groups.values():
+        g["sessions"].sort(key=lambda x: x.get("created_at") or "", reverse=True)
+
+    # 排序：当前工作空间优先 → 按最近打开顺序 → 仅历史会话出现的按最新会话倒序
+    cur = [g for g in groups.values() if g["path"] == _current_workspace]
+    seen = {g["path"] for g in cur}
+    opened_rest = []
+    for p in opened:
+        g = groups.get(p)
+        if g and p not in seen:
+            opened_rest.append(g)
+            seen.add(p)
+    hist_rest = [g for g in groups.values() if g["path"] not in seen]
+    hist_rest.sort(key=lambda g: (g["sessions"][0]["created_at"]
+                                  if g["sessions"] else ""), reverse=True)
+    workspaces = cur + opened_rest + hist_rest
+
+    return {"server_root": str(_SERVER_ROOT),
+            "current": _current_workspace,
+            "workspaces": workspaces}
+
+
+@app.get("/api/workspace/browse")
+def workspace_browse(path: str = ""):
+    """列出目录下的子文件夹（打开工作空间的选择弹窗），限定服务器根目录内。"""
+    base = Path(path).resolve() if path else _SERVER_ROOT
+    if not (base == _SERVER_ROOT or _is_under(base, _SERVER_ROOT)):
+        raise HTTPException(403, "只能浏览当前目录下的文件夹")
+    if not base.is_dir():
+        raise HTTPException(404, "目录不存在")
+    dirs = []
+    for d in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+        try:
+            if d.is_dir() and not d.name.startswith("."):
+                dirs.append({"name": d.name, "path": str(d.resolve())})
+        except Exception:
+            continue
+    return {"path": str(base), "server_root": str(_SERVER_ROOT),
+            "relative": _ws_display_name(str(base)), "dirs": dirs}
+
+
+@app.post("/api/workspace/open")
+async def workspace_open(req: Request):
+    """打开文件夹作为工作空间：保存当前会话 + 切换工作目录。"""
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    model_name = body.get("model_name", "")
+    path = (body.get("path") or "").strip()
+    if not agent_name or not model_name or not path:
+        raise HTTPException(400, "缺少 agent_name / model_name / path")
+    target = Path(path).resolve()
+    if not (target == _SERVER_ROOT or _is_under(target, _SERVER_ROOT)):
+        raise HTTPException(403, "只能打开当前目录下的文件夹作为工作空间")
+    if not target.is_dir():
+        raise HTTPException(404, "目录不存在")
+
+    # 当前会话保存到旧工作空间（与 /new 相同的保存逻辑）
+    key = _get_session_key(agent_name, model_name)
+    old = _chat_sessions.pop(key, None)
+    if old and old.session and len(old.session.messages) > 1:
+        try:
+            cfg = _get_agent_config(agent_name)
+            if cfg:
+                SessionHistoryManager(cfg.workspace_path).save_session(
+                    old.session.get_context_messages(), old.session.id,
+                    workspace=getattr(old, "workspace", "") or "",
+                    title=getattr(old, "custom_title", "") or "")
+        except Exception:
+            pass
+
+    _set_current_workspace(str(target))
+
+    # resume=True（侧边栏"选择该文件夹"）：恢复该工作空间下最新会话
+    messages_out: list = []
+    usage_out = None
+    if body.get("resume"):
+        history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
+        latest = None
+        for s in history_mgr.list_sessions(limit=200):
+            if (s.get("workspace") or str(_SERVER_ROOT)) == str(target):
+                latest = s
+                break
+        if latest:
+            cs, _ = _load_session_core(agent_name, model_name, latest["filename"])
+            messages_out = cs.export_messages()
+            usage_out = cs.usage_stats()
+
+    return {"message": f"已打开工作空间: {_ws_display_name(str(target))}",
+            "workspace": _current_workspace,
+            "messages": messages_out, "usage": usage_out}
+
+
+@app.post("/api/workspace/sessions/clear")
+async def workspace_sessions_clear(req: Request):
+    """删除某工作空间下的全部会话（v5.2.8 文件夹三点菜单）。"""
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    path = (body.get("path") or "").strip()
+    if not agent_name or not path:
+        raise HTTPException(400, "缺少 agent_name / path")
+    target = str(Path(path).resolve())
+    history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
+    removed = 0
+    for s in history_mgr.list_sessions(limit=1000):
+        if (s.get("workspace") or str(_SERVER_ROOT)) == target:
+            if history_mgr.delete_session(s["filename"]):
+                removed += 1
+    was_active = False
+    for key in list(_chat_sessions.keys()):
+        cs = _chat_sessions[key]
+        if cs.agent_name == agent_name and \
+                (getattr(cs, "workspace", "") or "") == target:
+            cs.abort = True
+            _chat_sessions.pop(key, None)
+            was_active = True
+    return {"message": f"已删除 {removed} 个会话",
+            "removed": removed, "was_active": was_active}
+
+
+@app.get("/api/files/list")
+def files_list(path: str = ""):
+    """文件管理器：列出目录下的文件和文件夹（v5.2.8，限定当前工作空间内）。"""
+    ws = Path(_current_workspace).resolve()
+    base = Path(path).resolve() if path else ws
+    if not (base == ws or _is_under(base, ws)):
+        raise HTTPException(403, "只能浏览当前工作空间内的文件")
+    if not base.is_dir():
+        raise HTTPException(404, "目录不存在")
+    try:
+        items = sorted(base.iterdir(),
+                       key=lambda p: (not p.is_dir(), p.name.lower()))
+    except Exception as e:
+        raise HTTPException(500, f"读取目录失败: {e}")
+    entries = []
+    for p in items:
+        try:
+            st = p.stat()
+            entries.append({
+                "name": p.name,
+                "path": str(p.resolve()),
+                "is_dir": p.is_dir(),
+                "size": 0 if p.is_dir() else st.st_size,
+                "mtime": round(st.st_mtime),
+            })
+        except Exception:
+            continue
+    return {"path": str(base), "workspace": str(ws), "entries": entries}
+
+
+def _find_live_session(agent_name: str, session_id: str):
+    """按会话 id 查找内存中的活跃会话（v5.2.8 会话管理）。"""
+    for cs in list(_chat_sessions.values()):
+        if cs.agent_name == agent_name and cs.session \
+                and cs.session.id == session_id:
+            return cs
+    return None
+
+
+@app.post("/api/workspace/session/rename")
+async def session_rename(req: Request):
+    """重命名会话（v5.2.8 侧边栏会话管理）。"""
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    session_id = body.get("session_id", "")
+    filename = body.get("filename", "")
+    # 压缩换行/连续空白为单空格（标题保持单行）
+    title = " ".join((body.get("title") or "").split())
+    if not agent_name or not title:
+        raise HTTPException(400, "缺少 agent_name / title")
+    history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
+    live = _find_live_session(agent_name, session_id) if session_id else None
+    if live:
+        live.custom_title = title
+    if filename:
+        if not history_mgr.update_session_title(filename, title):
+            raise HTTPException(404, "会话不存在")
+    elif live and live.session and len(live.session.messages) > 1:
+        # 活跃会话尚未落盘时立即保存以持久化标题
+        cfg = _get_agent_config(agent_name)
+        if cfg:
+            SessionHistoryManager(cfg.workspace_path).save_session(
+                live.session.get_context_messages(), live.session.id,
+                workspace=getattr(live, "workspace", "") or "", title=title)
+    return {"message": "已重命名"}
+
+
+@app.post("/api/workspace/session/delete")
+async def session_delete(req: Request):
+    """删除会话（若为活跃会话同时清除内存对话）。"""
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    session_id = body.get("session_id", "")
+    filename = body.get("filename", "")
+    if not agent_name:
+        raise HTTPException(400, "缺少 agent_name")
+    history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
+    deleted = False
+    if filename:
+        deleted = history_mgr.delete_session(filename)
+    elif session_id and not any(c in session_id for c in "*?[]"):
+        # 无文件名时按会话 id 删除历史文件（复制产生的副本等）
+        for fp in history_mgr.history_dir.glob(f"*_{session_id}.json"):
+            try:
+                fp.unlink()
+                deleted = True
+            except Exception:
+                pass
+    live = _find_live_session(agent_name, session_id) if session_id else None
+    if live:
+        live.abort = True
+        _chat_sessions.pop(
+            _get_session_key(live.agent_name, live.model_name), None)
+        deleted = True
+    if not deleted:
+        raise HTTPException(404, "会话不存在")
+    return {"message": "已删除", "was_active": bool(live)}
+
+
+@app.post("/api/workspace/session/copy")
+async def session_copy(req: Request):
+    """复制会话（新 id 独立副本，可再重命名/分支对话）。"""
+    body = await req.json()
+    agent_name = body.get("agent_name", "")
+    session_id = body.get("session_id", "")
+    filename = body.get("filename", "")
+    if not agent_name:
+        raise HTTPException(400, "缺少 agent_name")
+    history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
+    live = _find_live_session(agent_name, session_id) if session_id else None
+    if live:
+        if not live.session or len(live.session.messages) <= 1:
+            raise HTTPException(400, "当前会话为空，无法复制")
+        new_id = str(uuid.uuid4())
+        history_mgr.save_session(
+            live.session.get_context_messages(), new_id,
+            workspace=getattr(live, "workspace", "") or "",
+            title=getattr(live, "custom_title", "") or "")
+        return {"message": "已复制", "new_id": new_id}
+    if not filename:
+        raise HTTPException(400, "缺少 filename")
+    data = history_mgr.load_session_full(filename)
+    if data is None:
+        raise HTTPException(404, "会话不存在")
+    new_id = str(uuid.uuid4())
+    history_mgr.save_session(
+        data.get("messages", []), new_id,
+        workspace=data.get("workspace", "") or "",
+        title=data.get("title", "") or "")
+    return {"message": "已复制", "new_id": new_id}
 
 
 @app.post("/api/chat/compress")

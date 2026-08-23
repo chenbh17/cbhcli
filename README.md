@@ -1,4 +1,4 @@
-# CBHCLI v5.2.7 - AI驱动的终端助手
+# CBHCLI v5.2.8 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -162,7 +162,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.2.7-py3-none-any.whl
+pip install dist/cbhcli-5.2.8-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -233,8 +233,9 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 ### 6. 会话管理
 ```
 /new 或 /reset    # 创建新会话（自动保存当前会话到history文件夹）
-/resume           # 列出历史会话
+/resume           # 列出历史会话（最近50条）
 /resume 1         # 恢复第1个历史会话
+/resume 打包      # 按标题关键词搜索历史会话
 /history          # 查看历史会话列表
 /comp             # 手动压缩上下文
 /comp 保留迁移方案，丢弃调试过程   # 带指令压缩
@@ -480,7 +481,7 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/model embedding` | 配置嵌入模型 |
 | `/model rerank` | 配置重排序模型 |
 | `/reset` 或 `/new` | 创建新会话（自动保存当前会话） |
-| `/resume [编号]` | 列出或恢复历史会话 |
+| `/resume [编号\|关键词]` | 列出或恢复历史会话（关键词按标题搜索） |
 | `/history` | 查看历史会话列表 |
 | `/comp [指令]` | 压缩上下文（可带保留/丢弃指令） |
 | `/undo-compress [编号]` | 撤销最近一次上下文压缩（恢复压缩前原始消息） |
