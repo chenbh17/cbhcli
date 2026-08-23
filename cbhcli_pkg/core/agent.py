@@ -115,7 +115,7 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /agent [add|rm|use] <name> - Agent管理
 - /model [add|use|rm|config|embedding|rerank] - 模型管理
 - /new 或 /reset - 创建新会话（自动保存当前会话到history）
-- /resume [编号] - 列出或恢复历史会话
+- /resume [编号|关键词] - 列出或恢复历史会话（关键词按标题搜索）
 - /history - 查看历史会话列表
 - /ctx - 查看上下文使用情况
 - /comp [指令] - 手动压缩上下文（可带保留/丢弃指令）

@@ -41,13 +41,25 @@ def register_session_commands(parser, app):
         if not app.session_history:
             return "❌ 会话历史管理器未初始化"
         
-        sessions = app.session_history.list_sessions(20)
+        sessions = app.session_history.list_sessions(50)
         if not sessions:
             return "📭 暂无历史会话"
-        
+
         # 如果提供了参数，直接用参数选择
         choice = args.strip()
-        
+
+        # 关键词搜索：参数非编号且非已有文件名时，按标题过滤全部历史
+        # （历史会话很多时，旧会话超出默认列表窗口，可用关键词找回）
+        if choice and not choice.isdigit() \
+                and app.session_history.load_session(choice) is None:
+            kw = choice.lower()
+            matched = [s for s in app.session_history.list_sessions(500)
+                       if kw in (s.get("title") or "").lower()]
+            if not matched:
+                return f"❌ 未找到标题包含「{choice}」的会话"
+            sessions = matched[:50]
+            choice = ""  # 展示匹配列表，重新选择
+
         if not choice:
             # 无参数时显示交互式选择菜单
             lines = ["📋 选择要恢复的会话 (输入编号或文件名):\n"]
@@ -57,11 +69,12 @@ def register_session_commands(parser, app):
                 count = s.get("message_count", 0)
                 lines.append(f"  {i:2d}. [{created}] {title} ({count} 条消息)")
             lines.append(f"\n   0. 取消")
+            lines.append("   提示: /resume <关键词> 可按标题搜索更多历史会话")
             lines.append("")
-            
+
             print("\n" + "\n".join(lines))
             choice = ask_text("请选择 [编号/文件名]: ").strip()
-            
+
             if not choice or choice == '0':
                 return "已取消"
         
@@ -126,7 +139,7 @@ def register_session_commands(parser, app):
     parser.register(SlashCommand(
         name="resume",
         description="列出或恢复历史会话",
-        usage="[编号或文件名]",
+        usage="[编号|文件名|关键词]",
         handler=resume_handler,
         requires_agent=True
     ))
