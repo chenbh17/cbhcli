@@ -139,8 +139,25 @@ const api = {
     request("/chat/abort", { method: "POST", body: JSON.stringify({ agent_name, model_name }) }),
   chatStatus: (a, m) => request(`/chat/status?agent_name=${enc(a)}&model_name=${enc(m)}`),
   chatMessages: (a, m) => request(`/chat/messages?agent_name=${enc(a)}&model_name=${enc(m)}`),
-  chatLoad: (agent_name, model_name, filename) =>
-    request("/chat/load", { method: "POST", body: JSON.stringify({ agent_name, model_name, filename }) }),
+  chatLoad: (agent_name, model_name, filename, workspace, session_id) =>
+    request("/chat/load", { method: "POST", body: JSON.stringify({ agent_name, model_name, filename: filename || "", workspace: workspace || "", session_id: session_id || "" }) }),
+
+  // 工作空间（v5.2.8：侧边栏会话按工作空间分组）
+  workspaceInfo: (a) => request(`/workspace/info?agent_name=${enc(a)}`),
+  workspaceBrowse: (p) => request(`/workspace/browse?path=${enc(p || "")}`),
+  workspaceOpen: (a, m, path, resume) =>
+    request("/workspace/open", { method: "POST", body: JSON.stringify({ agent_name: a, model_name: m, path, resume: !!resume }) }),
+  workspaceClearSessions: (a, path) =>
+    request("/workspace/sessions/clear", { method: "POST", body: JSON.stringify({ agent_name: a, path }) }),
+  // 文件管理器（v5.2.8）
+  filesList: (p) => request(`/files/list?path=${enc(p || "")}`),
+  // 会话管理（v5.2.8：重命名/删除/复制）
+  sessionRename: (a, s, title) =>
+    request("/workspace/session/rename", { method: "POST", body: JSON.stringify({ agent_name: a, session_id: s.id, filename: s.filename, title }) }),
+  sessionDelete: (a, s) =>
+    request("/workspace/session/delete", { method: "POST", body: JSON.stringify({ agent_name: a, session_id: s.id, filename: s.filename }) }),
+  sessionCopy: (a, s) =>
+    request("/workspace/session/copy", { method: "POST", body: JSON.stringify({ agent_name: a, session_id: s.id, filename: s.filename }) }),
   chatCompress: (agent_name, model_name, instructions) =>
     request("/chat/compress", { method: "POST", body: JSON.stringify({ agent_name, model_name, instructions: instructions || "" }) }),
   chatUpload: (file, a, m) => {
@@ -941,7 +958,20 @@ const state = {
   currentView: "chat",
   statusTimer: null,
   activeChain: null,  // 当前激活的链条名称
+  currentWorkspace: "",   // 当前打开的工作空间目录（v5.2.8）
+  wsExpanded: {},         // 工作空间展开状态 {path: bool}（v5.2.8）
+  wsShowAll: {},          // 工作空间"展开其余N个会话"状态（v5.2.8）
+  wsFilter: "",           // 会话搜索过滤词（v5.2.8）
+  currentSessionId: null, // 当前后端会话 id（服务器重启后自动找回用，v5.2.8）
+  fmPath: "",             // 文件管理器当前浏览目录（空=工作空间根，v5.2.8）
+  fmWorkspace: "",        // 文件管理器对应的的工作空间（切换时重置，v5.2.8）
 };
+
+/* ---- 面板布局常量（v5.2.8：工作区/文件管理器左右互换 + 拖拽调宽） ---- */
+const PANEL_MIN_W = 170, PANEL_MAX_W = 520;
+const LS_FM_SIDE = "cbhcli.fmSide";       // 文件管理器在哪侧: left/right
+const LS_WS_WIDTH = "cbhcli.wsPanelW";    // 工作区面板宽度
+const LS_FM_WIDTH = "cbhcli.fmPanelW";    // 文件管理器面板宽度
 
 function currentAgent() { return state.activeAgent; }
 function currentModel() { return state.selectedModel; }
@@ -971,6 +1001,8 @@ function switchView(name) {
   state.currentView = name;
   $$(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.view === name));
   $$(".view").forEach(v => v.classList.toggle("active", v.id === `view-${name}`));
+  const settingsBtn = $("#btn-settings");
+  if (settingsBtn) settingsBtn.classList.toggle("active", name === "settings");
   if (location.hash !== `#/${name}`) location.hash = `#/${name}`;
   const loader = VIEW_LOADERS[name];
   if (loader) loader().catch(e => toast(e.message, "error"));
@@ -1117,6 +1149,7 @@ async function onAgentChange() {
   await restoreMessages();
   await refreshStatus();
   updateChainIndicator();
+  refreshWorkspaces();
 }
 
 async function onModelChange() {
@@ -1176,6 +1209,7 @@ async function refreshStatus() {
   try {
     const s = await api.chatStatus(a, m);
     updateCtxMeter(s);
+    if (s.workspace) state.currentWorkspace = s.workspace;
     const cwdBar = $("#cwd-bar");
     if (cwdBar) {
       $("#cwd-bar-text").textContent = s.cwd || "";
@@ -1186,7 +1220,35 @@ async function refreshStatus() {
       state.activeChain = s.active_chain || null;
       updateChainIndicator();
     }
+    // v5.2.8：跟踪后端会话 id；若后端会话丢失（服务器重启）但页面仍有
+    // 对话内容，自动按 id 找回并恢复该会话（含上下文进度条）
+    if (s.active) {
+      if (s.session_id) state.currentSessionId = s.session_id;
+    } else if (!state.streaming && state.currentSessionId
+               && $(".msg-column", chatUI.messages)) {
+      const sid = state.currentSessionId;
+      state.currentSessionId = null;  // 先清空，恢复失败时不重试
+      restoreLostSession(sid);
+    }
   } catch { /* 忽略 */ }
+}
+
+/* 后端会话丢失（服务器重启）后按会话 id 自动恢复 */
+async function restoreLostSession(sessionId) {
+  const a = currentAgent(), m = currentModel();
+  if (!a || !m) return;
+  try {
+    const r = await api.chatLoad(a, m, "", "", sessionId);
+    state.currentSessionId = sessionId;
+    if (r.workspace) state.currentWorkspace = r.workspace;
+    clearMessages();
+    renderRestoredMessages(r.messages || []);
+    if (r.usage) updateCtxMeter(r.usage);
+    toast("检测到服务重启，会话已自动恢复", "info");
+    refreshWorkspaces();
+  } catch {
+    // 会话从未落盘（未完成过完整对话轮），无法恢复，保持当前展示
+  }
 }
 
 function updateCtxMeter(s) {
@@ -1390,7 +1452,8 @@ async function runStream(userContent, images) {
     const statusEl = el("span", { class: "tag amber tool-status" }, "等待确认");
     const previewEl = el("span", { class: "tool-preview-text" });
     const bodyEl = el("div", { class: "tool-card-body" });
-    const cardEl = el("div", { class: "tool-card open" },
+    // v5.2.8：工具卡片默认收起展示（点击标题展开），避免页面过长
+    const cardEl = el("div", { class: "tool-card" },
       el("div", { class: "tool-card-header" },
         el("span", { class: "arrow" }, "▶"),
         el("span", { class: "tool-icon" }, toolIcon(name)),
@@ -1495,15 +1558,11 @@ async function runStream(userContent, images) {
     scrollBottom();
   }
 
-  // Todo 专用面板（跟随最近一次 Todo 调用位置，始终展示全部事项）
-  let todoPanel = null;
+  // Todo 专用面板（v5.2.8：每调用一次 Todo 展示一次面板，不再原地替换）
   const showTodoPanel = (args) => {
     const todos = normalizeTodos(args);
     if (!todos.length) return;
-    const panel = todoPanelEl(todos);
-    if (todoPanel && todoPanel.isConnected) todoPanel.replaceWith(panel);
-    else aiBody.append(panel);
-    todoPanel = panel;
+    aiBody.append(todoPanelEl(todos));
     scrollBottom();
   };
 
@@ -1522,15 +1581,19 @@ async function runStream(userContent, images) {
       return;
     }
 
+    // 需确认时展开工具卡片，便于用户审查参数后再决定
+    rec.cardEl.classList.add("open");
+
     // 确认条（参数已在上方工具卡片中高亮展示，此处不再重复）
+    // v5.2.8：按钮顺序与 CLI 一致 [Y/n/all/always]，"始终允许"改名消除歧义
     const chainTag = data.chain_agent ? ` [${data.chain_agent}]` : "";
     const confirmEl = el("div", { class: "confirm-card" },
       el("div", { class: "confirm-title" }, `⚠️ 确认执行 ${data.tool_name}${chainTag} ?`),
       el("div", { class: "confirm-actions" },
         el("button", { class: "btn btn-sm btn-success", "data-r": "y" }, "✓ 允许"),
         el("button", { class: "btn btn-sm btn-danger", "data-r": "n" }, "✕ 拒绝"),
-        el("button", { class: "btn btn-sm", "data-r": "always" }, "始终允许"),
-        el("button", { class: "btn btn-sm", "data-r": "all" }, "全部允许")));
+        el("button", { class: "btn btn-sm", "data-r": "all" }, "全部允许"),
+        el("button", { class: "btn btn-sm", "data-r": "always" }, "始终允许该命令")));
     rec.confirmEl = confirmEl;
     aiBody.append(confirmEl);
     scrollBottom();
@@ -1815,6 +1878,7 @@ async function runStream(userContent, images) {
     // 回复完成后渲染 mermaid / echarts 图表（流式中先显示代码）
     void renderDiagrams(aiBody);
     refreshStatus();
+    refreshWorkspaces();  // 会话标题/自动落盘后同步侧边栏
     scrollBottom();
     chatUI.input.focus();
   }
@@ -1825,9 +1889,25 @@ async function restoreMessages() {
   const a = currentAgent(), m = currentModel();
   if (!a || !m) return;
   try {
-    const { messages } = await api.chatMessages(a, m);
-    if (!messages || !messages.length) return;
-    renderRestoredMessages(messages);
+    const st = await api.chatStatus(a, m);
+    if (st.active) {
+      if (st.session_id) state.currentSessionId = st.session_id;
+      updateCtxMeter(st);
+      const { messages } = await api.chatMessages(a, m);
+      if (messages && messages.length) renderRestoredMessages(messages);
+      return;
+    }
+    // v5.2.8：无活跃会话（如服务器重启后重新打开页面）→ 自动恢复最近会话，
+    // 避免页面空白/进度条归零且上下文丢失
+    const hist = await api.getHistory(a, 1);
+    const latest = (hist.sessions || [])[0];
+    if (!latest) return;
+    const r = await api.chatLoad(a, m, latest.filename, latest.workspace);
+    state.currentSessionId = latest.id || null;
+    if (r.workspace) state.currentWorkspace = r.workspace;
+    if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
+    if (r.usage) updateCtxMeter(r.usage);
+    refreshWorkspaces();
   } catch { /* 忽略 */ }
 }
 
@@ -1933,6 +2013,7 @@ function renderRestoredMessages(messages) {
 async function newSession() {
   const ok = await confirmDialog("新建会话", "当前会话将保存到历史记录，确定开始新会话吗？", { okText: "新建" });
   if (!ok) return;
+  state.currentSessionId = null;  // 主动新建，禁用丢失自动恢复
   try {
     await api.chatReset(currentAgent(), currentModel());
     clearMessages();
@@ -2000,6 +2081,582 @@ async function showUndoModal() {
   }
 
   const m = openModal({ title: "↩️ 回滚文件修改", body, width: "640px" });
+}
+
+/* ===================================================================
+   侧边栏工作区会话列表（v5.2.8）
+   =================================================================== */
+
+function fmtRelTime(iso) {
+  if (!iso) return "";
+  const t = new Date(iso);
+  if (isNaN(t.getTime())) return "";
+  const diffMin = Math.floor((Date.now() - t.getTime()) / 60000);
+  if (diffMin < 1) return "刚刚";
+  if (diffMin < 60) return `${diffMin}分`;
+  const h = Math.floor(diffMin / 60);
+  if (h < 24) return `${h}时`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}天`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo}月`;
+  return `${Math.floor(mo / 12)}年`;
+}
+
+function initSidebar() {
+  $("#btn-new-session-side").addEventListener("click", async () => {
+    await newSession();
+    refreshWorkspaces();
+  });
+  $("#btn-settings").addEventListener("click", () => switchView("settings"));
+  $("#btn-ws-refresh").addEventListener("click", () => refreshWorkspaces());
+  $("#btn-ws-open").addEventListener("click", () => showWorkspaceBrowser());
+  $("#btn-ws-search").addEventListener("click", () => {
+    const inp = $("#ws-filter");
+    inp.classList.toggle("hidden");
+    if (!inp.classList.contains("hidden")) inp.focus();
+    else { inp.value = ""; state.wsFilter = ""; refreshWorkspaces(); }
+  });
+  $("#ws-filter").addEventListener("input", (e) => {
+    state.wsFilter = e.target.value.trim().toLowerCase();
+    refreshWorkspaces();
+  });
+  // 定时刷新（会话标题/新会话后台落盘后同步到侧边栏）
+  setInterval(() => { if (!state.streaming) refreshWorkspaces(); }, 20000);
+}
+
+async function refreshWorkspaces() {
+  const a = currentAgent();
+  const listEl = $("#ws-list");
+  if (!a || !listEl) return;
+  let data;
+  try { data = await api.workspaceInfo(a); } catch { return; }
+  state.currentWorkspace = data.current || state.currentWorkspace;
+  renderWorkspaces(data);
+  refreshFileManager();  // 工作空间变化时内部自动重置到根目录
+}
+
+function renderWorkspaces(data) {
+  const listEl = $("#ws-list");
+  listEl.innerHTML = "";
+  const filter = state.wsFilter;
+  for (const ws of data.workspaces || []) {
+    const total = ws.sessions || [];
+    let sessions = total;
+    let hiddenCount = 0;
+    if (filter) {
+      sessions = total.filter(s => (s.title || "").toLowerCase().includes(filter));
+    } else if (!state.wsShowAll[ws.path]) {
+      sessions = total.slice(0, 5);
+      hiddenCount = total.length - sessions.length;
+    }
+    const expanded = filter ? true
+      : (state.wsExpanded[ws.path] ?? ws.path === data.current);
+
+    const fMenuBtn = el("span", { class: "ws-session-menu ws-folder-menu", title: "工作空间管理" }, "⋯");
+    fMenuBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showWorkspaceMenu(ws, fMenuBtn);
+    });
+    const head = el("div", { class: "ws-folder-head" },
+      el("span", { class: "ws-arrow" + (expanded ? " open" : "") }, "▶"),
+      el("span", { class: "ws-folder-icon" }, "📂"),
+      el("span", { class: "ws-folder-name", title: ws.path }, ws.name),
+      fMenuBtn);
+    head.addEventListener("click", () => {
+      state.wsExpanded[ws.path] = !expanded;
+      renderWorkspaces(data);
+    });
+    const row = el("div", {
+      class: "ws-folder" + (ws.path === data.current ? " current" : ""),
+    }, head);
+
+    if (expanded) {
+      const bodyEl = el("div", { class: "ws-sessions" });
+      if (!sessions.length) {
+        bodyEl.append(el("div", { class: "ws-empty" },
+          filter ? "无匹配会话" : "暂无会话"));
+      }
+      for (const s of sessions) bodyEl.append(wsSessionRow(s));
+      if (hiddenCount > 0) {
+        const more = el("div", { class: "ws-more" }, `展开其余 ${hiddenCount} 个会话`);
+        more.addEventListener("click", () => {
+          state.wsShowAll[ws.path] = true;
+          renderWorkspaces(data);
+        });
+        bodyEl.append(more);
+      }
+      row.append(bodyEl);
+    }
+    listEl.append(row);
+  }
+}
+
+function wsSessionRow(s) {
+  const isActive = s.active && s.model === currentModel();
+  const menuBtn = el("span", { class: "ws-session-menu", title: "会话管理" }, "⋯");
+  menuBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    showSessionMenu(s, menuBtn);
+  });
+  const row = el("div", { class: "ws-session" + (isActive ? " active" : "") },
+    el("span", { class: "ws-session-title", title: s.title }, s.title || "新会话"),
+    el("span", { class: "ws-session-time" }, fmtRelTime(s.created_at)),
+    menuBtn);
+  row.addEventListener("click", () => openSidebarSession(s));
+  return row;
+}
+
+/* ---- 会话管理菜单（悬停三点按钮弹出：重命名/复制/删除） ---- */
+let _sessionMenuEl = null;
+function closeSessionMenu() {
+  if (_sessionMenuEl) { _sessionMenuEl.remove(); _sessionMenuEl = null; }
+}
+
+function showSessionMenu(s, anchor) {
+  closeSessionMenu();
+  const menu = el("div", { class: "ws-ctx-menu" });
+  const mkItem = (label, cls, fn) => {
+    const it = el("div", { class: "ws-ctx-item" + (cls ? " " + cls : "") }, label);
+    it.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeSessionMenu();
+      fn();
+    });
+    return it;
+  };
+  menu.append(
+    mkItem("✏️ 重命名", "", () => doSessionRename(s)),
+    mkItem("📄 复制会话", "", () => doSessionCopy(s)),
+    mkItem("🗑 删除会话", "danger", () => doSessionDelete(s)));
+  document.body.append(menu);
+  // 定位：锚点右下方，靠右对齐，避免超出视口
+  const rect = anchor.getBoundingClientRect();
+  menu.style.top = Math.min(rect.bottom + 4, window.innerHeight - 120) + "px";
+  menu.style.left = Math.max(8, rect.right - menu.offsetWidth - 8) + "px";
+  _sessionMenuEl = menu;
+  setTimeout(() => {
+    document.addEventListener("click", closeSessionMenu, { once: true });
+  }, 0);
+}
+
+async function doSessionRename(s) {
+  const out = await promptDialog("重命名会话",
+    [{ key: "title", label: "会话标题", value: s.title || "", type: "text" }],
+    "保存");
+  if (out === null) return;
+  const title = (out.title || "").trim();
+  if (!title) { toast("标题不能为空", "warn"); return; }
+  try {
+    const r = await api.sessionRename(currentAgent(), s, title);
+    toast(r.message, "success");
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function doSessionCopy(s) {
+  try {
+    const r = await api.sessionCopy(currentAgent(), s);
+    toast(r.message, "success");
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function doSessionDelete(s) {
+  const ok = await confirmDialog("删除会话",
+    `确定删除会话「${(s.title || "").slice(0, 30)}」吗？此操作不可恢复。`,
+    { danger: true, okText: "删除" });
+  if (!ok) return;
+  state.currentSessionId = null;  // 主动删除，禁用丢失自动恢复
+  try {
+    const r = await api.sessionDelete(currentAgent(), s);
+    toast(r.message, "success");
+    if (r.was_active) { clearMessages(); refreshStatus(); }
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+/* ---- 工作空间（文件夹）三点管理菜单 ---- */
+function showWorkspaceMenu(ws, anchor) {
+  closeSessionMenu();
+  const menu = el("div", { class: "ws-ctx-menu" });
+  const mkItem = (label, cls, fn) => {
+    const it = el("div", { class: "ws-ctx-item" + (cls ? " " + cls : "") }, label);
+    it.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeSessionMenu();
+      fn();
+    });
+    return it;
+  };
+  menu.append(
+    mkItem("📂 选择该文件夹", "", () => doWorkspaceSelect(ws)),
+    mkItem("✚ 新增会话", "", () => doWorkspaceNew(ws)),
+    mkItem("🗑 删除全部会话", "danger", () => doWorkspaceClear(ws)));
+  document.body.append(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.top = Math.min(rect.bottom + 4, window.innerHeight - 120) + "px";
+  menu.style.left = Math.max(8, rect.right - menu.offsetWidth - 8) + "px";
+  _sessionMenuEl = menu;
+  setTimeout(() => {
+    document.addEventListener("click", closeSessionMenu, { once: true });
+  }, 0);
+}
+
+// 选择该文件夹：切换工作空间并恢复其最新会话（空文件夹则为新会话）
+async function doWorkspaceSelect(ws) {
+  if (ws.path === state.currentWorkspace) { switchView("chat"); return; }
+  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
+  try {
+    const r = await api.workspaceOpen(currentAgent(), currentModel(), ws.path, true);
+    toast(r.message, "success");
+    state.currentWorkspace = r.workspace;
+    state.wsExpanded[ws.path] = true;
+    switchView("chat");
+    clearMessages();
+    if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
+    if (r.usage) updateCtxMeter(r.usage);
+    refreshStatus();
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// 新增会话：切换到该文件夹并开始全新会话
+async function doWorkspaceNew(ws) {
+  if (ws.path === state.currentWorkspace) {
+    await newSession();
+    refreshWorkspaces();
+    return;
+  }
+  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
+  try {
+    const r = await api.workspaceOpen(currentAgent(), currentModel(), ws.path, false);
+    toast(r.message, "success");
+    state.currentWorkspace = r.workspace;
+    state.wsExpanded[ws.path] = true;
+    switchView("chat");
+    clearMessages();
+    refreshStatus();
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+// 删除该文件夹下的全部会话
+async function doWorkspaceClear(ws) {
+  const ok = await confirmDialog("删除全部会话",
+    `确定删除工作空间「${ws.name}」下的全部会话吗？此操作不可恢复。`,
+    { danger: true, okText: "全部删除" });
+  if (!ok) return;
+  state.currentSessionId = null;  // 主动删除，禁用丢失自动恢复
+  try {
+    const r = await api.workspaceClearSessions(currentAgent(), ws.path);
+    toast(r.message, "success");
+    if (r.was_active) { clearMessages(); refreshStatus(); }
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function openSidebarSession(s) {
+  if (s.active) {
+    if (s.model === currentModel()) { switchView("chat"); return; }
+    toast(`该会话正在模型 '${s.model}' 下活动`, "info");
+    return;
+  }
+  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
+  try {
+    const r = await api.chatLoad(currentAgent(), currentModel(), s.filename, s.workspace);
+    toast(r.message, "success");
+    if (r.workspace) state.currentWorkspace = r.workspace;
+    switchView("chat");
+    clearMessages();
+    renderRestoredMessages(r.messages || []);
+    if (r.usage) updateCtxMeter(r.usage);
+    refreshStatus();
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+/* ---- 打开工作空间（文件夹选择弹窗） ---- */
+async function showWorkspaceBrowser() {
+  const body = el("div", { class: "ws-browser" });
+  const crumbEl = el("div", { class: "ws-browser-crumb" });
+  const listEl = el("div", { class: "ws-browser-list" });
+  body.append(crumbEl, listEl);
+
+  let curPath = state.currentWorkspace || "";
+  let serverRoot = "";
+
+  async function nav(path) {
+    let data;
+    try { data = await api.workspaceBrowse(path); }
+    catch (e) { toast(e.message, "error"); return; }
+    curPath = data.path;
+    serverRoot = data.server_root;
+    // 面包屑：根目录 + 相对路径各段
+    crumbEl.innerHTML = "";
+    const rootBtn = el("span", { class: "ws-crumb", title: serverRoot },
+      "📁 " + (serverRoot.split("/").pop() || serverRoot));
+    rootBtn.addEventListener("click", () => nav(serverRoot));
+    crumbEl.append(rootBtn);
+    let acc = serverRoot;
+    for (const seg of data.path.slice(serverRoot.length).split("/").filter(Boolean)) {
+      acc += "/" + seg;
+      const target = acc;
+      const c = el("span", { class: "ws-crumb" }, " / " + seg);
+      c.addEventListener("click", () => nav(target));
+      crumbEl.append(c);
+    }
+    // 目录列表
+    listEl.innerHTML = "";
+    if (curPath !== serverRoot) {
+      const up = el("div", { class: "ws-browser-item up" }, "⬆ 上级目录");
+      const parent = curPath.slice(0, curPath.lastIndexOf("/")) || "/";
+      up.addEventListener("click", () => nav(parent.startsWith(serverRoot) ? parent : serverRoot));
+      listEl.append(up);
+    }
+    if (!data.dirs.length) {
+      listEl.append(el("div", { class: "ws-empty" }, "（无子文件夹）"));
+    }
+    for (const d of data.dirs) {
+      const item = el("div", { class: "ws-browser-item" }, "📁 " + d.name);
+      item.addEventListener("click", () => nav(d.path));
+      listEl.append(item);
+    }
+  }
+
+  const openBtn = el("button", {
+    class: "btn btn-primary",
+    onclick: async (e) => {
+      e.target.disabled = true;
+      try {
+        const r = await api.workspaceOpen(currentAgent(), currentModel(), curPath);
+        toast(r.message, "success");
+        state.currentWorkspace = r.workspace;
+        state.wsExpanded[r.workspace] = true;
+        m.close();
+        switchView("chat");
+        clearMessages();
+        refreshStatus();
+        refreshWorkspaces();
+      } catch (err) {
+        toast(err.message, "error");
+        e.target.disabled = false;
+      }
+    },
+  }, "打开当前文件夹");
+
+  const m = openModal({
+    title: "📂 打开工作空间",
+    body,
+    footer: [el("button", { class: "btn", onclick: () => m.close() }, "取消"), openBtn],
+    width: "560px",
+  });
+  nav(curPath || undefined);
+}
+
+/* ===================================================================
+   面板布局：工作区/文件管理器左右互换 + 拖拽调宽（v5.2.8）
+   =================================================================== */
+
+function applyPanelLayout() {
+  const fmSide = localStorage.getItem(LS_FM_SIDE) || "right";
+  const app = $("#app");
+  const wsPanel = $("#ws-panel"), fmPanel = $("#fm-panel");
+  const rLeft = $("#resize-left"), rRight = $("#resize-right");
+  const main = $("#main");
+  if (fmSide === "left") app.append(fmPanel, rLeft, main, rRight, wsPanel);
+  else app.append(wsPanel, rLeft, main, rRight, fmPanel);
+}
+
+function swapPanels() {
+  const cur = localStorage.getItem(LS_FM_SIDE) || "right";
+  localStorage.setItem(LS_FM_SIDE, cur === "right" ? "left" : "right");
+  applyPanelLayout();
+}
+
+function initPanelLayout() {
+  applyPanelLayout();
+  const wsW = parseInt(localStorage.getItem(LS_WS_WIDTH) || "", 10);
+  const fmW = parseInt(localStorage.getItem(LS_FM_WIDTH) || "", 10);
+  if (wsW) $("#ws-panel").style.width = wsW + "px";
+  if (fmW) $("#fm-panel").style.width = fmW + "px";
+  $("#btn-ws-swap").addEventListener("click", swapPanels);
+  $("#btn-fm-swap").addEventListener("click", swapPanels);
+  setupResizeHandle($("#resize-left"), "left");
+  setupResizeHandle($("#resize-right"), "right");
+}
+
+function setupResizeHandle(handle, side) {
+  handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    // 左手柄控制其左侧面板，右手柄控制其右侧面板
+    const panel = side === "left" ? handle.previousElementSibling
+                                  : handle.nextElementSibling;
+    if (!panel || !panel.classList.contains("side-panel")) return;
+    const startX = e.clientX, startW = panel.offsetWidth;
+    const lsKey = panel.id === "ws-panel" ? LS_WS_WIDTH : LS_FM_WIDTH;
+    const move = (ev) => {
+      let w = side === "left" ? startW + (ev.clientX - startX)
+                              : startW - (ev.clientX - startX);
+      w = Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, w));
+      panel.style.width = w + "px";
+      localStorage.setItem(lsKey, String(w));
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+      document.body.classList.remove("resizing");
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+    document.body.classList.add("resizing");
+  });
+}
+
+/* ===================================================================
+   文件管理器（v5.2.8：当前工作空间文件浏览/下载等）
+   =================================================================== */
+
+const FM_ICONS = {
+  py: "🐍", js: "📜", ts: "📜", sh: "⚙️", md: "📝", txt: "📄", log: "📄",
+  json: "🧾", yaml: "🧾", yml: "🧾", toml: "🧾", csv: "📊", xlsx: "📊",
+  png: "🖼️", jpg: "🖼️", jpeg: "🖼️", gif: "🖼️", svg: "🖼️",
+  pdf: "📕", zip: "📦", tar: "📦", gz: "📦", whl: "📦",
+  html: "🌐", css: "🎨",
+};
+function fmIcon(entry) {
+  if (entry.is_dir) return "📁";
+  const i = entry.name.lastIndexOf(".");
+  const ext = i > 0 ? entry.name.slice(i + 1).toLowerCase() : "";
+  return FM_ICONS[ext] || "📄";
+}
+
+function initFileManager() {
+  $("#btn-fm-refresh").addEventListener("click", () => refreshFileManager());
+  $("#btn-fm-up").addEventListener("click", () => {
+    if (!state.fmPath || state.fmPath === state.fmWorkspace) return;
+    const parent = state.fmPath.slice(0, state.fmPath.lastIndexOf("/")) || "/";
+    state.fmPath = parent.startsWith(state.fmWorkspace) ? parent : state.fmWorkspace;
+    refreshFileManager();
+  });
+}
+
+async function refreshFileManager() {
+  if (!$("#fm-list")) return;
+  // 工作空间变化时重置到其根目录
+  if (state.currentWorkspace && state.fmWorkspace !== state.currentWorkspace) {
+    state.fmWorkspace = state.currentWorkspace;
+    state.fmPath = "";
+  }
+  let data;
+  try { data = await api.filesList(state.fmPath); } catch { return; }
+  state.fmPath = data.path;
+  renderFileManager(data);
+}
+
+function renderFileManager(data) {
+  // 面包屑：工作空间根 + 各级相对目录
+  const crumbEl = $("#fm-crumb");
+  crumbEl.innerHTML = "";
+  const rootBtn = el("span", { class: "ws-crumb", title: data.workspace }, "🏠 根");
+  rootBtn.addEventListener("click", () => {
+    state.fmPath = data.workspace;
+    refreshFileManager();
+  });
+  crumbEl.append(rootBtn);
+  let acc = data.workspace.replace(/\/$/, "");
+  for (const seg of data.path.slice(data.workspace.length).split("/").filter(Boolean)) {
+    acc += "/" + seg;
+    const target = acc;
+    const c = el("span", { class: "ws-crumb" }, " / " + seg);
+    c.addEventListener("click", () => { state.fmPath = target; refreshFileManager(); });
+    crumbEl.append(c);
+  }
+
+  const listEl = $("#fm-list");
+  listEl.innerHTML = "";
+  if (!data.entries.length) {
+    listEl.append(el("div", { class: "ws-empty" }, "（空目录）"));
+    return;
+  }
+  for (const ent of data.entries) {
+    const menuBtn = el("span", { class: "ws-session-menu fm-menu", title: "更多操作" }, "⋯");
+    menuBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showFileMenu(ent, menuBtn);
+    });
+    const row = el("div", { class: "fm-item" },
+      el("span", { class: "fm-icon" }, fmIcon(ent)),
+      el("span", { class: "fm-name", title: ent.path }, ent.name),
+      el("span", { class: "fm-meta" }, ent.is_dir ? "" : fmtSize(ent.size)),
+      menuBtn);
+    row.addEventListener("click", () => {
+      // 文件夹点击进入；文件点击不触发下载（下载仅通过三点菜单）
+      if (ent.is_dir) { state.fmPath = ent.path; refreshFileManager(); }
+    });
+    listEl.append(row);
+  }
+}
+
+function downloadFile(ent) {
+  const a = el("a", {
+    href: `/api/files/download_path?path=${enc(ent.path)}`,
+    download: ent.name,
+  });
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+function showFileMenu(ent, anchor) {
+  closeSessionMenu();
+  const menu = el("div", { class: "ws-ctx-menu" });
+  const mkItem = (label, cls, fn) => {
+    const it = el("div", { class: "ws-ctx-item" + (cls ? " " + cls : "") }, label);
+    it.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeSessionMenu();
+      fn();
+    });
+    return it;
+  };
+  if (ent.is_dir) {
+    menu.append(
+      mkItem("📂 打开为工作空间", "", () => openFolderAsWorkspace(ent.path)),
+      mkItem("📋 复制路径", "", () => {
+        copyText(ent.path);
+        toast("已复制路径", "success");
+      }));
+  } else {
+    menu.append(
+      mkItem("📥 下载", "", () => downloadFile(ent)),
+      mkItem("📋 复制路径", "", () => {
+        copyText(ent.path);
+        toast("已复制路径", "success");
+      }));
+  }
+  document.body.append(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.top = Math.min(rect.bottom + 4, window.innerHeight - 100) + "px";
+  menu.style.left = Math.max(8, rect.right - menu.offsetWidth - 8) + "px";
+  _sessionMenuEl = menu;
+  setTimeout(() => {
+    document.addEventListener("click", closeSessionMenu, { once: true });
+  }, 0);
+}
+
+async function openFolderAsWorkspace(path) {
+  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
+  try {
+    const r = await api.workspaceOpen(currentAgent(), currentModel(), path, false);
+    toast(r.message, "success");
+    state.currentWorkspace = r.workspace;
+    state.wsExpanded[r.workspace] = true;
+    switchView("chat");
+    clearMessages();
+    refreshStatus();
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
 }
 
 /* ===================================================================
@@ -3796,10 +4453,11 @@ async function loadHistoryView() {
             el("button", {
               class: "btn btn-sm btn-primary",
               onclick: async () => {
-                const ok = await confirmDialog("恢复会话", "将该历史会话恢复为当前对话？（当前对话会先保存到历史）", { okText: "恢复" });
+                const ok = await confirmDialog("恢复会话", "将该历史会话恢复为当前对话？", { okText: "恢复" });
                 if (!ok) return;
+                state.currentSessionId = null;  // 主动恢复，禁用丢失自动恢复
                 try {
-                  const r = await api.chatLoad(agent, currentModel(), s.filename);
+                  const r = await api.chatLoad(agent, currentModel(), s.filename, s.workspace);
                   toast(r.message, "success");
                   switchView("chat");
                   clearMessages();
@@ -3862,6 +4520,33 @@ async function loadSettingsView() {
   const inner = pageShell("设置", "全局配置与系统信息");
   root.append(el("div", { class: "page" }, inner));
 
+  // v5.2.8：原侧边栏各配置入口统一收归设置页
+  const NAV_CARDS = [
+    ["agents", "🤖", "Agent", "创建 / 管理 / 编辑 Agent"],
+    ["chains", "🔗", "链条", "多 Agent 调用编排"],
+    ["models", "🧠", "模型", "大模型 / 嵌入 / 重排序配置"],
+    ["fallback", "🔄", "备用模型", "主模型异常自动切换"],
+    ["skills", "⚡", "技能", "可复用提示词与脚本"],
+    ["mcp", "🔌", "MCP", "外部工具服务器"],
+    ["knowledge", "📚", "知识库", "知识文件管理与检索"],
+    ["tools", "🔧", "工具", "内置工具开关"],
+    ["security", "🛡️", "安全", "权限模式 / 钩子 / 回滚"],
+    ["embedding", "🧭", "索引", "向量索引管理"],
+    ["history", "🕘", "历史", "查看 / 恢复 / 删除历史会话"],
+  ];
+  inner.append(el("div", { class: "section-title" }, "️ 管理功能"));
+  const grid = el("div", { class: "settings-nav-grid" });
+  for (const [view, icon, label, desc] of NAV_CARDS) {
+    const card = el("div", { class: "settings-nav-card" },
+      el("div", { class: "settings-nav-icon" }, icon),
+      el("div", null,
+        el("div", { class: "settings-nav-label" }, label),
+        el("div", { class: "settings-nav-desc" }, desc)));
+    card.addEventListener("click", () => switchView(view));
+    grid.append(card);
+  }
+  inner.append(grid);
+
   // 压缩设置
   const compressChk = el("input", { type: "checkbox" });
   compressChk.checked = s.auto_compress !== false;
@@ -3914,6 +4599,9 @@ async function loadSettingsView() {
 
 async function bootstrap() {
   initChatView();
+  initSidebar();
+  initPanelLayout();
+  initFileManager();
 
   // 先加载基础数据，再初始化路由（避免直接以 #/skills 等 URL 打开时
   // 管理视图在 state.agents 为空的情况下渲染出"暂无 Agent"）
@@ -3935,6 +4623,8 @@ async function bootstrap() {
   refreshSelectors();
   await restoreMessages();
   refreshStatus();
+  refreshWorkspaces();
+  refreshFileManager();
   updateChainIndicator();
   chatUI.input.focus();
 }

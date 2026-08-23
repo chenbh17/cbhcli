@@ -5,13 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CBHCLI Web</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <link rel="stylesheet" href="/css/style.css?v=5.2.7" />
-  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.2.7" />
+  <link rel="stylesheet" href="/css/style.css?v=5.2.8" />
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.2.8" />
 </head>
 <body>
   <div id="app">
-    <!-- ===== 侧边栏 ===== -->
-    <aside id="sidebar">
+    <!-- ===== 工作区面板（v5.2.8：新会话 + 工作区会话列表 + 设置按钮；
+         与文件管理器面板可左右互换，宽度可拖拽） ===== -->
+    <aside id="ws-panel" class="side-panel">
       <div class="sidebar-header">
         <div class="logo">
           <span class="logo-icon">❯</span>
@@ -19,25 +20,57 @@
           <span class="logo-version" id="app-version"></span>
         </div>
       </div>
-      <nav class="sidebar-nav" id="sidebar-nav">
-        <a class="nav-item active" data-view="chat"><span class="nav-icon">💬</span><span class="nav-label">对话</span></a>
-        <a class="nav-item" data-view="agents"><span class="nav-icon">🤖</span><span class="nav-label">Agent</span></a>
-        <a class="nav-item" data-view="chains"><span class="nav-icon">🔗</span><span class="nav-label">链条</span></a>
-        <a class="nav-item" data-view="models"><span class="nav-icon">🧠</span><span class="nav-label">模型</span></a>
-        <a class="nav-item" data-view="fallback"><span class="nav-icon">🔄</span><span class="nav-label">备用模型</span></a>
-        <a class="nav-item" data-view="skills"><span class="nav-icon">⚡</span><span class="nav-label">技能</span></a>
-        <a class="nav-item" data-view="mcp"><span class="nav-icon">🔌</span><span class="nav-label">MCP</span></a>
-        <a class="nav-item" data-view="knowledge"><span class="nav-icon">📚</span><span class="nav-label">知识库</span></a>
-        <a class="nav-item" data-view="tools"><span class="nav-icon">🔧</span><span class="nav-label">工具</span></a>
-        <a class="nav-item" data-view="security"><span class="nav-icon">🛡️</span><span class="nav-label">安全</span></a>
-        <a class="nav-item" data-view="embedding"><span class="nav-icon">🧭</span><span class="nav-label">索引</span></a>
-        <a class="nav-item" data-view="history"><span class="nav-icon">🕘</span><span class="nav-label">历史</span></a>
-        <a class="nav-item" data-view="settings"><span class="nav-icon">⚙️</span><span class="nav-label">设置</span></a>
-      </nav>
+      <button class="side-new-session" id="btn-new-session-side" title="新建会话 (/new)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+        <span>新会话</span>
+      </button>
+      <input class="ws-filter hidden" id="ws-filter" placeholder="搜索会话…" />
+      <div class="ws-header">
+        <span class="ws-title">工作区</span>
+        <span class="ws-actions">
+          <button class="ws-icon-btn" id="btn-ws-search" title="搜索会话">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          </button>
+          <button class="ws-icon-btn" id="btn-ws-refresh" title="刷新会话列表">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          </button>
+          <button class="ws-icon-btn" id="btn-ws-open" title="打开文件夹作为工作空间">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M12 10v6M9 13h6"/></svg>
+          </button>
+          <button class="ws-icon-btn" id="btn-ws-swap" title="工作区/文件管理器左右互换">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg>
+          </button>
+        </span>
+      </div>
+      <div class="ws-list" id="ws-list"></div>
       <div class="sidebar-footer">
-        <div class="sidebar-footer-text">AI 驱动的终端助手</div>
+        <button class="side-settings-btn" id="btn-settings" title="设置（Agent/模型/技能/MCP/安全等）">
+          <span class="nav-icon">⚙️</span><span class="nav-label">设置</span>
+        </button>
       </div>
     </aside>
+
+    <!-- ===== 文件管理器面板 ===== -->
+    <aside id="fm-panel" class="side-panel">
+      <div class="fm-header">
+        <span class="fm-title">📁 文件</span>
+        <span class="ws-actions">
+          <button class="ws-icon-btn" id="btn-fm-up" title="上级目录">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+          </button>
+          <button class="ws-icon-btn" id="btn-fm-refresh" title="刷新文件列表">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          </button>
+          <button class="ws-icon-btn" id="btn-fm-swap" title="文件管理器/工作区左右互换">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg>
+          </button>
+        </span>
+      </div>
+      <div class="fm-crumb" id="fm-crumb"></div>
+      <div class="fm-list" id="fm-list"></div>
+    </aside>
+
+    <div class="resize-handle" id="resize-left" title="拖动调整面板宽度"></div>
 
     <!-- ===== 主区域 ===== -->
     <main id="main">
@@ -109,6 +142,8 @@
       <section class="view" id="view-history"></section>
       <section class="view" id="view-settings"></section>
     </main>
+
+    <div class="resize-handle" id="resize-right" title="拖动调整面板宽度"></div>
   </div>
 
   <!-- 模态框 -->
@@ -116,8 +151,8 @@
   <!-- Toast 通知 -->
   <div id="toast-root"></div>
 
-  <script src="/vendor/marked.umd.js?v=5.2.7"></script>
-  <script src="/vendor/katex/katex.min.js?v=5.2.7"></script>
-  <script src="/js/app.js?v=5.2.7"></script>
+  <script src="/vendor/marked.umd.js?v=5.2.8"></script>
+  <script src="/vendor/katex/katex.min.js?v=5.2.8"></script>
+  <script src="/js/app.js?v=5.2.8"></script>
 </body>
 </html>
