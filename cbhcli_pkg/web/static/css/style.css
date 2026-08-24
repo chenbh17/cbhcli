@@ -210,7 +210,21 @@ body.resizing { cursor: col-resize; user-select: none; }
   flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ws-session-time { color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
+.ws-session-time {
+  color: var(--text-dim); font-size: 10px; flex-shrink: 0;
+  white-space: nowrap; font-family: var(--font-mono, monospace);
+}
+/* v5.2.9：后台运行状态徽标（会话正在执行任务时显示） */
+.ws-run-badge {
+  flex-shrink: 0;
+  color: var(--success);
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--success-dim);
+  animation: pulse 1.6s ease-in-out infinite;
+  white-space: nowrap;
+}
 /* 悬停显示三点管理按钮（暂时隐藏时间标签让位） */
 .ws-session-menu {
   display: none;
@@ -368,6 +382,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 .page-title { font-size: 20px; font-weight: 700; }
 .page-desc { color: var(--text-2); font-size: 13px; margin-top: 2px; }
 .page-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* v5.2.9：设置/详情页返回按钮（详情页->设置主页->会话） */
+.page-back-btn { border: 1px solid var(--border, #333); }
 
 .section-title {
   font-size: 14px;
