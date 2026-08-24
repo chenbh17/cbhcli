@@ -1,4 +1,4 @@
-# CBHCLI v5.2.8 - AI驱动的终端助手
+# CBHCLI v5.2.9 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -11,7 +11,7 @@
 - **知识库系统** - 为每个Agent建立专属知识库，支持语义搜索和问答
 - **会话管理** - 上下文窗口监控、自动压缩、会话重置
 - **向量检索** - 基于ChromaDB的语义搜索，支持历史对话和知识库检索
-- **Web界面（v4.9.4 全面重构）** - 对标 CLI 全部功能：SSE 流式对话（思考块折叠/工具卡片/确认条/ask_user 问答/中断/上下文仪表/附件上传/刷新恢复会话）+ 11 个管理视图（Agent/模型/备用模型/技能/MCP/知识库/工具/索引/历史/设置），原生 JS 零构建依赖，现代深色主题
+- **Web界面（v4.9.4 全面重构，v5.2.9 实时架构升级）** - 对标 CLI 全部功能：WebSocket 实时流式对话（多浏览器同会话画面一致/会话后台运行不中断/侧边栏运行状态徽标）+ 工作区会话管理（按文件夹分组/三点菜单重命名复制删除）+ 文件管理器双面板 + 11 个管理视图（Agent/模型/备用模型/技能/MCP/知识库/工具/索引/历史/设置），原生 JS 零构建依赖，现代深色主题
 - **技能系统** - 可复用的提示词+脚本技能，按需激活增强AI能力
 - **Markdown渲染** - CLI界面支持Markdown格式渲染，代码高亮、表格、列表等美观显示
 - **LaTeX公式渲染** - 支持LaTeX数学公式渲染，行内公式与块级公式均可正常显示
@@ -39,6 +39,10 @@
 - **上下文压缩四项优化（v5.1.6）** - ① 压缩目标可控：修复 target_tokens 死参数，压缩后降到窗口 30%（摘要 max_tokens 预算限制 + 超目标迭代降级保留轮数）；② 摘要提示词对标 Claude Code：CRITICAL 约束 + analysis/summary 双块 + 9 章节结构化模板；③ 压缩可撤销：自动备份到 history/compressions/，`/undo-compress` 一键恢复压缩前原始消息；④ 摘要输入保留工具调用链（`[工具 terminal 结果]`）+ 大输出截断
 - **文本复读检测误报修复（v5.1.7）** - TextLoopDetector 改为双块整体匹配（尾部 2×150 字符）+ 近邻窗口（最近 5000 字符）统计，且重复 ≥15 次才判定复读（连续重复总长 <4500 字符永不触发）。修复正常思考中"先设计后实现"重复写出的模板/骨架片段（如 HTML 头部）被误判死循环、思考被截断的问题；真正的连续大量复读仍会正常熔断。改 loop_detector.py 1 个文件，CLI/Web 调用方零改动
 - **上下文压缩失败修复（v5.1.8）** - 修复 `/comp` 压缩"假装成功"的严重 bug：① 摘要 max_tokens 封顶到 64k（`SUMMARY_MAX_TOKENS=65536`），消除大窗口模型（context_limit≥44万）下预算超过 API max_tokens 上限（131072）导致的 400 错误；② 摘要生成失败不再返回 `[压缩失败...]` 占位文本塞进会话，改为抛异常 + `compress()` 捕获后保持会话原样、记录 `last_error`、返回 False，杜绝失败污染上下文；③ CLI/Web 各调用点失败时展示具体原因（补可观测性）。改 6 个文件
+- **一次性非交互执行（v5.2.5）** - `cbhcli exec` 对标 `claude -p`：shell/CI/管道一次性下发任务，fd 级 stdout/stderr 分离，进程内 monkey-patch 零改核心文件，退出码 0/1/2/130 + JSON 输出
+- **每轮对话自动保存（v5.2.6）** - CLI/Web 全部出口（含中断/SSE 断开/死循环熔断）自动落盘会话，服务重启最多丢当前轮
+- **Web 侧边栏工作区会话管理（v5.2.8）** - 会话按工作空间文件夹分组可折叠，打开任意文件夹作工作空间（chdir+系统提示重建）；会话/文件夹三点菜单（重命名/复制/删除/选择/新增/清空）；文件管理器面板与工作区面板左右互换+拖拽调宽；CLI `/resume` 扩容 50 条+关键词搜索
+- **Web 实时架构升级（v5.2.9）** - ① **WebSocket 多浏览器同步**：聊天从 SSE 改为 `/ws` 事件总线，事件按单调 seq 记录、迟到订阅按 since_seq 回放，多个浏览器打开同一会话画面完全一致（含流式思考/工具确认实时同步，多浏览器确认首个应答生效）；② **会话后台运行**：新建/切换会话不中断正在执行的任务（后台 asyncio 任务继续跑），侧边栏实时显示"●运行中"徽标；会话身份以 session.id 为准，同 agent:model 可并存多会话；③ **工具运行中可中断**：terminal 等工具执行期间点中断立即杀子进程组（实测 sleep 30 中断 0.6s 结束）；④ 设置页返回导航（设置主页←返回会话、详情页←设置）；⑤ CLI/Web 共享会话文件的内存副本新鲜度校验（磁盘被外部更新自动重载）
 
 ### 17大内置工具 + Web 专属工具
 | 工具 | 功能 |
@@ -93,10 +97,13 @@ cbhpacks_get_random_data → cbhpacks_desc_df → cbhpacks_cols_encode → cbhpa
 通过 MCP (Model Context Protocol) 协议连接外部工具服务器，无限扩展AI的能力。
 添加的MCP工具与内置工具使用方式完全相同。
 
-### Web 界面（v4.9.4 全面重构）
+### Web 界面（v4.9.4 全面重构，v5.2.9 实时架构升级）
 基于 FastAPI + 原生 JS SPA（零构建依赖，marked 内置离线可用），对标 CLI 全部功能与逻辑：
-- **流式对话** - SSE 实时渲染 Markdown、思考块折叠、工具调用卡片（参数/结果/状态）、工具确认条（允许/拒绝/全部允许）、ask_user 交互问答、自我反思重试提示、随时中断
-- **会话能力** - 上下文使用仪表、手动/自动压缩、新会话自动存档、历史会话恢复、**刷新页面自动恢复对话**
+- **实时对话（WebSocket）** - 流式渲染 Markdown、思考块折叠、工具调用卡片（默认收起，失败/含图自动展开）、工具确认条（允许/拒绝/全部允许/始终允许该命令）、ask_user 交互问答、自我反思重试提示、工具运行中随时中断；**多个浏览器打开同一会话画面完全一致**，多浏览器同时弹出确认时首个应答生效
+- **会话后台运行** - 新建/切换会话不中断正在执行的任务，后台继续运行并在侧边栏显示"●运行中"徽标；每轮自动落盘，刷新页面自动恢复到上次会话
+- **工作区会话管理** - 左侧栏按工作空间文件夹分组展示会话（可折叠），会话/文件夹三点菜单（重命名/复制/删除/选择该文件夹/新增会话/删除全部）；打开任意文件夹作为工作空间，Agent 随之感知新工作目录
+- **文件管理器** - 双面板（工作区⇄文件管理器左右互换、拖拽调宽），文件下载/复制路径/文件夹打开为工作空间
+- **会话能力** - 上下文使用仪表、手动/自动压缩、新会话自动存档、历史会话恢复、服务重启自动找回会话
 - **Agent管理** - 创建/切换/删除/编辑配置，soul/memory/tools/usage 四文件在线编辑
 - **模型配置** - 模型 CRUD、嵌入/重排序模型、备用模型（main/vision 排序管理）
 - **知识库管理** - 文件上传/按路径添加、删除、重建索引、向量状态
@@ -162,7 +169,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.2.8-py3-none-any.whl
+pip install dist/cbhcli-5.2.9-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -604,8 +611,8 @@ cbhcli_pkg/
 │   ├── fallback_cmd.py # 备用模型管理命令
 │   └── harness_cmd.py  # Harness命令（/mode /permissions /hooks /undo）
 ├── web/               # Web界面
-│   ├── server.py       # FastAPI 后端（SSE 流式 + 全量管理 API）
-│   └── static/         # 原生前端 SPA（index.html + css + js + vendor/marked，零构建）
+│   ├── server.py       # FastAPI 后端（WebSocket 实时 + 会话后台运行 + 全量管理 API）
+│   └── static/         # 原生前端 SPA（index.html + css + js + vendor/marked/katex/mermaid/echarts，零构建）
 ├── config/            # 配置管理
 │   └── global_config.py # 全局配置
 ├── context/           # 上下文管理
@@ -614,25 +621,6 @@ cbhcli_pkg/
 └── vector/            # 向量数据库
     ├── store.py        # ChromaDB封装
     └── indexer.py      # 记忆索引器
-
-web-frontend/          # Vue 3 前端源码
-├── src/
-│   ├── App.vue        # 根组件
-│   ├── api.js         # API接口
-│   ├── router.js      # 路由配置
-│   ├── style.css      # 全局样式
-│   └── views/         # 页面组件
-│       ├── ChatView.vue       # 聊天页面
-│       ├── AgentsView.vue     # Agent管理
-│       ├── ModelsView.vue     # 模型管理
-│       ├── KnowledgeView.vue  # 知识库管理
-│       ├── MCPView.vue        # MCP管理
-│       ├── HistoryView.vue    # 历史会话
-│       ├── SkillsView.vue     # 技能管理
-│       └── SettingsView.vue   # 设置
-├── vite.config.js     # Vite构建配置
-├── package.json
-└── index.html
 
 docs/                 # 项目文档
 ├── API参考/           # API开发文档

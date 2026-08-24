@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -97,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.2.8")
+app = FastAPI(title="CBHCLI Web", version="5.2.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,6 +132,16 @@ def get_permission_engine() -> PermissionEngine:
 
 # 活跃聊天会话: session_key(agent:model) -> WebChatSession
 _chat_sessions: dict[str, 'WebChatSession'] = {}
+# 全部存活会话注册表（v5.2.9）: session.id -> WebChatSession
+# 会话切换/新建不再中断旧会话，后台运行中的会话全部驻留于此，
+# 供侧边栏展示运行状态、任意浏览器按 id 订阅实时事件。
+_sessions_by_id: dict[str, 'WebChatSession'] = {}
+# WebSocket 连接集合（v5.2.9 实时广播）
+_ws_clients: set = set()
+# 单次运行事件日志上限（超出裁剪头部，迟到订阅者触发 resync 兜底）
+_MAX_RUN_EVENTS = 6000
+# 存活会话上限（超出驱逐最旧的空闲会话；数据每轮已自动落盘，安全）
+_MAX_LIVE_SESSIONS = 40
 # MCP 管理器缓存（管理 API 专用，带独立注册表）: agent_name -> MCPManager
 _mcp_managers: dict[str, MCPManager] = {}
 
@@ -169,8 +180,11 @@ def _set_current_workspace(path: str) -> None:
     """切换当前工作空间：chdir 服务器进程 + 记录状态 + 刷新活跃会话系统提示。
 
     v5.2.8 修正：只重建系统提示（cwd 是进程级全局），**不改写各活跃会话
-    的 workspace 归属标签**——否则切换工作空间会把别的文件夹下的会话
+    的 workspace 归属标签**--否则切换工作空间会把别的文件夹下的会话
     "带入"新文件夹（下次保存时归档到错误分组）。
+    v5.2.9 修正：只重建**属于新工作空间**的会话的系统提示。会话可后台
+    运行后，其他工作空间的会话仍在执行任务，其系统提示必须继续指向
+    自己的工作空间，不能被全局 chdir "带偏"。
     """
     global _current_workspace
     target = Path(path).resolve()
@@ -178,9 +192,10 @@ def _set_current_workspace(path: str) -> None:
     _current_workspace = str(target)
     _record_opened_workspace(_current_workspace)
     # Agent 系统提示含 cwd，切换后重建使 Agent 知道新工作空间
-    for cs in list(_chat_sessions.values()):
+    for cs in list(_sessions_by_id.values()) or list(_chat_sessions.values()):
         try:
-            cs._rebuild_system_prompt()
+            if (getattr(cs, "workspace", "") or "") == _current_workspace:
+                cs._rebuild_system_prompt()
         except Exception:
             pass
 
@@ -498,6 +513,17 @@ class WebChatSession:
         self.respond_queue: Optional[asyncio.Queue] = None
         self.lock: Optional[asyncio.Lock] = None
 
+        # ---- v5.2.9：后台运行 + WebSocket 事件广播 ----
+        self.run_task: Optional[asyncio.Task] = None   # 后台 ReAct 任务
+        self.run_active = False                        # 本次运行是否进行中
+        self.run_events: list = []                     # 当前/最近一次运行的事件日志（迟到订阅者回放）
+        self.run_seq = 0                               # 会话内单调递增事件序号（跨运行不重置）
+        self.run_min_seq = 0                           # 日志裁剪后仍可回放的最小 seq-1
+        self.run_start_msg_count = 0                   # 本次运行首条用户消息的下标（运行中导出消息截断到此）
+        self.subscribers: list = []                    # 订阅者队列（asyncio.Queue，每个 WebSocket 一个）
+        self.respond_waiting = False                   # 是否正等待前端应答（工具确认/ask_user）
+        self.last_active_ts: float = 0.0               # 最近一次运行时间戳（空闲会话驱逐排序用）
+
     # --------------------------------------------------------------
     #  构造
     # --------------------------------------------------------------
@@ -611,11 +637,25 @@ class WebChatSession:
 
         return cs
 
+    def _sync_python_session(self):
+        """python 工具解释器会话按聊天会话 id 隔离（v5.2.9 多会话并发）。
+
+        旧版全局共享 "default" 一个解释器，多个会话并发执行 python 时
+        变量互相污染；现按 session.id 隔离，会话驱逐/删除时同步清理。
+        """
+        try:
+            pt = self.tool_registry.get("python") if self.tool_registry else None
+            if pt is not None and hasattr(pt, "set_session_id"):
+                pt.set_session_id(self.session.id if self.session else "default")
+        except Exception:
+            pass
+
     def _rebuild_tools(self):
         """重建工具注册表和 MCP 管理器（MCP 配置变更后同步调用）。"""
         self.tool_registry = _build_tool_registry(
             self.agent_name, self.app_proxy, chain=self.active_chain)
         self.app_proxy.tool_executor = ToolExecutor(self.tool_registry)
+        self._sync_python_session()
 
         # Harness 组件挂载（delegate_task 子Agent经 tool_executor 执行工具）
         # 子Agent在后台线程无法交互确认 → 免确认模式，安全由权限引擎
@@ -741,24 +781,33 @@ class WebChatSession:
     # --------------------------------------------------------------
 
     async def wait_response(self, timeout: float = 600.0) -> Optional[str]:
-        """等待前端应答，支持中断。返回 None 表示超时或被中断。"""
-        # 清空过期应答
-        while not self.respond_queue.empty():
-            try:
-                self.respond_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        """等待前端应答，支持中断。返回 None 表示超时或被中断。
 
-        elapsed = 0.0
-        interval = 0.5
-        while elapsed < timeout:
-            if self.abort:
-                return None
-            try:
-                return await asyncio.wait_for(self.respond_queue.get(), timeout=interval)
-            except asyncio.TimeoutError:
-                elapsed += interval
-        return None
+        v5.2.9：respond_waiting 标志控制 /api/chat/respond 是否接收应答--
+        多个浏览器同时显示确认框时，仅会话真正在等待期间的首个应答生效，
+        迟到的应答被拒绝（避免误当作下一次确认的结果）。
+        """
+        self.respond_waiting = True
+        try:
+            # 清空过期应答
+            while not self.respond_queue.empty():
+                try:
+                    self.respond_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+            elapsed = 0.0
+            interval = 0.5
+            while elapsed < timeout:
+                if self.abort:
+                    return None
+                try:
+                    return await asyncio.wait_for(self.respond_queue.get(), timeout=interval)
+                except asyncio.TimeoutError:
+                    elapsed += interval
+            return None
+        finally:
+            self.respond_waiting = False
 
     # --------------------------------------------------------------
     #  状态导出
@@ -778,10 +827,18 @@ class WebChatSession:
             "compression_ratio": self.context_window.compression_ratio,
         }
 
-    def export_messages(self) -> list[dict]:
-        """导出为前端可恢复的展示结构（assistant 消息聚合 tool 结果）。"""
+    def export_messages(self, limit: Optional[int] = None) -> list[dict]:
+        """导出为前端可恢复的展示结构（assistant 消息聚合 tool 结果）。
+
+        limit（v5.2.9）：会话正在后台运行时传 run_start_msg_count，
+        截断掉本次运行中已产生的消息--这部分由 WebSocket 事件日志回放
+        渲染（含正在流式输出的内容），避免双份展示。
+        """
         result = []
-        for m in self.session.messages:
+        messages = self.session.messages
+        if limit is not None and limit >= 0:
+            messages = messages[:limit]
+        for m in messages:
             if m.role == "system":
                 continue
             if m.role == "user":
@@ -860,20 +917,108 @@ def _get_session_key(agent_name: str, model_name: str) -> str:
     return f"{agent_name}:{model_name}"
 
 
+def _register_session(cs: 'WebChatSession') -> None:
+    """注册到全局会话注册表并按需驱逐空闲会话（v5.2.9）。"""
+    if cs is None or not cs.session:
+        return
+    _sessions_by_id[cs.session.id] = cs
+    _evict_idle_sessions()
+
+
+def _evict_idle_sessions() -> None:
+    """存活会话超上限时驱逐最旧的空闲会话（无订阅者/未运行/非默认键）。
+
+    每轮对话结束已自动落盘（v5.2.6 autosave），驱逐不丢数据；
+    驱逐同步清理对应的 python 解释器会话。
+    """
+    if len(_sessions_by_id) <= _MAX_LIVE_SESSIONS:
+        return
+    default_sessions = set(id(cs) for cs in _chat_sessions.values())
+    candidates = [
+        cs for cs in _sessions_by_id.values()
+        if not cs.run_active
+        and not cs.subscribers
+        and id(cs) not in default_sessions
+    ]
+    candidates.sort(key=lambda cs: getattr(cs, "last_active_ts", 0.0))
+    while len(_sessions_by_id) > _MAX_LIVE_SESSIONS and candidates:
+        victim = candidates.pop(0)
+        _sessions_by_id.pop(victim.session.id, None)
+        try:
+            remove_python_session(victim.session.id)
+        except Exception:
+            pass
+
+
+def _find_history_file_by_id(agent_name: str, session_id: str) -> Optional[str]:
+    """按会话 id 在历史目录定位文件名（服务器重启后找回会话用）。"""
+    if not session_id or any(c in session_id for c in "*?[]"):
+        return None
+    try:
+        agent_config = _get_agent_config(agent_name)
+        if not agent_config:
+            return None
+        hist_dir = SessionHistoryManager(agent_config.workspace_path).history_dir
+        found = sorted(hist_dir.glob(f"*_{session_id}.json"), reverse=True)
+        return found[0].name if found else None
+    except Exception:
+        return None
+
+
+def _resolve_session(agent_name: str, model_name: str,
+                     session_id: str = "") -> 'WebChatSession':
+    """按 session_id 解析会话；无 id 或未命中时回落到 (agent, model) 默认会话。
+
+    v5.2.9：会话身份以 session.id 为准（同一 agent:model 下可并存多个会话）。
+    服务器重启导致内存会话丢失时，自动按 id 从历史恢复。
+    """
+    if session_id:
+        cs = _sessions_by_id.get(session_id)
+        if cs is not None and cs.agent_name == agent_name:
+            return cs
+        # 内存未命中：尝试从历史按 id 恢复（服务器重启场景）
+        filename = _find_history_file_by_id(agent_name, session_id)
+        if filename:
+            try:
+                cs, _ = _load_session_core(agent_name, model_name, filename)
+                return cs
+            except Exception:
+                pass
+        # 历史也无此 id（从未落盘的新会话）：回落默认会话（可能是新建）
+        return _get_or_create_session(agent_name, model_name)
+    return _get_or_create_session(agent_name, model_name)
+
+
+def _resolve_session_quiet(agent_name: str, model_name: str,
+                           session_id: str = "") -> Optional['WebChatSession']:
+    """同 _resolve_session，但不创建新会话（查询/应答类端点用）。"""
+    if session_id:
+        cs = _sessions_by_id.get(session_id)
+        if cs is not None and cs.agent_name == agent_name:
+            return cs
+        return _chat_sessions.get(_get_session_key(agent_name, model_name))
+    return _chat_sessions.get(_get_session_key(agent_name, model_name))
+
+
 def _get_or_create_session(agent_name: str, model_name: str) -> WebChatSession:
     key = _get_session_key(agent_name, model_name)
     cs = _chat_sessions.get(key)
     if cs is None:
         cs = WebChatSession.create(agent_name, model_name)
+        import time as _time
+        cs.last_active_ts = _time.time()
         _chat_sessions[key] = cs
+        _register_session(cs)
     return cs
 
 
 def _sync_agent_tool_change(agent_name: str, full_rebuild: bool = False):
-    """工具开关/MCP 变更后同步到该 Agent 的所有活跃会话。"""
-    for cs in _chat_sessions.values():
-        if cs.agent_name != agent_name:
+    """工具开关/MCP 变更后同步到该 Agent 的所有存活会话（含后台运行的）。"""
+    seen = set()
+    for cs in list(_sessions_by_id.values()) + list(_chat_sessions.values()):
+        if id(cs) in seen or cs.agent_name != agent_name:
             continue
+        seen.add(id(cs))
         try:
             if full_rebuild:
                 cs.rebuild_tools_sync()
@@ -975,12 +1120,14 @@ class ChatRequest(BaseModel):
     model_name: str
     images: list[str] = []
     file_infos: list[dict] = []  # [{filename, url, download_url, is_image, size, content_type}]
+    session_id: str = ""        # v5.2.9：目标会话 id（空=该 agent:model 的默认会话）
 
 
 class ChatRespondRequest(BaseModel):
     agent_name: str
     model_name: str
     response: str
+    session_id: str = ""        # v5.2.9：应答目标会话 id
 
 
 class FileContent(BaseModel):
@@ -1962,7 +2109,7 @@ async def use_chain(req: Request):
             f"链条 '{chain_name}' 的元 Agent 是 '{root}'，"
             f"当前 Agent 是 '{agent_name}'。请先切换到元 Agent 再激活。")
 
-    cs = _get_or_create_session(agent_name, model_name)
+    cs = _resolve_session(agent_name, model_name, data.get("session_id", ""))
     cs.active_chain = chain
     cs.chain_active_path = [chain.get_root_agent()]
     cs.app_proxy.active_chain = chain
@@ -1992,7 +2139,7 @@ async def off_chain(req: Request):
     agent_name = data.get("agent_name", "")
     model_name = data.get("model_name", "")
 
-    cs = _get_or_create_session(agent_name, model_name)
+    cs = _resolve_session(agent_name, model_name, data.get("session_id", ""))
     cs.active_chain = None
     cs.chain_active_path = None
     cs.app_proxy.active_chain = None
@@ -2015,6 +2162,322 @@ async def off_chain(req: Request):
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+# ===================================================================
+#  实时事件总线 + 后台运行（v5.2.9：WebSocket 多浏览器同步）
+#
+#  会话的 ReAct 循环不再绑定 SSE 连接，而是在后台 asyncio 任务中运行：
+#  - 浏览器新建/切换会话不影响正在运行的任务（后台继续执行）
+#  - 全部事件（流式内容/工具确认/进度）发布到会话事件总线，
+#    任意数量的浏览器通过 /ws 订阅同一会话获得一致的实时画面
+#  - 事件日志按会话内单调 seq 记录，迟到订阅者（新开的浏览器、
+#    断线重连）按 since_seq 回放，不丢事件也不重复
+# ===================================================================
+
+def _parse_sse_line(sse_str: str) -> Optional[dict]:
+    """把 _react_loop 产出的 SSE 行还原为事件 dict。"""
+    s = (sse_str or "").strip()
+    if s.startswith("data: "):
+        s = s[6:]
+    try:
+        data = json.loads(s)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _publish_event(cs: 'WebChatSession', data: dict) -> None:
+    """发布事件：写入会话事件日志 + 投递给所有订阅者队列。"""
+    if not isinstance(data, dict) or cs is None:
+        return
+    try:
+        cs.run_seq += 1
+        entry = dict(data)
+        entry["seq"] = cs.run_seq
+        cs.run_events.append(entry)
+        if len(cs.run_events) > _MAX_RUN_EVENTS:
+            drop = len(cs.run_events) - _MAX_RUN_EVENTS
+            del cs.run_events[:drop]
+            cs.run_min_seq = cs.run_events[0]["seq"] - 1
+        for q in list(cs.subscribers):
+            try:
+                q.put_nowait(entry)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _session_title(cs: 'WebChatSession') -> str:
+    """会话显示标题（自定义标题 > 首条用户消息 > "新会话"）。"""
+    title = getattr(cs, "custom_title", "") or ""
+    if title:
+        return title
+    if cs.session:
+        for m in cs.session.messages:
+            if m.role == "user" and (m.content or "").strip():
+                return " ".join(m.content.split())[:50]
+    return "新会话"
+
+
+def _session_status_event(cs: 'WebChatSession', status: str) -> dict:
+    """会话状态变化通知（广播给所有 WebSocket 客户端，驱动侧边栏徽标）。"""
+    return {
+        "type": "session_status",
+        "session_id": cs.session.id if cs.session else "",
+        "agent": cs.agent_name,
+        "model": cs.model_name,
+        "status": status,           # running / idle
+        "title": _session_title(cs),
+    }
+
+
+def _broadcast_global(payload: dict) -> None:
+    """向所有 WebSocket 客户端广播通知（会话状态变化等）。"""
+    for client in list(_ws_clients):
+        try:
+            client.notify(payload)
+        except Exception:
+            pass
+
+
+def _live_export_limit(cs: 'WebChatSession') -> Optional[int]:
+    """会话运行中导出消息时的截断下标（当前运行的消息由事件回放渲染）。"""
+    if cs is not None and getattr(cs, "run_active", False):
+        return getattr(cs, "run_start_msg_count", 0) or None
+    return None
+
+
+def _ensure_session_cwd(cs: 'WebChatSession') -> None:
+    """工具执行前对齐进程 cwd 到会话所属工作空间（v5.2.9 多会话并发）。
+
+    工作空间切换是进程级 chdir，后台运行的会话若不对齐会在错误的
+    目录下执行读写操作。注意：多会话"同时"执行工具仍存在极小的
+    chdir 竞窗（毫秒级），对齐已覆盖绝大多数场景。
+    """
+    try:
+        ws = getattr(cs, "workspace", "") or ""
+        if ws and os.getcwd() != ws:
+            os.chdir(ws)
+    except Exception:
+        pass
+
+
+def _start_background_run(cs: 'WebChatSession', user_message: str) -> None:
+    """启动后台 ReAct 运行任务（若已有任务在跑则返回，不重复启动）。"""
+    if cs.run_task is not None and not cs.run_task.done():
+        return
+    import time as _time
+    cs.run_active = True
+    cs.run_events = []
+    cs.run_min_seq = 0
+    cs.respond_waiting = False
+    cs.last_active_ts = _time.time()
+    # 本次运行首条用户消息是最后一条消息：导出历史时截断到它之前，
+    # 该消息及后续由事件日志回放渲染（保证多浏览器一致）
+    cs.run_start_msg_count = max(0, len(cs.session.messages) - 1)
+    _publish_event(cs, {
+        "type": "run_start",
+        "session_id": cs.session.id,
+        "message": user_message,
+        "agent": cs.agent_name,
+        "model": cs.model_name,
+    })
+    # SessionStart 钩子输出（会话创建时收集，首次聊天时随事件下发）
+    if cs.hook_start_outputs:
+        for line in list(cs.hook_start_outputs):
+            _publish_event(cs, {"type": "hook_output",
+                                "event": "SessionStart", "content": line})
+        cs.hook_start_outputs = []
+    _broadcast_global(_session_status_event(cs, "running"))
+    cs.run_task = asyncio.create_task(_background_react_runner(cs))
+
+
+async def _background_react_runner(cs: 'WebChatSession'):
+    """后台执行 ReAct 循环：持有会话锁、逐事件发布到总线。
+
+    与 SSE 连接完全解耦--浏览器断开/切换会话/关闭页面均不影响执行。
+    """
+    try:
+        async with cs.lock:
+            async for ev in _react_loop(cs):
+                data = _parse_sse_line(ev)
+                if data is not None:
+                    _publish_event(cs, data)
+            # Stop 钩子：AI 回复完成后触发（与 CLI 一致）
+            if cs.hook_manager and cs.hook_manager.has_hooks("Stop"):
+                try:
+                    decision = await asyncio.to_thread(
+                        cs.hook_manager.run_simple, "Stop",
+                        session_id=cs.session.id)
+                    for line in decision.outputs:
+                        _publish_event(cs, {"type": "hook_output",
+                                            "event": "Stop", "content": line})
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        _publish_event(cs, {"type": "aborted"})
+    except Exception as e:
+        _publish_event(cs, {"type": "error", "content": str(e)})
+    finally:
+        import time as _time
+        cs.run_active = False
+        cs.respond_waiting = False
+        cs.last_active_ts = _time.time()
+        try:
+            _publish_event(cs, {"type": "run_end", "usage": cs.usage_stats()})
+        except Exception:
+            _publish_event(cs, {"type": "run_end"})
+        _broadcast_global(_session_status_event(cs, "idle"))
+        if cs.run_task is not None and cs.run_task.done():
+            cs.run_task = None
+
+
+class _WsClient:
+    """单个 WebSocket 连接：统一发送队列 + 至多一个会话的事件订阅。
+
+    所有出站消息（订阅回执/事件回放/全局通知）进入单一 out 队列，
+    由唯一 sender 任务串行写出，避免并发 send_text 交错。
+    """
+
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.out: asyncio.Queue = asyncio.Queue()
+        self.session_id: Optional[str] = None
+        self.cs: Optional['WebChatSession'] = None
+        self.queue: Optional[asyncio.Queue] = None
+        self._pump_task: Optional[asyncio.Task] = None
+        self._sender_task: Optional[asyncio.Task] = None
+        self._closed = False
+
+    # ---- 出站 ----
+    def _put(self, payload: dict) -> None:
+        if self._closed:
+            return
+        if self.out.qsize() > 5000:
+            # 慢消费者保护：积压过多直接断开，客户端重连后按 seq 回放恢复
+            self._closed = True
+            asyncio.ensure_future(self._close())
+            return
+        self.out.put_nowait(payload)
+
+    def notify(self, payload: dict) -> None:
+        """全局通知（任意任务调用，非阻塞）。"""
+        self._put({"type": "notice", "data": payload})
+
+    async def _sender(self) -> None:
+        while True:
+            payload = await self.out.get()
+            await self.ws.send_text(json.dumps(payload, ensure_ascii=False))
+
+    async def _close(self) -> None:
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+    # ---- 订阅管理 ----
+    def subscribe(self, session_id: str, since_seq: int) -> None:
+        self.unsubscribe()
+        cs = _sessions_by_id.get(session_id)
+        if cs is None:
+            self._put({"type": "subscribed", "session_id": session_id,
+                       "error": "会话不存在"})
+            return
+        # 快照与订阅之间无 await：asyncio 单线程下原子，事件不丢不重
+        snapshot = [ev for ev in cs.run_events if ev.get("seq", 0) > since_seq]
+        q: asyncio.Queue = asyncio.Queue()
+        cs.subscribers.append(q)
+        self.session_id = session_id
+        self.cs = cs
+        self.queue = q
+        need_resync = since_seq < cs.run_min_seq
+        self._put({"type": "subscribed", "session_id": session_id,
+                   "seq": cs.run_seq, "run_active": cs.run_active,
+                   "resync": need_resync})
+        if not need_resync:
+            for ev in snapshot:
+                self._put({"type": "event", "data": ev})
+
+        async def _pump():
+            try:
+                while self.queue is q:
+                    ev = await q.get()
+                    self._put({"type": "event", "data": ev})
+            except asyncio.CancelledError:
+                pass
+
+        self._pump_task = asyncio.create_task(_pump())
+
+    def unsubscribe(self) -> None:
+        if self.cs is not None and self.queue is not None:
+            try:
+                self.cs.subscribers.remove(self.queue)
+            except ValueError:
+                pass
+        self.session_id = None
+        self.cs = None
+        self.queue = None
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            self._pump_task = None
+
+    async def start(self) -> None:
+        self._sender_task = asyncio.create_task(self._sender())
+
+    async def stop(self) -> None:
+        self._closed = True
+        self.unsubscribe()
+        if self._sender_task is not None:
+            self._sender_task.cancel()
+            self._sender_task = None
+        await self._close()
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    """WebSocket 实时通道（v5.2.9）。
+
+    客户端 -> 服务端:
+      {"type": "subscribe", "session_id": "...", "since_seq": N}
+      {"type": "unsubscribe"}
+      {"type": "ping"}
+    服务端 -> 客户端:
+      {"type": "subscribed", seq, run_active, resync}   订阅回执（含回放判断）
+      {"type": "event", data: {...事件, seq}}           会话事件（回放+实时）
+      {"type": "notice", data: {...}}                   全局通知（会话状态等）
+      {"type": "pong"}
+    """
+    await websocket.accept()
+    client = _WsClient(websocket)
+    _ws_clients.add(client)
+    try:
+        await client.start()
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            mtype = msg.get("type", "")
+            if mtype == "subscribe":
+                client.subscribe(str(msg.get("session_id", "")),
+                                 int(msg.get("since_seq", 0) or 0))
+            elif mtype == "unsubscribe":
+                client.unsubscribe()
+            elif mtype == "ping":
+                client._put({"type": "pong"})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        try:
+            await client.stop()
+        except Exception:
+            pass
+        _ws_clients.discard(client)
 
 
 def _tool_preview(tool_name: str, arguments: dict) -> str:
@@ -2224,6 +2687,34 @@ def _fill_aborted_tool_msgs(cs: WebChatSession, valid_calls: list):
             tool_call_id=tc["id"])
 
 
+async def _execute_tool_interruptible(cs: 'WebChatSession', tool_name: str,
+                                      tool_args: dict) -> ToolResult:
+    """线程执行工具，期间轮询 abort 标志；用户中断时触发工具的 interrupt()
+    （terminal 会立即杀掉子进程）——修复"工具运行中无法中断"（v5.2.9）。
+
+    无 interrupt() 方法的工具（python/read/write 等）等待其自然结束
+    （通常为快速操作；python 代码执行无法安全杀线程）。
+    """
+    loop = asyncio.get_event_loop()
+    future = loop.run_in_executor(
+        None, lambda: cs.tool_registry.execute(tool_name, **tool_args))
+    interrupted = False
+    while not future.done():
+        if cs.abort and not interrupted:
+            interrupted = True
+            try:
+                tool = cs.tool_registry.get(tool_name)
+            except Exception:
+                tool = None
+            if tool is not None and hasattr(tool, "interrupt"):
+                try:
+                    tool.interrupt()
+                except Exception:
+                    pass
+        await asyncio.sleep(0.3)
+    return await future  # 异常由调用方捕获
+
+
 def _autosave_web_session(cs: "WebChatSession") -> None:
     """每轮对话结束自动保存会话到 history（v5.2.6）
 
@@ -2410,6 +2901,10 @@ async def _react_loop_inner(cs: WebChatSession):
                 _fill_aborted_tool_msgs(cs, valid_calls)
                 yield _sse({"type": "aborted"})
                 return
+
+            # v5.2.9：工具执行前对齐进程 cwd 到会话所属工作空间
+            # （多会话并发时，后台会话不会被其他会话的工作空间切换带偏）
+            _ensure_session_cwd(cs)
 
             tool_name = tc["tool"]
             tool_args = tc["arguments"]
@@ -2813,11 +3308,34 @@ async def _react_loop_inner(cs: WebChatSession):
                 })
             else:
                 try:
-                    result = await asyncio.to_thread(
-                        cs.tool_registry.execute, tool_name, **tool_args)
+                    # v5.2.9：工具执行期间轮询 abort，可中断工具（terminal）
+                    # 在用户中断时立即杀子进程（旧版须等工具执行完毕）
+                    result = await _execute_tool_interruptible(
+                        cs, tool_name, tool_args)
                 except Exception as e:
                     result = ToolResult(success=False, output="", error=str(e))
             result.duration_ms = int((_time.monotonic() - _t0) * 1000)
+
+            # v5.2.9：用户在工具执行期间中断——记录结果并立即结束本轮运行
+            # （跳过反思重试与剩余工具；被中断的命令不按普通失败处理）
+            if cs.abort:
+                _int_out = (result.output or "")
+                if result.error:
+                    _int_out += f"\n错误: {result.error}"
+                _int_out = _int_out[:MAX_TOOL_OUTPUT_LENGTH]
+                yield _sse({
+                    "type": "tool_result", "tool_name": tool_name,
+                    "tool_id": tool_id, "success": False,
+                    "preview": _int_out[:7500],
+                    "duration_ms": getattr(result, "duration_ms", 0),
+                })
+                cs.session.add_message(
+                    "tool", _int_out or "命令已被用户中断",
+                    tool_call_id=tool_id,
+                    metadata={"tool_name": tool_name, "success": False})
+                _fill_aborted_tool_msgs(cs, valid_calls)
+                yield _sse({"type": "aborted"})
+                return
 
             # ---- Web 端：python 工具执行后检测新生成的图片文件 ----
             if tool_name == "python" and result.success:
@@ -2985,10 +3503,17 @@ async def _react_loop_inner(cs: WebChatSession):
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """SSE 流式聊天端点（完整 ReAct 工具执行循环）。"""
-    cs = _get_or_create_session(req.agent_name, req.model_name)
+    """发送消息并启动后台 ReAct 运行（v5.2.9 实时架构）。
 
-    if cs.lock.locked():
+    立即返回，不再持有 HTTP 流：完整 ReAct 循环在后台 asyncio 任务中
+    执行（_background_react_runner），全部事件经会话事件总线广播给
+    所有已订阅该会话的浏览器（WebSocket /ws）。
+    - 浏览器关闭/切换会话不影响任务继续执行
+    - 多个浏览器打开同一会话看到完全一致的实时画面
+    """
+    cs = _resolve_session(req.agent_name, req.model_name, req.session_id or "")
+
+    if cs.lock and cs.lock.locked():
         raise HTTPException(409, "该会话正在处理中，请等待完成或先中断")
 
     # UserPromptSubmit 钩子：stdout 追加为用户上下文（与 CLI 一致）
@@ -3009,82 +3534,65 @@ async def chat(req: ChatRequest):
                            images=req.images if req.images else None)
     cs.abort = False
 
-    async def event_stream():
-        async with cs.lock:
-            try:
-                # SessionStart 钩子输出（会话创建时收集，首次聊天时下发）
-                if cs.hook_start_outputs:
-                    for line in cs.hook_start_outputs:
-                        yield _sse({"type": "hook_output",
-                                    "event": "SessionStart", "content": line})
-                    cs.hook_start_outputs = []
+    # 后台运行（事件总线发布 run_start + SessionStart 钩子输出）
+    _start_background_run(cs, req.message or "")
 
-                async for ev in _react_loop(cs):
-                    yield ev
-
-                # Stop 钩子：AI 回复完成后触发（与 CLI 一致）
-                if cs.hook_manager and cs.hook_manager.has_hooks("Stop"):
-                    try:
-                        decision = await asyncio.to_thread(
-                            cs.hook_manager.run_simple, "Stop",
-                            session_id=cs.session.id)
-                        for line in decision.outputs:
-                            yield _sse({"type": "hook_output",
-                                        "event": "Stop", "content": line})
-                    except Exception:
-                        pass
-            except Exception as e:
-                yield _sse({"type": "error", "content": str(e)})
-                yield _sse({"type": "done", "usage": cs.usage_stats()})
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return {"session_id": cs.session.id, "message": "已接收",
+            "started": True}
 
 
 @app.post("/api/chat/respond")
 async def chat_respond(req: ChatRespondRequest):
-    """工具确认 / ask_user 应答。"""
-    key = _get_session_key(req.agent_name, req.model_name)
-    cs = _chat_sessions.get(key)
+    """工具确认 / ask_user 应答（v5.2.9：多浏览器首个应答生效）。"""
+    cs = _resolve_session_quiet(req.agent_name, req.model_name, req.session_id or "")
     if cs and cs.respond_queue is not None:
+        # 仅在会话确实等待应答时接收（其他浏览器已应答/已超时则忽略，
+        # 防止迟到的应答被误当作下一次确认的结果）
+        if not getattr(cs, "respond_waiting", False):
+            return {"message": "无待处理操作"}
         await cs.respond_queue.put(req.response)
+        # 广播应答事件：所有浏览器撤销待确认/待回答 UI
+        _publish_event(cs, {"type": "responded",
+                            "session_id": cs.session.id,
+                            "response": req.response})
         return {"message": "应答已接收"}
     return {"message": "无待处理操作"}
 
 
 @app.post("/api/chat/reset")
 async def reset_chat(req: Request):
-    """新建会话（自动保存当前会话到历史）。"""
+    """新建会话（v5.2.9：旧会话不中断、不弹栈，后台继续运行）。
+
+    - 旧会话每轮对话已自动落盘（autosave），无需在此保存
+    - 旧会话若仍在运行，继续在后台执行；空闲则留在会话注册表中，
+      侧边栏仍可点开（数据与历史一致）
+    - 仅当旧会话空闲时清理其 python 解释器会话；运行中保留
+    """
     body = await req.json()
     agent_name = body.get("agent_name", "")
     model_name = body.get("model_name", "")
+    session_id = body.get("session_id", "")
     key = _get_session_key(agent_name, model_name)
 
-    cs = _chat_sessions.pop(key, None)
-    if cs:
-        cs.abort = True
-        if cs.session and len(cs.session.messages) > 1:
-            agent_config = _get_agent_config(agent_name)
-            if agent_config:
-                history_mgr = SessionHistoryManager(agent_config.workspace_path)
-                try:
-                    history_mgr.save_session(
-                        cs.session.get_context_messages(), cs.session.id,
-                        workspace=getattr(cs, "workspace", "") or "",
-                        title=getattr(cs, "custom_title", "") or "")
-                except Exception:
-                    pass
+    old = None
+    if session_id:
+        old = _sessions_by_id.get(session_id)
+    if old is None:
+        old = _chat_sessions.get(key)
 
-    # 释放 python 会话（含 cbhpacks 工具缓存），与 CLI /new 行为一致
-    remove_python_session("default")
-    return {"message": "会话已重置"}
+    if old is not None and not getattr(old, "run_active", False):
+        try:
+            remove_python_session(old.session.id)
+        except Exception:
+            pass
+
+    # 创建全新会话并注册为该 (agent, model) 的默认会话
+    cs = WebChatSession.create(agent_name, model_name)
+    _chat_sessions[key] = cs
+    _register_session(cs)
+    _broadcast_global({"type": "sessions_changed"})
+    return {"message": "已开始新会话", "session_id": cs.session.id,
+            "usage": cs.usage_stats()}
 
 
 @app.post("/api/chat/switch_model")
@@ -3093,12 +3601,13 @@ async def chat_switch_model(req: Request):
 
     仅替换 LLM 客户端及关联组件（token计数/压缩器/上下文窗口限制），
     会话消息原样保留，系统提示原地更新（模型名称、视觉能力描述可能变化）。
-    会话在 _chat_sessions 中从旧 (agent, model) 键迁移到新键。
+    v5.2.9：支持 session_id 定位会话（后台运行的会话也可原地切模型）。
     """
     body = await req.json()
     agent_name = body.get("agent_name", "")
     old_model = body.get("old_model", "")
     new_model = body.get("new_model", "")
+    session_id = body.get("session_id", "")
 
     if not agent_name or not new_model:
         raise HTTPException(400, "缺少 agent_name / new_model")
@@ -3112,25 +3621,22 @@ async def chat_switch_model(req: Request):
     old_key = _get_session_key(agent_name, old_model or new_model)
     new_key = _get_session_key(agent_name, new_model)
 
-    cs = _chat_sessions.get(old_key)
+    # v5.2.9：优先按 session_id 定位（当前订阅的会话可能不是默认会话）
+    cs = None
+    if session_id:
+        cs = _sessions_by_id.get(session_id)
+        if cs is not None and cs.agent_name != agent_name:
+            cs = None
+    if cs is None:
+        cs = _chat_sessions.get(old_key)
     if cs is None or old_key == new_key:
         # 无活动会话（或新旧模型相同），仅更新选择，无需迁移
         return {"switched": False, "message": f"已选择模型 '{new_model}'"}
 
-    # 新键位若已有旧会话：保存到历史后让位（与 chat_load 行为一致）
+    # 新键位若已有旧会话：让位（保留在注册表继续后台运行，不中断，v5.2.9）
     existing = _chat_sessions.pop(new_key, None)
     if existing is not None and existing is not cs:
-        existing.abort = True
-        if existing.session and len(existing.session.messages) > 1:
-            try:
-                agent_config = _get_agent_config(agent_name)
-                if agent_config:
-                    SessionHistoryManager(agent_config.workspace_path).save_session(
-                        existing.session.get_context_messages(), existing.session.id,
-                        workspace=getattr(existing, "workspace", "") or "",
-                        title=getattr(existing, "custom_title", "") or "")
-            except Exception:
-                pass
+        _register_session(existing)
 
     # 原地替换模型组件（会话消息原样保留）
     cs.llm_client = LLMClient(model_config)
@@ -3148,14 +3654,15 @@ async def chat_switch_model(req: Request):
     cs.session_key = new_key
     cs._rebuild_system_prompt()  # 原地更新首条 system 消息
 
-    # 会话键迁移: (agent, old_model) → (agent, new_model)
-    _chat_sessions.pop(old_key, None)
-    _chat_sessions[new_key] = cs
+    # 会话键迁移: (agent, old_model) -> (agent, new_model)（仅当 cs 是旧默认会话）
+    if _chat_sessions.get(old_key) is cs:
+        _chat_sessions.pop(old_key, None)
+        _chat_sessions[new_key] = cs
 
     return {"switched": True,
             "message": f"已切换到模型 '{new_model}'（会话及上下文已保留）",
+            "session_id": cs.session.id,
             "usage": cs.usage_stats()}
-
 
 @app.post("/api/chat/abort")
 async def chat_abort(req: Request):
@@ -3163,8 +3670,8 @@ async def chat_abort(req: Request):
     body = await req.json()
     agent_name = body.get("agent_name", "")
     model_name = body.get("model_name", "")
-    key = _get_session_key(agent_name, model_name)
-    cs = _chat_sessions.get(key)
+    session_id = body.get("session_id", "")
+    cs = _resolve_session_quiet(agent_name, model_name, session_id)
     if cs:
         # wait_response 每 0.5s 轮询一次 abort 标志，无需唤醒队列
         # （向队列投放空串会被误判为用户确认，导致中断失效继续执行工具）
@@ -3173,10 +3680,9 @@ async def chat_abort(req: Request):
 
 
 @app.get("/api/chat/status")
-def chat_status(agent_name: str, model_name: str):
-    """会话状态：token 精确统计 + 上下文占比。"""
-    key = _get_session_key(agent_name, model_name)
-    cs = _chat_sessions.get(key)
+def chat_status(agent_name: str, model_name: str, session_id: str = ""):
+    """会话状态：token 精确统计 + 上下文占比 + 后台运行状态（v5.2.9）。"""
+    cs = _resolve_session_quiet(agent_name, model_name, session_id)
     if not cs:
         # 会话不存在（页面刷新后），也从 GlobalConfig 返回持久化的链条状态
         result = {
@@ -3195,7 +3701,8 @@ def chat_status(agent_name: str, model_name: str):
     stats.update({"active": True, "cwd": os.getcwd(),
                   "workspace": _current_workspace,
                   "session_id": cs.session.id,
-                  "busy": bool(cs.lock and cs.lock.locked())})
+                  "busy": bool(cs.lock and cs.lock.locked()),
+                  "run_active": bool(getattr(cs, "run_active", False))})
     # 链条激活状态（前端据此更新按钮）
     if cs.active_chain:
         stats["active_chain"] = cs.active_chain.name
@@ -3205,13 +3712,46 @@ def chat_status(agent_name: str, model_name: str):
 
 
 @app.get("/api/chat/messages")
-def chat_messages(agent_name: str, model_name: str):
-    """导出当前会话消息（前端刷新后恢复对话）。"""
-    key = _get_session_key(agent_name, model_name)
-    cs = _chat_sessions.get(key)
+def chat_messages(agent_name: str, model_name: str, session_id: str = ""):
+    """导出当前会话消息（前端刷新后恢复对话）。
+
+    v5.2.9：会话后台运行中时截断到本次运行开始处，当前运行的内容
+    由 WebSocket 事件日志回放渲染（避免双份展示）。
+    """
+    cs = _resolve_session_quiet(agent_name, model_name, session_id)
     if not cs:
         return {"messages": []}
-    return {"messages": cs.export_messages()}
+    return {"messages": cs.export_messages(_live_export_limit(cs)),
+            "session_id": cs.session.id,
+            "run_active": bool(getattr(cs, "run_active", False)),
+            "run_seq": getattr(cs, "run_seq", 0)}
+
+
+def _live_session_stale_vs_disk(cs: 'WebChatSession', filename: str) -> bool:
+    """内存会话空闲且磁盘文件被外部更新过（如 CLI 对话）-> 内存副本过期。
+
+    CLI 与 Web 是两个独立进程、各自持有内存会话，共享历史文件。若磁盘文件
+    mtime 晚于本会话最近活动时间，说明外部进程写入了更新内容——必须丢弃
+    内存副本改从磁盘重载，否则 Web 页面显示过时/分叉内容（v5.2.9 修复：
+    CLI 对话中 Web 打开同一会话看到的是旧快照 + 测试残留）。
+    """
+    if getattr(cs, "run_active", False):
+        return False
+    try:
+        if cs.lock and cs.lock.locked():
+            return False
+    except Exception:
+        pass
+    try:
+        agent_config = _get_agent_config(cs.agent_name)
+        if not agent_config:
+            return False
+        fp = SessionHistoryManager(agent_config.workspace_path).history_dir / filename
+        if not fp.exists():
+            return False
+        return fp.stat().st_mtime > getattr(cs, "last_active_ts", 0.0) + 1.0
+    except Exception:
+        return False
 
 
 def _load_session_core(agent_name: str, model_name: str, filename: str):
@@ -3219,7 +3759,9 @@ def _load_session_core(agent_name: str, model_name: str, filename: str):
 
     【保留原会话 id/创建时间/工作空间/标题】：后续自动保存幂等覆盖同一文件，
     对该会话的新问答都记录在该会话下（点击会话=直接跳转，不产生副本）。
-    切换时【不保存旧会话】（每轮已自动保存落盘），仅中断。返回 (cs, data)。
+    v5.2.9：切换会话【不再中断旧会话】（每轮已自动保存落盘，后台任务
+    继续执行）；若同 id 会话仍在内存中（含后台运行中），直接复用该会话
+    对象--保留运行状态与未落盘的当前轮，绝不重建副本。返回 (cs, data)。
     """
     agent_config = _get_agent_config(agent_name)
     if not agent_config:
@@ -3231,9 +3773,19 @@ def _load_session_core(agent_name: str, model_name: str, filename: str):
         raise HTTPException(404, "会话不存在")
 
     key = _get_session_key(agent_name, model_name)
-    old = _chat_sessions.pop(key, None)
-    if old:
-        old.abort = True
+
+    # v5.2.9：同 id 会话仍在内存（含后台运行）-> 直接复用，保留运行状态；
+    # 但内存副本过期时（磁盘被 CLI 等外部进程更新）落到下方从磁盘重载
+    orig_id_live = data.get("id") or ""
+    if orig_id_live:
+        live = _sessions_by_id.get(orig_id_live)
+        if live is not None and live.agent_name == agent_name \
+                and not _live_session_stale_vs_disk(live, filename):
+            _chat_sessions[key] = live
+            return live, data
+
+    # 旧默认会话让位（不中断：可能仍在后台运行，v5.2.9）
+    _chat_sessions.pop(key, None)
 
     cs = WebChatSession.create(agent_name, model_name)
     orig_id = data.get("id") or ""
@@ -3248,6 +3800,7 @@ def _load_session_core(agent_name: str, model_name: str, filename: str):
             cs.app_proxy.tool_executor.session_id = orig_id
         except Exception:
             pass
+        cs._sync_python_session()  # v5.2.9：id 覆盖后重新隔离 python 会话
     try:
         if data.get("created_at"):
             cs.session.created_at = datetime.fromisoformat(data["created_at"])
@@ -3270,6 +3823,9 @@ def _load_session_core(agent_name: str, model_name: str, filename: str):
             reasoning_content=msg.get("reasoning_content"),
         )
     _chat_sessions[key] = cs
+    _register_session(cs)
+    import time as _time
+    cs.last_active_ts = _time.time()  # 过期检测基线：刚加载不算过期
     return cs, data
 
 
@@ -3284,6 +3840,31 @@ async def chat_load(req: Request):
 
     if not agent_name or not model_name or (not filename and not session_id):
         raise HTTPException(400, "缺少 agent_name / model_name / filename")
+
+    # v5.2.9：该 id 的会话仍在内存（含后台运行中）-> 直接复用。
+    # 保留其运行状态与未落盘的当前轮；运行中的会话事件由 WS 回放接管。
+    # 内存副本过期时（磁盘被 CLI 等外部进程更新）落到下方文件路径从磁盘重载。
+    if session_id:
+        live = _sessions_by_id.get(session_id)
+        if live is not None and live.agent_name == agent_name:
+            fname = _find_history_file_by_id(agent_name, session_id)
+            if fname and not _live_session_stale_vs_disk(live, fname):
+                _chat_sessions[_get_session_key(agent_name, model_name)] = live
+                ws = (body.get("workspace") or "").strip() or live.workspace
+                if ws and Path(ws).is_dir():
+                    try:
+                        _set_current_workspace(ws)
+                    except Exception:
+                        pass
+                return {"message": "会话已加载", "session_id": live.session.id,
+                        "messages": live.export_messages(_live_export_limit(live)),
+                        "usage": live.usage_stats(),
+                        "model": live.model_name,
+                        "workspace": _current_workspace,
+                        "run_active": bool(getattr(live, "run_active", False)),
+                        "run_seq": getattr(live, "run_seq", 0)}
+            if fname:
+                filename = fname  # 副本过期：改走文件加载路径从磁盘重载
 
     # v5.2.8：无文件名时按会话 id 定位（服务器重启后前端自动找回原会话）
     if not filename and session_id and not any(c in session_id for c in "*?[]"):
@@ -3308,9 +3889,13 @@ async def chat_load(req: Request):
             pass
 
     return {"message": "会话已加载",
-            "messages": cs.export_messages(),
+            "session_id": cs.session.id,
+            "messages": cs.export_messages(_live_export_limit(cs)),
             "usage": cs.usage_stats(),
-            "workspace": _current_workspace}
+            "model": cs.model_name,
+            "workspace": _current_workspace,
+            "run_active": bool(getattr(cs, "run_active", False)),
+            "run_seq": getattr(cs, "run_seq", 0)}
 
 
 # ===================================================================
@@ -3351,26 +3936,25 @@ def workspace_info(agent_name: str):
                           "sessions": []}
         return groups[ws]
 
-    # 活跃会话（内存中，优先于历史文件展示）
+    # 活跃会话（内存注册表全部会话，含后台运行中的；优先于历史文件展示）
+    # v5.2.9：展示有内容/正在运行/当前默认的会话（其余全新空会话不进侧边栏）
     seen_ids = set()
-    for cs in list(_chat_sessions.values()):
+    default_cs_ids = {id(v) for v in _chat_sessions.values()}
+    for cs in list(_sessions_by_id.values()):
         if cs.agent_name != agent_name or not cs.session:
             continue
-        title = getattr(cs, "custom_title", "") or ""
-        if not title:
-            title = "新会话"
-            for m in cs.session.messages:
-                if m.role == "user" and (m.content or "").strip():
-                    # 压缩换行/连续空白，避免侧边栏/列表标题折行
-                    title = " ".join(m.content.split())[:50]
-                    break
+        has_content = len(cs.session.messages) > 1
+        running = bool(getattr(cs, "run_active", False))
+        is_default = id(cs) in default_cs_ids
+        if not has_content and not running and not is_default:
+            continue
         seen_ids.add(cs.session.id)
         group_of(getattr(cs, "workspace", "") or "")["sessions"].append({
-            "filename": "", "id": cs.session.id, "title": title,
+            "filename": "", "id": cs.session.id, "title": _session_title(cs),
             "created_at": cs.session.created_at.isoformat(),
             "message_count": len(cs.session.messages),
             "workspace": getattr(cs, "workspace", "") or str(_SERVER_ROOT),
-            "model": cs.model_name, "active": True,
+            "model": cs.model_name, "active": True, "running": running,
         })
 
     # 历史会话（与活跃会话同 id 的跳过，活跃条目更新）
@@ -3379,6 +3963,7 @@ def workspace_info(agent_name: str):
             continue
         entry = dict(s)
         entry["active"] = False
+        entry["running"] = False
         group_of(s.get("workspace", "") or "")["sessions"].append(entry)
 
     # 确保当前工作空间 + 历史打开过的工作空间始终在列表中
@@ -3445,25 +4030,20 @@ async def workspace_open(req: Request):
     if not target.is_dir():
         raise HTTPException(404, "目录不存在")
 
-    # 当前会话保存到旧工作空间（与 /new 相同的保存逻辑）
+    # 旧默认会话让位（v5.2.9：不中断、不弹栈；每轮已自动落盘，
+    # 仍运行中的会话继续后台执行，侧边栏仍可点开）
     key = _get_session_key(agent_name, model_name)
-    old = _chat_sessions.pop(key, None)
-    if old and old.session and len(old.session.messages) > 1:
-        try:
-            cfg = _get_agent_config(agent_name)
-            if cfg:
-                SessionHistoryManager(cfg.workspace_path).save_session(
-                    old.session.get_context_messages(), old.session.id,
-                    workspace=getattr(old, "workspace", "") or "",
-                    title=getattr(old, "custom_title", "") or "")
-        except Exception:
-            pass
+    _chat_sessions.pop(key, None)
 
     _set_current_workspace(str(target))
 
     # resume=True（侧边栏"选择该文件夹"）：恢复该工作空间下最新会话
     messages_out: list = []
     usage_out = None
+    session_out = None
+    model_out = None
+    run_active_out = False
+    run_seq_out = 0
     if body.get("resume"):
         history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
         latest = None
@@ -3473,12 +4053,18 @@ async def workspace_open(req: Request):
                 break
         if latest:
             cs, _ = _load_session_core(agent_name, model_name, latest["filename"])
-            messages_out = cs.export_messages()
+            messages_out = cs.export_messages(_live_export_limit(cs))
             usage_out = cs.usage_stats()
+            session_out = cs.session.id
+            model_out = cs.model_name
+            run_active_out = bool(getattr(cs, "run_active", False))
+            run_seq_out = getattr(cs, "run_seq", 0)
 
     return {"message": f"已打开工作空间: {_ws_display_name(str(target))}",
             "workspace": _current_workspace,
-            "messages": messages_out, "usage": usage_out}
+            "messages": messages_out, "usage": usage_out,
+            "session_id": session_out, "model": model_out,
+            "run_active": run_active_out, "run_seq": run_seq_out}
 
 
 @app.post("/api/workspace/sessions/clear")
@@ -3539,11 +4125,11 @@ def files_list(path: str = ""):
 
 
 def _find_live_session(agent_name: str, session_id: str):
-    """按会话 id 查找内存中的活跃会话（v5.2.8 会话管理）。"""
-    for cs in list(_chat_sessions.values()):
-        if cs.agent_name == agent_name and cs.session \
-                and cs.session.id == session_id:
-            return cs
+    """按会话 id 查找内存中的活跃会话（v5.2.9：从全会话注册表查找）。"""
+    cs = _sessions_by_id.get(session_id)
+    if cs is not None and cs.agent_name == agent_name and cs.session \
+            and cs.session.id == session_id:
+        return cs
     return None
 
 
@@ -3572,6 +4158,7 @@ async def session_rename(req: Request):
             SessionHistoryManager(cfg.workspace_path).save_session(
                 live.session.get_context_messages(), live.session.id,
                 workspace=getattr(live, "workspace", "") or "", title=title)
+    _broadcast_global({"type": "sessions_changed"})
     return {"message": "已重命名"}
 
 
@@ -3598,9 +4185,21 @@ async def session_delete(req: Request):
                 pass
     live = _find_live_session(agent_name, session_id) if session_id else None
     if live:
+        # v5.2.9：中断后台任务 + 从注册表彻底移除 + 清理 python 会话
         live.abort = True
-        _chat_sessions.pop(
-            _get_session_key(live.agent_name, live.model_name), None)
+        task = getattr(live, "run_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        _sessions_by_id.pop(session_id, None)
+        for k, v in list(_chat_sessions.items()):
+            if v is live:
+                _chat_sessions.pop(k, None)
+                break
+        try:
+            remove_python_session(session_id)
+        except Exception:
+            pass
+        _broadcast_global({"type": "sessions_changed"})
         deleted = True
     if not deleted:
         raise HTTPException(404, "会话不存在")
@@ -3646,8 +4245,7 @@ async def chat_compress(req: Request):
     body = await req.json()
     agent_name = body.get("agent_name", "")
     model_name = body.get("model_name", "")
-    key = _get_session_key(agent_name, model_name)
-    cs = _chat_sessions.get(key)
+    cs = _resolve_session_quiet(agent_name, model_name, body.get("session_id", ""))
     if not cs:
         raise HTTPException(400, "当前没有活动会话")
     if not cs.context_compressor:
