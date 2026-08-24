@@ -122,23 +122,24 @@ const api = {
   getHistoryDetail: (a, f) => request(`/agents/${enc(a)}/history/${enc(f)}`),
   deleteHistory: (a, f) => request(`/agents/${enc(a)}/history/${enc(f)}`, { method: "DELETE" }),
 
-  // 对话
-  chatStream: (message, agent_name, model_name, images) =>
-    fetch(`${BASE}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, agent_name, model_name, images: images || [] }),
-    }),
-  chatRespond: (agent_name, model_name, response) =>
-    request("/chat/respond", { method: "POST", body: JSON.stringify({ agent_name, model_name, response }) }),
-  chatReset: (agent_name, model_name) =>
-    request("/chat/reset", { method: "POST", body: JSON.stringify({ agent_name, model_name }) }),
-  chatSwitchModel: (agent_name, old_model, new_model) =>
-    request("/chat/switch_model", { method: "POST", body: JSON.stringify({ agent_name, old_model, new_model }) }),
-  chatAbort: (agent_name, model_name) =>
-    request("/chat/abort", { method: "POST", body: JSON.stringify({ agent_name, model_name }) }),
-  chatStatus: (a, m) => request(`/chat/status?agent_name=${enc(a)}&model_name=${enc(m)}`),
-  chatMessages: (a, m) => request(`/chat/messages?agent_name=${enc(a)}&model_name=${enc(m)}`),
+  // 对话（v5.2.9：消息经 POST 发送立即返回，实时事件走 WebSocket）
+  chatStream: (message, agent_name, model_name, images, session_id) =>
+    request("/chat", { method: "POST", body: JSON.stringify({
+      message, agent_name, model_name, images: images || [],
+      session_id: session_id || "",
+    }) }),
+  chatRespond: (agent_name, model_name, response, session_id) =>
+    request("/chat/respond", { method: "POST", body: JSON.stringify({ agent_name, model_name, response, session_id: session_id || "" }) }),
+  chatReset: (agent_name, model_name, session_id) =>
+    request("/chat/reset", { method: "POST", body: JSON.stringify({ agent_name, model_name, session_id: session_id || "" }) }),
+  chatSwitchModel: (agent_name, old_model, new_model, session_id) =>
+    request("/chat/switch_model", { method: "POST", body: JSON.stringify({ agent_name, old_model, new_model, session_id: session_id || "" }) }),
+  chatAbort: (agent_name, model_name, session_id) =>
+    request("/chat/abort", { method: "POST", body: JSON.stringify({ agent_name, model_name, session_id: session_id || "" }) }),
+  chatStatus: (a, m, session_id) =>
+    request(`/chat/status?agent_name=${enc(a)}&model_name=${enc(m)}${session_id ? `&session_id=${enc(session_id)}` : ""}`),
+  chatMessages: (a, m, session_id) =>
+    request(`/chat/messages?agent_name=${enc(a)}&model_name=${enc(m)}${session_id ? `&session_id=${enc(session_id)}` : ""}`),
   chatLoad: (agent_name, model_name, filename, workspace, session_id) =>
     request("/chat/load", { method: "POST", body: JSON.stringify({ agent_name, model_name, filename: filename || "", workspace: workspace || "", session_id: session_id || "" }) }),
 
@@ -158,8 +159,8 @@ const api = {
     request("/workspace/session/delete", { method: "POST", body: JSON.stringify({ agent_name: a, session_id: s.id, filename: s.filename }) }),
   sessionCopy: (a, s) =>
     request("/workspace/session/copy", { method: "POST", body: JSON.stringify({ agent_name: a, session_id: s.id, filename: s.filename }) }),
-  chatCompress: (agent_name, model_name, instructions) =>
-    request("/chat/compress", { method: "POST", body: JSON.stringify({ agent_name, model_name, instructions: instructions || "" }) }),
+  chatCompress: (agent_name, model_name, instructions, session_id) =>
+    request("/chat/compress", { method: "POST", body: JSON.stringify({ agent_name, model_name, instructions: instructions || "", session_id: session_id || "" }) }),
   chatUpload: (file, a, m) => {
     const fd = new FormData();
     fd.append("file", file);
@@ -174,10 +175,10 @@ const api = {
   getChain: (n) => request(`/chains/${enc(n)}`),
   updateChain: (n, d) => request(`/chains/${enc(n)}`, { method: "PUT", body: JSON.stringify(d) }),
   deleteChain: (n) => request(`/chains/${enc(n)}`, { method: "DELETE" }),
-  useChain: (a, m, chain_name) =>
-    request("/chat/use-chain", { method: "POST", body: JSON.stringify({ agent_name: a, model_name: m, chain_name }) }),
-  offChain: (a, m) =>
-    request("/chat/off-chain", { method: "POST", body: JSON.stringify({ agent_name: a, model_name: m }) }),
+  useChain: (a, m, chain_name, session_id) =>
+    request("/chat/use-chain", { method: "POST", body: JSON.stringify({ agent_name: a, model_name: m, chain_name, session_id: session_id || "" }) }),
+  offChain: (a, m, session_id) =>
+    request("/chat/off-chain", { method: "POST", body: JSON.stringify({ agent_name: a, model_name: m, session_id: session_id || "" }) }),
 };
 
 function enc(s) { return encodeURIComponent(s); }
@@ -1145,6 +1146,8 @@ async function onAgentChange() {
   state.activeChain = null;
   updateChainIndicator();
   api.selectAgent(name).catch(() => {});
+  liveRunReset();
+  wsSubscribe(null);   // 退订旧会话（restoreMessages 会订阅新 Agent 的会话）
   clearMessages();
   await restoreMessages();
   await refreshStatus();
@@ -1159,7 +1162,7 @@ async function onModelChange() {
   state.selectedModel = name;
   try {
     // 原地切换模型：保留当前会话及上下文（对齐 CLI /model use）
-    const r = await api.chatSwitchModel(currentAgent(), old, name);
+    const r = await api.chatSwitchModel(currentAgent(), old, name, state.currentSessionId);
     toast(r.message || `已切换到模型 '${name}'`, "success");
   } catch (e) {
     state.selectedModel = old;
@@ -1207,7 +1210,7 @@ async function refreshStatus() {
   const a = currentAgent(), m = currentModel();
   if (!a || !m) return;
   try {
-    const s = await api.chatStatus(a, m);
+    const s = await api.chatStatus(a, m, state.currentSessionId);
     updateCtxMeter(s);
     if (s.workspace) state.currentWorkspace = s.workspace;
     const cwdBar = $("#cwd-bar");
@@ -1220,12 +1223,27 @@ async function refreshStatus() {
       state.activeChain = s.active_chain || null;
       updateChainIndicator();
     }
-    // v5.2.8：跟踪后端会话 id；若后端会话丢失（服务器重启）但页面仍有
-    // 对话内容，自动按 id 找回并恢复该会话（含上下文进度条）
+    // v5.2.9：按当前订阅会话跟踪状态；后台运行中同步流式状态
     if (s.active) {
-      if (s.session_id) state.currentSessionId = s.session_id;
+      if (s.session_id && s.session_id !== state.currentSessionId) {
+        setSessionId(s.session_id);
+      }
+      if (s.run_active && !state.streaming) {
+        setStreaming(true);
+        ensureLiveTurn();
+      } else if (!s.run_active && state.streaming && !liveRun.active) {
+        // v5.2.9 兜底：当前会话未在运行却残留流式状态（如从其他运行中
+        // 会话切走后）-> 复位，中断按钮只在当前会话运行中显示
+        setStreaming(false);
+      }
+      // 确保已订阅当前会话（页面刷新/重连后补订阅）
+      if (state.currentSessionId && ws.connected
+          && ws.sessionSub !== state.currentSessionId) {
+        wsSubscribe(state.currentSessionId, ws.lastSeq);
+      }
     } else if (!state.streaming && state.currentSessionId
                && $(".msg-column", chatUI.messages)) {
+      // 后端会话丢失（服务器重启/被驱逐）但页面仍有对话内容：按 id 找回
       const sid = state.currentSessionId;
       state.currentSessionId = null;  // 先清空，恢复失败时不重试
       restoreLostSession(sid);
@@ -1239,16 +1257,39 @@ async function restoreLostSession(sessionId) {
   if (!a || !m) return;
   try {
     const r = await api.chatLoad(a, m, "", "", sessionId);
-    state.currentSessionId = sessionId;
+    setSessionId(r.session_id || sessionId);
     if (r.workspace) state.currentWorkspace = r.workspace;
+    liveRunReset();
     clearMessages();
     renderRestoredMessages(r.messages || []);
     if (r.usage) updateCtxMeter(r.usage);
+    wsSubscribe(r.session_id || sessionId, r.run_active ? 0 : (r.run_seq || 0));
     toast("检测到服务重启，会话已自动恢复", "info");
     refreshWorkspaces();
   } catch {
     // 会话从未落盘（未完成过完整对话轮），无法恢复，保持当前展示
   }
+}
+
+/* 记录当前会话 id（并持久化，刷新页面后重新打开同一会话） */
+function setSessionId(id) {
+  state.currentSessionId = id || null;
+  try {
+    if (id) localStorage.setItem("cbhcli.lastSession." + currentAgent(), id);
+    else localStorage.removeItem("cbhcli.lastSession." + currentAgent());
+  } catch (_) {}
+}
+
+/* 重新拉取当前会话消息并重渲染（WS 事件日志被裁剪时的 resync 兜底） */
+async function refreshCurrentSession() {
+  const a = currentAgent(), m = currentModel();
+  if (!a || !m || !state.currentSessionId) return;
+  try {
+    const { messages } = await api.chatMessages(a, m, state.currentSessionId);
+    liveRunReset();
+    clearMessages();
+    renderRestoredMessages(messages || []);
+  } catch (_) {}
 }
 
 function updateCtxMeter(s) {
@@ -1313,6 +1354,12 @@ async function sendMessage() {
   if (state.streaming) return;
   if (!text && state.attachments.length === 0) return;
 
+  // v5.2.9：实时事件走 WebSocket，发送前确保通道就绪
+  if (!(await ensureWsReady())) {
+    toast("实时通道未就绪，请稍后重试", "warn");
+    return;
+  }
+
   // 组装用户消息
   const fileInfos = [];
   const images = [];
@@ -1370,7 +1417,22 @@ async function sendMessage() {
   renderAttachments();
   scrollBottom();
 
-  await runStream(userContent, images);
+  // v5.2.9：POST 发送立即返回，实时事件经 WebSocket 到达（多浏览器一致）。
+  // 用户气泡已在本地渲染；run_start 事件到达时因 sentLocally 跳过重复渲染。
+  liveRunReset();
+  liveRun.sentLocally = true;
+  ensureLiveTurn();
+  try {
+    const r = await api.chatStream(userContent, a, m, images, state.currentSessionId);
+    if (r && r.session_id) {
+      if (r.session_id !== state.currentSessionId) setSessionId(r.session_id);
+      if (ws.sessionSub !== r.session_id) wsSubscribe(r.session_id, 0);
+    }
+  } catch (e) {
+    liveRun.sentLocally = false;
+    endLiveTurn();
+    toast(`发送失败: ${e.message}`, "error");
+  }
 }
 
 function setStreaming(on) {
@@ -1383,92 +1445,300 @@ function setStreaming(on) {
 
 async function abortStream() {
   try {
-    await api.chatAbort(currentAgent(), currentModel());
+    await api.chatAbort(currentAgent(), currentModel(), state.currentSessionId);
   } catch (e) { toast(e.message, "error"); }
 }
 
-/* ---- SSE 流处理 ---- */
-async function runStream(userContent, images) {
-  setStreaming(true);
-  const col = msgColumn();
+/* ===================================================================
+   WebSocket 实时通道 + 当前运行渲染状态（v5.2.9）
+   - 事件经 /ws 订阅推送（与发送端解耦，多浏览器画面一致）
+   - 会话切换/新建后旧会话后台继续运行，侧边栏实时显示状态
+   =================================================================== */
 
-  // AI 消息容器
-  const aiBody = el("div", { class: "msg-ai-body" });
-  col.append(el("div", { class: "msg-ai" }, el("div", { class: "msg-ai-avatar" }, "❯"), aiBody));
-  scrollBottom();
+const ws = {
+  sock: null, connected: false, sessionSub: "", lastSeq: 0,
+  retryTimer: null, retryDelay: 1000, pingTimer: null,
+};
 
-  // 当前块指针
-  let curReasoning = null;   // {content, textEl, blockEl}
-  let curContent = null;     // {raw, el}
-  let lastToolCard = null;
-  const toolCards = new Map();  // tool_id -> card record
+function wsSend(obj) {
+  try { if (ws.sock && ws.sock.readyState === 1) ws.sock.send(JSON.stringify(obj)); } catch (_) {}
+}
 
-  const closeReasoning = () => {
-    if (curReasoning) {
-      curReasoning.blockEl.querySelector(".thinking-live-dot")?.remove();
-      // 思考结束后自动折叠，保持对话整洁（点击标题可重新展开）
-      curReasoning.blockEl.classList.remove("open");
-      curReasoning = null;
+/** 订阅会话（同会话断线重连从 lastSeq 续订；新会话从 0 回放当前运行） */
+function wsSubscribe(sessionId, sinceSeq) {
+  if (!sessionId) { ws.sessionSub = ""; wsSend({ type: "unsubscribe" }); return; }
+  const since = (sinceSeq === undefined || sinceSeq === null)
+    ? (ws.sessionSub === sessionId ? ws.lastSeq : 0)
+    : sinceSeq;
+  ws.sessionSub = sessionId;
+  wsSend({ type: "subscribe", session_id: sessionId, since_seq: since });
+}
+
+function wsConnect() {
+  if (ws.sock && (ws.sock.readyState === 0 || ws.sock.readyState === 1)) return;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  try { ws.sock = new WebSocket(`${proto}://${location.host}/ws`); }
+  catch (e) { wsScheduleReconnect(); return; }
+  ws.sock.onopen = () => {
+    ws.connected = true;
+    ws.retryDelay = 1000;
+    if (ws.sessionSub) wsSubscribe(ws.sessionSub, ws.lastSeq);
+    ws.pingTimer = setInterval(() => wsSend({ type: "ping" }), 30000);
+  };
+  ws.sock.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    if (msg.type === "event" && msg.data) {
+      if (msg.data.seq) ws.lastSeq = msg.data.seq;
+      handleLiveEvent(msg.data);
+    } else if (msg.type === "subscribed") {
+      handleSubscribed(msg);
+    } else if (msg.type === "notice" && msg.data) {
+      handleWsNotice(msg.data);
     }
   };
-  const closeContent = () => { curContent = null; };
+  ws.sock.onclose = () => {
+    ws.connected = false;
+    clearInterval(ws.pingTimer);
+    wsScheduleReconnect();
+  };
+  ws.sock.onerror = () => { try { ws.sock.close(); } catch (_) {} };
+}
 
-  function ensureReasoning() {
-    if (curReasoning) return curReasoning;
-    closeContent();
-    const textEl = el("div", { class: "thinking-content" });
-    const blockEl = el("div", { class: "thinking-block open" },
-      el("div", { class: "thinking-header" },
-        el("span", { class: "arrow" }, "▶"),
-        el("span", null, "思考过程"),
-        el("span", { class: "thinking-live-dot" })),
-      textEl);
-    blockEl.querySelector(".thinking-header").addEventListener("click", () =>
-      blockEl.classList.toggle("open"));
-    aiBody.append(blockEl);
-    curReasoning = { content: "", textEl, blockEl };
-    return curReasoning;
-  }
+function wsScheduleReconnect() {
+  clearTimeout(ws.retryTimer);
+  ws.retryTimer = setTimeout(() => {
+    ws.retryDelay = Math.min(ws.retryDelay * 1.5, 8000);
+    wsConnect();
+  }, ws.retryDelay);
+}
 
-  function ensureContent() {
-    if (curContent) return curContent;
-    closeReasoning();
-    const mdEl = el("div", { class: "md-content" });
-    aiBody.append(mdEl);
-    curContent = { raw: "", el: mdEl };
-    return curContent;
-  }
+/** 发送前确保 WS 就绪（最多等待约 5 秒） */
+function ensureWsReady() {
+  if (ws.connected && ws.sock && ws.sock.readyState === 1) return Promise.resolve(true);
+  wsConnect();
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const timer = setInterval(() => {
+      if (ws.connected && ws.sock && ws.sock.readyState === 1) {
+        clearInterval(timer); resolve(true);
+      } else if (Date.now() - t0 > 5000) {
+        clearInterval(timer); resolve(false);
+      }
+    }, 200);
+  });
+}
 
-  function addSysEvent(text, cls = "", icon = "ℹ️") {
-    closeReasoning(); closeContent();
-    aiBody.append(el("div", { class: `sys-event ${cls}` },
-      el("span", { class: "icon" }, icon), el("span", null, text)));
-    scrollBottom();
+/* ---- 订阅回执 ---- */
+function handleSubscribed(msg) {
+  if (msg.error) {
+    // 会话不存在（服务器重启等）：清除订阅，等待状态轮询自动恢复
+    if (ws.sessionSub === msg.session_id) { ws.sessionSub = ""; ws.lastSeq = 0; }
+    return;
   }
+  if (msg.resync) {
+    // 事件日志已裁剪（超长流）：重拉消息后按当前 seq 续订兜底
+    refreshCurrentSession().then(() => {
+      if (msg.session_id) wsSubscribe(msg.session_id, msg.seq || 0);
+    });
+    return;
+  }
+}
 
-  function ensureToolCard(toolId, name) {
-    if (toolCards.has(toolId)) return toolCards.get(toolId);
-    closeReasoning(); closeContent();
-    const statusEl = el("span", { class: "tag amber tool-status" }, "等待确认");
-    const previewEl = el("span", { class: "tool-preview-text" });
-    const bodyEl = el("div", { class: "tool-card-body" });
-    // v5.2.8：工具卡片默认收起展示（点击标题展开），避免页面过长
-    const cardEl = el("div", { class: "tool-card" },
-      el("div", { class: "tool-card-header" },
-        el("span", { class: "arrow" }, "▶"),
-        el("span", { class: "tool-icon" }, toolIcon(name)),
-        el("span", { class: "tool-name" }, name),
-        previewEl, statusEl),
-      bodyEl);
-    cardEl.querySelector(".tool-card-header").addEventListener("click", () =>
-      cardEl.classList.toggle("open"));
-    aiBody.append(cardEl);
-    const rec = { toolId, name, cardEl, statusEl, previewEl, bodyEl, confirmEl: null };
-    toolCards.set(toolId, rec);
-    lastToolCard = rec;
-    scrollBottom();
-    return rec;
+/* ---- 全局通知（会话运行状态/列表变化，多浏览器侧边栏同步） ---- */
+function handleWsNotice(d) {
+  if (d.type === "session_status") {
+    scheduleWorkspacesRefresh();
+    if (d.session_id && d.session_id === state.currentSessionId) {
+      if (d.status === "running") {
+        if (!state.streaming) setStreaming(true);
+        ensureLiveTurn();
+      } else if (!liveRun.active) {
+        setStreaming(false);
+      }
+    }
+  } else if (d.type === "sessions_changed") {
+    scheduleWorkspacesRefresh();
   }
+}
+
+let _wsRefreshTimer = null;
+function scheduleWorkspacesRefresh() {
+  clearTimeout(_wsRefreshTimer);
+  _wsRefreshTimer = setTimeout(() => refreshWorkspaces(), 600);
+}
+
+/* ---- 当前运行渲染状态（v5.2.9：事件驱动，多浏览器一致） ---- */
+const liveRun = {
+  active: false,        // 当前订阅会话是否处于一轮运行的渲染中
+  sentLocally: false,   // 本浏览器发送的消息（run_start 不重复渲染用户气泡）
+  aiBody: null,         // 本轮 AI 消息容器（首个内容事件时惰性创建）
+  curReasoning: null, curContent: null, lastToolCard: null,
+  toolCards: new Map(),
+  pendingRespondEl: null,  // 待应答 UI（确认卡/提问卡），其他浏览器应答后撤销
+};
+
+function liveRunReset() {
+  liveRun.active = false;
+  liveRun.sentLocally = false;
+  liveRun.aiBody = null;
+  liveRun.curReasoning = null;
+  liveRun.curContent = null;
+  liveRun.lastToolCard = null;
+  liveRun.toolCards = new Map();
+  liveRun.pendingRespondEl = null;
+  // v5.2.9 修复：切换/加载/新建会话时复位流式状态，中断按钮仅当前会话
+  // 运行中显示（旧版在别的浏览器运行会话时切走后中断按钮残留）
+  setStreaming(false);
+}
+
+/** 本轮 AI 消息容器（惰性创建：用户气泡先于 AI 内容，保证顺序正确） */
+function getAiBody() {
+  if (liveRun.aiBody) return liveRun.aiBody;
+  const col = msgColumn();
+  liveRun.aiBody = el("div", { class: "msg-ai-body" });
+  col.append(el("div", { class: "msg-ai" },
+    el("div", { class: "msg-ai-avatar" }, "❯"), liveRun.aiBody));
+  scrollBottom();
+  return liveRun.aiBody;
+}
+
+/** 标记一轮运行开始（本浏览器发送或收到 run_start 事件时调用） */
+function ensureLiveTurn() {
+  if (liveRun.active) return;
+  liveRun.active = true;
+  setStreaming(true);
+}
+
+/** 一轮运行结束（run_end 事件收尾） */
+function endLiveTurn(usage) {
+  const hadBody = !!liveRun.aiBody;
+  closeLiveReasoning();
+  closeLiveContent();
+  liveRun.active = false;
+  liveRun.sentLocally = false;
+  setStreaming(false);
+  if (usage) updateCtxMeter(usage);
+  if (hadBody) void renderDiagrams(liveRun.aiBody);
+  refreshStatus();
+  refreshWorkspaces();
+  scrollBottom();
+  chatUI.input.focus();
+}
+
+function closeLiveReasoning() {
+  if (liveRun.curReasoning) {
+    liveRun.curReasoning.blockEl.querySelector(".thinking-live-dot")?.remove();
+    // 思考结束后自动折叠，保持对话整洁（点击标题可重新展开）
+    liveRun.curReasoning.blockEl.classList.remove("open");
+    liveRun.curReasoning = null;
+  }
+}
+
+function closeLiveContent() { liveRun.curContent = null; }
+
+/** 其他浏览器发送消息时渲染用户气泡（run_start.message） */
+function renderIncomingUserMessage(text) {
+  const col = msgColumn();
+  col.append(el("div", { class: "msg-user" },
+    el("div", { class: "msg-user-bubble" },
+      el("div", { class: "msg-user-text" }, text || ""))));
+  scrollBottom();
+}
+
+/** 其他浏览器已应答：撤销本浏览器的待确认/待回答 UI */
+function dismissPendingRespond(response) {
+  const elx = liveRun.pendingRespondEl;
+  liveRun.pendingRespondEl = null;
+  if (!elx || !elx.isConnected) return;
+  elx.replaceWith(el("div", { class: "sys-event" },
+    el("span", { class: "icon" }, "💬"),
+    el("span", null, `已在其他窗口应答: ${response || ""}`)));
+}
+
+/* ---- 实时事件入口（run_start/run_end/responded + 各类渲染事件） ---- */
+function handleLiveEvent(d) {
+  const t = d.type;
+  if (t === "run_start") {
+    // 其他浏览器发送的消息：先渲染用户气泡（本地发送则跳过重复渲染）
+    if (!liveRun.sentLocally) renderIncomingUserMessage(d.message || "");
+    ensureLiveTurn();
+    return;
+  }
+  if (t === "run_end") {
+    endLiveTurn(d.usage);
+    return;
+  }
+  if (t === "responded") {
+    dismissPendingRespond(d.response);
+    return;
+  }
+  if (!liveRun.active) {
+    // 迟到的事件（如订阅瞬间运行恰好结束）：忽略内容类事件防错乱
+    if (["reasoning", "content", "tool_confirm", "tool_result"].includes(t)) return;
+  }
+  const h = LIVE_HANDLERS[t];
+  if (h) {
+    try { h(d); } catch (e) { console.error(`实时事件处理异常 [${t}]:`, e); }
+  }
+}
+
+function ensureReasoning() {
+  if (liveRun.curReasoning) return liveRun.curReasoning;
+  closeLiveContent();
+  const textEl = el("div", { class: "thinking-content" });
+  const blockEl = el("div", { class: "thinking-block open" },
+    el("div", { class: "thinking-header" },
+      el("span", { class: "arrow" }, "▶"),
+      el("span", null, "思考过程"),
+      el("span", { class: "thinking-live-dot" })),
+    textEl);
+  blockEl.querySelector(".thinking-header").addEventListener("click", () =>
+    blockEl.classList.toggle("open"));
+  getAiBody().append(blockEl);
+  liveRun.curReasoning = { content: "", textEl, blockEl };
+  return liveRun.curReasoning;
+}
+
+function ensureContent() {
+  if (liveRun.curContent) return liveRun.curContent;
+  closeLiveReasoning();
+  const mdEl = el("div", { class: "md-content" });
+  getAiBody().append(mdEl);
+  liveRun.curContent = { raw: "", el: mdEl };
+  return liveRun.curContent;
+}
+
+function addSysEvent(text, cls = "", icon = "ℹ️") {
+  closeLiveReasoning(); closeLiveContent();
+  getAiBody().append(el("div", { class: `sys-event ${cls}` },
+    el("span", { class: "icon" }, icon), el("span", null, text)));
+  scrollBottom();
+}
+
+function ensureToolCard(toolId, name) {
+  if (liveRun.toolCards.has(toolId)) return liveRun.toolCards.get(toolId);
+  closeLiveReasoning(); closeLiveContent();
+  const statusEl = el("span", { class: "tag amber tool-status" }, "等待确认");
+  const previewEl = el("span", { class: "tool-preview-text" });
+  const bodyEl = el("div", { class: "tool-card-body" });
+  // v5.2.8：工具卡片默认收起展示（点击标题展开），避免页面过长
+  const cardEl = el("div", { class: "tool-card" },
+    el("div", { class: "tool-card-header" },
+      el("span", { class: "arrow" }, "▶"),
+      el("span", { class: "tool-icon" }, toolIcon(name)),
+      el("span", { class: "tool-name" }, name),
+      previewEl, statusEl),
+    bodyEl);
+  cardEl.querySelector(".tool-card-header").addEventListener("click", () =>
+    cardEl.classList.toggle("open"));
+  getAiBody().append(cardEl);
+  const rec = { toolId, name, cardEl, statusEl, previewEl, bodyEl, confirmEl: null };
+  liveRun.toolCards.set(toolId, rec);
+  liveRun.lastToolCard = rec;
+  scrollBottom();
+  return rec;
+}
 
   /* 按工具类型渲染参数（代码高亮 + diff，与 CLI 预览对齐） */
   function setToolArgs(rec, name, args) {
@@ -1480,7 +1750,6 @@ async function runStream(userContent, images) {
     rec.statusEl.className = `tag tool-status ${cls}`;
     rec.statusEl.textContent = text;
   }
-
   function setToolResult(rec, data) {
     const ok = data.success;
     setToolStatus(rec, ok ? "完成" : "失败", ok ? "green" : "red");
@@ -1553,8 +1822,11 @@ async function runStream(userContent, images) {
       rec.cardEl.classList.add("open");
     }
 
-    if (!ok) rec.cardEl.classList.add("open");
-    else if (!displayFiles.length) rec.cardEl.classList.remove("open");
+    // v5.2.9：write/edit 等工具成功后收起卡片（含自动生成的下载链接），
+    // 仅失败或含图片（需直接可见）时展开；用户想看详情点击卡片即可
+    const hasImages = displayFiles.some(f => f.is_image);
+    if (!ok || hasImages) rec.cardEl.classList.add("open");
+    else rec.cardEl.classList.remove("open");
     scrollBottom();
   }
 
@@ -1562,7 +1834,10 @@ async function runStream(userContent, images) {
   const showTodoPanel = (args) => {
     const todos = normalizeTodos(args);
     if (!todos.length) return;
-    aiBody.append(todoPanelEl(todos));
+    // v5.2.9 修复：关闭当前思考/内容块，使面板之后的输出追加到面板下方
+    // （否则 curContent 仍指向面板前的元素，后续文字渲染到面板上方）
+    closeLiveReasoning(); closeLiveContent();
+    getAiBody().append(todoPanelEl(todos));
     scrollBottom();
   };
 
@@ -1595,17 +1870,19 @@ async function runStream(userContent, images) {
         el("button", { class: "btn btn-sm", "data-r": "all" }, "全部允许"),
         el("button", { class: "btn btn-sm", "data-r": "always" }, "始终允许该命令")));
     rec.confirmEl = confirmEl;
-    aiBody.append(confirmEl);
+    liveRun.pendingRespondEl = confirmEl;  // v5.2.9：其他浏览器应答后统一撤销
+    getAiBody().append(confirmEl);
     scrollBottom();
 
     $$("button", confirmEl).forEach(btn => {
       btn.addEventListener("click", async () => {
         $$("button", confirmEl).forEach(b => (b.disabled = true));
         try {
-          await api.chatRespond(currentAgent(), currentModel(), btn.dataset.r);
+          await api.chatRespond(currentAgent(), currentModel(), btn.dataset.r, state.currentSessionId);
           setToolStatus(rec, "已确认", "blue");
           confirmEl.remove();
           rec.confirmEl = null;
+          if (liveRun.pendingRespondEl === confirmEl) liveRun.pendingRespondEl = null;
         } catch (e) {
           toast(e.message, "error");
           $$("button", confirmEl).forEach(b => (b.disabled = false));
@@ -1615,7 +1892,7 @@ async function runStream(userContent, images) {
   }
 
   async function handleAskUser(data) {
-    closeReasoning(); closeContent();
+    closeLiveReasoning(); closeLiveContent();
     const askEl = el("div", { class: "ask-card" });
     askEl.append(el("div", { class: "ask-question" }, "❓ " + (data.question || "")));
 
@@ -1627,7 +1904,8 @@ async function runStream(userContent, images) {
       if (answered) return;
       answered = true;
       try {
-        await api.chatRespond(currentAgent(), currentModel(), answer);
+        await api.chatRespond(currentAgent(), currentModel(), answer, state.currentSessionId);
+        if (liveRun.pendingRespondEl === askEl) liveRun.pendingRespondEl = null;
         askEl.innerHTML = "";
         askEl.append(
           el("div", { class: "ask-question" }, "❓ " + (data.question || "")),
@@ -1673,13 +1951,14 @@ async function runStream(userContent, images) {
     inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") doCustom(); });
     askEl.append(el("div", { class: "ask-input-row" }, inputEl, sendBtn));
 
-    aiBody.append(askEl);
+    liveRun.pendingRespondEl = askEl;  // v5.2.9：其他浏览器应答后统一撤销
+    getAiBody().append(askEl);
     scrollBottom();
     inputEl.focus();
   }
 
-  /* ---- 事件分发 ---- */
-  const handlers = {
+  /* ---- 事件分发（v5.2.9：WebSocket 实时事件，模块级） ---- */
+  const LIVE_HANDLERS = {
     reasoning(d) {
       const r = ensureReasoning();
       r.content += d.content;
@@ -1767,7 +2046,7 @@ async function runStream(userContent, images) {
         ),
         el("div", { class: "chain-agent-call-content", id: `chain-content-${d.agent_name}` }),
       );
-      aiBody.append(block);
+      getAiBody().append(block);
       scrollBottom();
     },
     chain_call_content(d) {
@@ -1834,79 +2113,51 @@ async function runStream(userContent, images) {
     aborted() { addSysEvent("已中断", "warn", "⛔"); },
   };
 
-  let finishUsage = null;
-  try {
-    const resp = await api.chatStream(userContent, currentAgent(), currentModel(), images);
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-      throw new Error(err.detail || "请求失败");
-    }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      let idx;
-      while ((idx = buffer.indexOf("\n\n")) >= 0) {
-        const rawEvent = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        for (const line of rawEvent.split("\n")) {
-          if (!line.startsWith("data: ")) continue;
-          let data;
-          try { data = JSON.parse(line.slice(6)); } catch { continue; }
-          if (data.type === "done") { finishUsage = data.usage; continue; }
-          const handler = handlers[data.type];
-          if (handler) {
-            // 单个事件处理异常不中断整个流（如工具参数格式异常）
-            try { await handler(data); }
-            catch (e) { console.error(`SSE事件处理异常 [${data.type}]:`, e); }
-          }
-        }
-      }
-    }
-  } catch (e) {
-    addSysEvent(`连接错误: ${e.message}`, "error", "❌");
-  } finally {
-    closeReasoning();
-    setStreaming(false);
-    if (finishUsage) updateCtxMeter(finishUsage);
-    // 回复完成后渲染 mermaid / echarts 图表（流式中先显示代码）
-    void renderDiagrams(aiBody);
-    refreshStatus();
-    refreshWorkspaces();  // 会话标题/自动落盘后同步侧边栏
-    scrollBottom();
-    chatUI.input.focus();
-  }
-}
-
 /* ---- 恢复会话消息（刷新页面后） ---- */
 async function restoreMessages() {
   const a = currentAgent(), m = currentModel();
   if (!a || !m) return;
   try {
+    // v5.2.9：优先恢复本浏览器上次打开的会话（多浏览器各自记忆），
+    // 其次默认活跃会话，最后最新历史会话
+    let lastId = null;
+    try { lastId = localStorage.getItem("cbhcli.lastSession." + a); } catch (_) {}
+    if (lastId) {
+      try {
+        const r = await api.chatLoad(a, m, "", "", lastId);
+        setSessionId(r.session_id || lastId);
+        if (r.workspace) state.currentWorkspace = r.workspace;
+        if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
+        if (r.usage) updateCtxMeter(r.usage);
+        // 空闲会话从 run_seq 续订（跳过上一轮事件回放，消息已含全量，防双份）
+        wsSubscribe(r.session_id || lastId, r.run_active ? 0 : (r.run_seq || 0));
+        if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
+        refreshWorkspaces();
+        return;
+      } catch (_) { /* 该会话已不存在，继续回落 */ }
+    }
+
     const st = await api.chatStatus(a, m);
     if (st.active) {
-      if (st.session_id) state.currentSessionId = st.session_id;
+      if (st.session_id) setSessionId(st.session_id);
       updateCtxMeter(st);
-      const { messages } = await api.chatMessages(a, m);
-      if (messages && messages.length) renderRestoredMessages(messages);
+      const md = await api.chatMessages(a, m, st.session_id);
+      if (md.messages && md.messages.length) renderRestoredMessages(md.messages);
+      wsSubscribe(st.session_id, md.run_active ? 0 : (md.run_seq || 0));
+      if (st.run_active) { setStreaming(true); ensureLiveTurn(); }
       return;
     }
-    // v5.2.8：无活跃会话（如服务器重启后重新打开页面）→ 自动恢复最近会话，
+    // 无活跃会话（如服务器重启后重新打开页面）→ 自动恢复最近会话，
     // 避免页面空白/进度条归零且上下文丢失
     const hist = await api.getHistory(a, 1);
     const latest = (hist.sessions || [])[0];
     if (!latest) return;
     const r = await api.chatLoad(a, m, latest.filename, latest.workspace);
-    state.currentSessionId = latest.id || null;
+    setSessionId(r.session_id || latest.id || null);
     if (r.workspace) state.currentWorkspace = r.workspace;
     if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
     if (r.usage) updateCtxMeter(r.usage);
+    wsSubscribe(r.session_id || latest.id, r.run_active ? 0 : (r.run_seq || 0));
     refreshWorkspaces();
   } catch { /* 忽略 */ }
 }
@@ -2011,13 +2262,20 @@ function renderRestoredMessages(messages) {
 
 /* ---- 新会话 / 压缩 ---- */
 async function newSession() {
-  const ok = await confirmDialog("新建会话", "当前会话将保存到历史记录，确定开始新会话吗？", { okText: "新建" });
+  const ok = await confirmDialog("新建会话",
+    "新会话立即可用；当前会话若仍在执行任务，将继续在后台运行。",
+    { okText: "新建" });
   if (!ok) return;
-  state.currentSessionId = null;  // 主动新建，禁用丢失自动恢复
   try {
-    await api.chatReset(currentAgent(), currentModel());
+    // v5.2.9：旧会话不中断（后台继续运行），仅切换到全新会话
+    const r = await api.chatReset(currentAgent(), currentModel(), state.currentSessionId);
+    liveRunReset();
     clearMessages();
+    setSessionId(r.session_id || null);
+    wsSubscribe(r.session_id || null, 0);
+    setStreaming(false);
     refreshStatus();
+    refreshWorkspaces();
     toast("已开始新会话", "success");
   } catch (e) { toast(e.message, "error"); }
 }
@@ -2033,7 +2291,8 @@ async function manualCompress() {
   if (instructions === null) return;  // 用户取消
   try {
     const r = await api.chatCompress(currentAgent(), currentModel(),
-                                     (instructions.instructions || "").trim());
+                                     (instructions.instructions || "").trim(),
+                                     state.currentSessionId);
     toast(r.message, r.compressed ? "success" : "info");
     if (r.usage) updateCtxMeter(r.usage);
   } catch (e) { toast(e.message, "error"); }
@@ -2101,6 +2360,16 @@ function fmtRelTime(iso) {
   const mo = Math.floor(d / 30);
   if (mo < 12) return `${mo}月`;
   return `${Math.floor(mo / 12)}年`;
+}
+
+/* 完整时间：年月日时分秒（v5.2.9 侧边栏会话时间详细显示） */
+function fmtFullTime(iso) {
+  if (!iso) return "";
+  const t = new Date(iso);
+  if (isNaN(t.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} `
+       + `${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
 }
 
 function initSidebar() {
@@ -2193,16 +2462,23 @@ function renderWorkspaces(data) {
 }
 
 function wsSessionRow(s) {
-  const isActive = s.active && s.model === currentModel();
+  const isCurrent = !!s.id && s.id === state.currentSessionId;
   const menuBtn = el("span", { class: "ws-session-menu", title: "会话管理" }, "⋯");
   menuBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     showSessionMenu(s, menuBtn);
   });
-  const row = el("div", { class: "ws-session" + (isActive ? " active" : "") },
+  const children = [
     el("span", { class: "ws-session-title", title: s.title }, s.title || "新会话"),
-    el("span", { class: "ws-session-time" }, fmtRelTime(s.created_at)),
-    menuBtn);
+  ];
+  // v5.2.9：后台运行状态徽标（WebSocket 通知实时刷新）
+  if (s.running) children.push(el("span", { class: "ws-run-badge" }, "● 运行中"));
+  children.push(el("span", {
+    class: "ws-session-time",
+    title: fmtFullTime(s.created_at),
+  }, fmtFullTime(s.created_at)));
+  children.push(menuBtn);
+  const row = el("div", { class: "ws-session" + (isCurrent ? " active" : "") }, ...children);
   row.addEventListener("click", () => openSidebarSession(s));
   return row;
 }
@@ -2267,11 +2543,18 @@ async function doSessionDelete(s) {
     `确定删除会话「${(s.title || "").slice(0, 30)}」吗？此操作不可恢复。`,
     { danger: true, okText: "删除" });
   if (!ok) return;
-  state.currentSessionId = null;  // 主动删除，禁用丢失自动恢复
+  const isCurrent = !!s.id && s.id === state.currentSessionId;
   try {
     const r = await api.sessionDelete(currentAgent(), s);
     toast(r.message, "success");
-    if (r.was_active) { clearMessages(); refreshStatus(); }
+    if (isCurrent || r.was_active) {
+      liveRunReset();
+      clearMessages();
+      setSessionId(null);
+      wsSubscribe(null);
+      setStreaming(false);
+      refreshStatus();
+    }
     refreshWorkspaces();
   } catch (e) { toast(e.message, "error"); }
 }
@@ -2306,16 +2589,23 @@ function showWorkspaceMenu(ws, anchor) {
 // 选择该文件夹：切换工作空间并恢复其最新会话（空文件夹则为新会话）
 async function doWorkspaceSelect(ws) {
   if (ws.path === state.currentWorkspace) { switchView("chat"); return; }
-  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
   try {
     const r = await api.workspaceOpen(currentAgent(), currentModel(), ws.path, true);
     toast(r.message, "success");
     state.currentWorkspace = r.workspace;
     state.wsExpanded[ws.path] = true;
+    liveRunReset();
     switchView("chat");
     clearMessages();
     if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
     if (r.usage) updateCtxMeter(r.usage);
+    setSessionId(r.session_id || null);
+    if (r.session_id) {
+      wsSubscribe(r.session_id, r.run_active ? 0 : (r.run_seq || 0));
+      if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
+    } else {
+      wsSubscribe(null);  // 空文件夹：无会话，退订旧会话
+    }
     refreshStatus();
     refreshWorkspaces();
   } catch (e) { toast(e.message, "error"); }
@@ -2328,14 +2618,17 @@ async function doWorkspaceNew(ws) {
     refreshWorkspaces();
     return;
   }
-  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
   try {
     const r = await api.workspaceOpen(currentAgent(), currentModel(), ws.path, false);
     toast(r.message, "success");
     state.currentWorkspace = r.workspace;
     state.wsExpanded[ws.path] = true;
+    liveRunReset();
     switchView("chat");
     clearMessages();
+    setSessionId(null);
+    wsSubscribe(null);
+    setStreaming(false);
     refreshStatus();
     refreshWorkspaces();
   } catch (e) { toast(e.message, "error"); }
@@ -2347,30 +2640,42 @@ async function doWorkspaceClear(ws) {
     `确定删除工作空间「${ws.name}」下的全部会话吗？此操作不可恢复。`,
     { danger: true, okText: "全部删除" });
   if (!ok) return;
-  state.currentSessionId = null;  // 主动删除，禁用丢失自动恢复
+  const isCurrentWs = ws.path === state.currentWorkspace;
   try {
     const r = await api.workspaceClearSessions(currentAgent(), ws.path);
     toast(r.message, "success");
-    if (r.was_active) { clearMessages(); refreshStatus(); }
+    if (isCurrentWs || r.was_active) {
+      liveRunReset();
+      clearMessages();
+      setSessionId(null);
+      wsSubscribe(null);
+      setStreaming(false);
+      refreshStatus();
+    }
     refreshWorkspaces();
   } catch (e) { toast(e.message, "error"); }
 }
 
 async function openSidebarSession(s) {
-  if (s.active) {
-    if (s.model === currentModel()) { switchView("chat"); return; }
-    toast(`该会话正在模型 '${s.model}' 下活动`, "info");
-    return;
-  }
-  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
+  // v5.2.9：点击会话 = 切换到该会话（含后台运行中的会话）。
+  // 运行中的会话不中断，画面由 WebSocket 事件回放接管（多浏览器一致）。
+  if (s.id && s.id === state.currentSessionId) { switchView("chat"); return; }
   try {
-    const r = await api.chatLoad(currentAgent(), currentModel(), s.filename, s.workspace);
-    toast(r.message, "success");
+    const r = await api.chatLoad(currentAgent(), currentModel(), s.filename, s.workspace, s.id);
+    setSessionId(r.session_id || s.id || null);
     if (r.workspace) state.currentWorkspace = r.workspace;
+    // 会话可能属于其他模型：同步模型选择器（程序赋值不触发 change 事件）
+    if (r.model && r.model !== state.selectedModel) {
+      state.selectedModel = r.model;
+      chatUI.modelSelect.value = r.model;
+    }
+    liveRunReset();
     switchView("chat");
     clearMessages();
     renderRestoredMessages(r.messages || []);
     if (r.usage) updateCtxMeter(r.usage);
+    wsSubscribe(r.session_id || s.id, r.run_active ? 0 : (r.run_seq || 0));
+    if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
     refreshStatus();
     refreshWorkspaces();
   } catch (e) { toast(e.message, "error"); }
@@ -2434,8 +2739,12 @@ async function showWorkspaceBrowser() {
         state.currentWorkspace = r.workspace;
         state.wsExpanded[r.workspace] = true;
         m.close();
+        liveRunReset();
         switchView("chat");
         clearMessages();
+        setSessionId(null);
+        wsSubscribe(null);
+        setStreaming(false);
         refreshStatus();
         refreshWorkspaces();
       } catch (err) {
@@ -2646,14 +2955,17 @@ function showFileMenu(ent, anchor) {
 }
 
 async function openFolderAsWorkspace(path) {
-  state.currentSessionId = null;  // 主动切换，禁用丢失自动恢复
   try {
     const r = await api.workspaceOpen(currentAgent(), currentModel(), path, false);
     toast(r.message, "success");
     state.currentWorkspace = r.workspace;
     state.wsExpanded[r.workspace] = true;
+    liveRunReset();
     switchView("chat");
     clearMessages();
+    setSessionId(null);
+    wsSubscribe(null);
+    setStreaming(false);
     refreshStatus();
     refreshWorkspaces();
   } catch (e) { toast(e.message, "error"); }
@@ -2832,7 +3144,7 @@ async function showQuickModel() {
       const old = currentModel();
       try {
         // 原地切换模型：保留当前会话及上下文（对齐 CLI /model use）
-        const r = await api.chatSwitchModel(currentAgent(), old, m.name);
+        const r = await api.chatSwitchModel(currentAgent(), old, m.name, state.currentSessionId);
         state.selectedModel = m.name;
         refreshSelectors();
         $("#modal-root").innerHTML = "";
@@ -2864,11 +3176,24 @@ function agentSelector(current, onChange) {
 
 function pageShell(title, desc, actions = []) {
   const inner = el("div", { class: "page-inner" });
+  // v5.2.9：返回按钮（详情页 -> 设置主页 -> 会话），避免进入设置后无法返回
+  const backBtns = [];
+  if (state.currentView === "settings") {
+    backBtns.push(el("button", {
+      class: "btn btn-ghost btn-sm page-back-btn",
+      onclick: () => switchView("chat"),
+    }, "← 返回会话"));
+  } else if (state.currentView !== "chat") {
+    backBtns.push(el("button", {
+      class: "btn btn-ghost btn-sm page-back-btn",
+      onclick: () => switchView("settings"),
+    }, "← 设置"));
+  }
   inner.append(el("div", { class: "page-header" },
     el("div", null,
       el("div", { class: "page-title" }, title),
       desc ? el("div", { class: "page-desc" }, desc) : null),
-    el("div", { class: "page-actions" }, ...actions)));
+    el("div", { class: "page-actions" }, ...backBtns, ...actions)));
   return inner;
 }
 
@@ -3141,7 +3466,7 @@ async function showChainDetail(name) {
         el("button", { class: "btn", onclick: () => close() }, "关闭"),
         el("button", { class: "btn btn-primary", onclick: async () => {
           try {
-            await api.useChain(state.activeAgent, state.selectedModel, chain.name);
+            await api.useChain(state.activeAgent, state.selectedModel, chain.name, state.currentSessionId);
             toast(`链条 '${chain.name}' 已激活`, "success");
             state.activeChain = chain.name;
             updateChainIndicator();
@@ -3247,11 +3572,11 @@ async function showChainPicker() {
     const chainName = e.target.value;
     try {
       if (chainName) {
-        await api.useChain(state.activeAgent, state.selectedModel, chainName);
+        await api.useChain(state.activeAgent, state.selectedModel, chainName, state.currentSessionId);
         state.activeChain = chainName;
         toast(`链条 '${chainName}' 已激活`, "success");
       } else {
-        await api.offChain(state.activeAgent, state.selectedModel);
+        await api.offChain(state.activeAgent, state.selectedModel, state.currentSessionId);
         state.activeChain = null;
         toast("链条绑定已取消", "success");
       }
@@ -3490,7 +3815,7 @@ async function loadModelsView() {
               try {
                 if (state.activeAgent) {
                   // 原地切换模型：保留当前会话及上下文（对齐 CLI /model use）
-                  await api.chatSwitchModel(state.activeAgent, state.selectedModel, m.name);
+                  await api.chatSwitchModel(state.activeAgent, state.selectedModel, m.name, state.currentSessionId);
                 } else {
                   await api.selectModel(m.name);
                 }
@@ -4455,14 +4780,18 @@ async function loadHistoryView() {
               onclick: async () => {
                 const ok = await confirmDialog("恢复会话", "将该历史会话恢复为当前对话？", { okText: "恢复" });
                 if (!ok) return;
-                state.currentSessionId = null;  // 主动恢复，禁用丢失自动恢复
                 try {
                   const r = await api.chatLoad(agent, currentModel(), s.filename, s.workspace);
                   toast(r.message, "success");
+                  setSessionId(r.session_id || s.id || null);
+                  if (r.workspace) state.currentWorkspace = r.workspace;
+                  liveRunReset();
                   switchView("chat");
                   clearMessages();
                   renderRestoredMessages(r.messages || []);
                   if (r.usage) updateCtxMeter(r.usage);
+                  wsSubscribe(r.session_id || s.id, r.run_active ? 0 : (r.run_seq || 0));
+                  refreshWorkspaces();
                 } catch (e) { toast(e.message, "error"); }
               },
             }, "恢复"),
@@ -4602,6 +4931,7 @@ async function bootstrap() {
   initSidebar();
   initPanelLayout();
   initFileManager();
+  wsConnect();  // v5.2.9：WebSocket 实时通道（会话事件多浏览器同步）
 
   // 先加载基础数据，再初始化路由（避免直接以 #/skills 等 URL 打开时
   // 管理视图在 state.agents 为空的情况下渲染出"暂无 Agent"）

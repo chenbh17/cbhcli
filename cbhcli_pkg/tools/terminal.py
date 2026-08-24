@@ -44,6 +44,22 @@ def _pipe_reader(fd, chunks: list):
 class TerminalTool(BaseTool):
     """终端命令执行工具"""
 
+    def __init__(self):
+        # v5.2.9：支持外部中断（Web 端用户点击中断按钮时杀掉正在运行的子进程）
+        self._current_process = None        # 当前正在运行的子进程
+        self._interrupt_requested = False   # 中断标记（区分"被中断"与"正常失败"）
+
+    def interrupt(self):
+        """外部中断：杀掉当前正在运行的子进程（v5.2.9）。
+
+        Web 端会话 abort 时由服务端在工具执行期间调用。杀掉后
+        execute 中的 process.wait() 立即返回，工具以"被用户中断"结果结束。
+        """
+        self._interrupt_requested = True
+        proc = self._current_process
+        if proc is not None:
+            _kill_process_group(proc)
+
     @property
     def name(self) -> str:
         return "terminal"
@@ -93,6 +109,7 @@ class TerminalTool(BaseTool):
             # 与用户直接交互（提示和密码不经过 stdout/stderr 管道）
             # start_new_session：让 shell 独立成进程组，超时时可 killpg
             # 杀掉整组（否则只杀 shell，子进程变孤儿继续持有管道）
+            self._interrupt_requested = False
             process = subprocess.Popen(
                 command,
                 shell=True,
@@ -100,6 +117,7 @@ class TerminalTool(BaseTool):
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            self._current_process = process  # 供 interrupt() 外部中断
 
             # 后台读线程持续 drain 两个管道：
             # 1) 防止输出超过64KB管道缓冲导致主进程阻塞在write（死锁）
@@ -153,6 +171,7 @@ class TerminalTool(BaseTool):
                 # Ctrl+C：SIGINT 只发给 cbhcli 前台进程组，start_new_session
                 # 使子进程收不到（不变孤儿需手动杀）；杀掉后 re-raise 让
                 # app 主循环捕获（打印"操作被中断"回到输入框）
+                self._current_process = None
                 _kill_process_group(process)
                 process.wait()
                 # 管道已 EOF，join 快速返回，残余输出随 raise 丢弃
@@ -162,6 +181,7 @@ class TerminalTool(BaseTool):
 
             # 主进程结束后收取残余输出；孙进程仍持有写端时
             # join 超时直接放弃（daemon 线程不阻塞退出，已读数据不丢）
+            self._current_process = None
             t_out.join(1.0)
             t_err.join(1.0)
 
@@ -174,6 +194,17 @@ class TerminalTool(BaseTool):
                 output += stdout
             if stderr:
                 output += stderr
+
+            # v5.2.9：被用户中断（Web 端 abort）——进程已被 interrupt() 杀掉，
+            # 明确返回"被中断"结果（区别于正常失败，避免模型反思重试同一命令）
+            if self._interrupt_requested:
+                self._interrupt_requested = False
+                partial = output.strip()
+                return ToolResult(
+                    success=False,
+                    output=partial or "（无输出）",
+                    error="命令已被用户中断（进程已终止）"
+                            + (f"\n\n中断前的输出:\n{partial}" if partial else ""))
 
             success = process.returncode == 0
 
