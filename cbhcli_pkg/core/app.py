@@ -1113,6 +1113,10 @@ class CBHCLIApp:
                 return f"抱歉，处理消息时出错了：{e}"
             finally:
                 app_ref.tool_executor.no_more_confirmations = old_confirm
+                # 每轮 QQ 对话结束自动保存到 history（与 CLI 逻辑一致，v5.2.6）
+                # _autosave_session 内部有 autosave_history 开关 + try/except 保护，
+                # 同 session_id 幂等覆盖同一文件，正常/异常出口统一落盘
+                app_ref._autosave_session()
         
         return handle_qq_message
     
