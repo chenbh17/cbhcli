@@ -98,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.2.9")
+app = FastAPI(title="CBHCLI Web", version="5.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2245,7 +2245,10 @@ def _broadcast_global(payload: dict) -> None:
 def _live_export_limit(cs: 'WebChatSession') -> Optional[int]:
     """会话运行中导出消息时的截断下标（当前运行的消息由事件回放渲染）。"""
     if cs is not None and getattr(cs, "run_active", False):
-        return getattr(cs, "run_start_msg_count", 0) or None
+        # v5.2.9 修复：第一轮运行时 run_start_msg_count=0，旧写法
+        # `n or None` 把"截断到 0 条"错误变成"不截断"——全量导出含本轮
+        # user 消息，与 WS 回放的 run_start 事件双份渲染。0 也是有效截断。
+        return max(0, int(getattr(cs, "run_start_msg_count", 0) or 0))
     return None
 
 
@@ -3848,7 +3851,10 @@ async def chat_load(req: Request):
         live = _sessions_by_id.get(session_id)
         if live is not None and live.agent_name == agent_name:
             fname = _find_history_file_by_id(agent_name, session_id)
-            if fname and not _live_session_stale_vs_disk(live, fname):
+            # v5.2.9 修复：磁盘无文件（新建会话第一轮运行中，尚未落盘）时，
+            # 内存副本是唯一真相来源（不存在外部进程更新磁盘的过期问题），
+            # 直接复用；此前 fname=None 会跳过复用落入 404"会话不存在"。
+            if fname is None or not _live_session_stale_vs_disk(live, fname):
                 _chat_sessions[_get_session_key(agent_name, model_name)] = live
                 ws = (body.get("workspace") or "").strip() or live.workspace
                 if ws and Path(ws).is_dir():
