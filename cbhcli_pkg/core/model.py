@@ -4,7 +4,7 @@ import json
 import signal
 from typing import Iterator, Optional
 
-from cbhcli_pkg.core.constants import API_TIMEOUT
+from cbhcli_pkg.core.constants import API_TIMEOUT, SUMMARY_MAX_TOKENS
 
 
 def _ensure_sigint_handler():
@@ -234,9 +234,51 @@ class LLMClient:
         
         if response.status_code != 200:
             raise Exception(f"API请求失败: {response.status_code} - {response.text}")
-        
+
         result = response.json()
-        return result["choices"][0]["message"]["content"].strip()
+
+        def _extract_content(r: dict):
+            """安全提取 (content, reasoning, finish_reason)。"""
+            choice = (r.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            content = message.get("content") or ""
+            if not isinstance(content, str):
+                content = str(content)
+            reasoning = (message.get("reasoning_content")
+                         or message.get("reasoning") or "") or ""
+            return content, reasoning, choice.get("finish_reason") or ""
+
+        # v5.3.0：思考模型（qwen3 等）思考阶段耗尽 max_tokens 时 API 返回
+        # content=null（内容全在 reasoning_content），旧代码直接对 None 调
+        # .strip() 抛 'NoneType' object has no attribute 'strip'。修复：
+        # 安全提取 + 空正文诊断 + finish_reason=length 时翻倍预算重试一次。
+        content, reasoning, finish = _extract_content(result)
+        if not content.strip() and finish == "length" \
+                and payload.get("max_tokens"):
+            # 截断发生在思考阶段：翻倍 max_tokens 重试一次（封顶 SUMMARY_MAX_TOKENS）
+            retry_max = min(int(payload["max_tokens"]) * 2, SUMMARY_MAX_TOKENS)
+            if retry_max > int(payload["max_tokens"]):
+                response = self._session.post(
+                    f"{self.base_url}/chat/completions",
+                    json={**payload, "max_tokens": retry_max},
+                    timeout=API_TIMEOUT
+                )
+                if response.status_code != 200:
+                    raise Exception(
+                        f"API请求失败: {response.status_code} - {response.text}")
+                content, reasoning, finish = _extract_content(response.json())
+
+        if not content.strip():
+            req_max = payload.get("max_tokens")
+            detail = (f"思考内容 {len(reasoning)} 字符" if reasoning
+                      else "无思考内容")
+            hint = ("，思考可能耗尽输出预算" if reasoning and finish == "length"
+                    else "")
+            raise Exception(
+                f"模型未返回正文内容（finish_reason={finish or 'unknown'}，"
+                f"{detail}，max_tokens={req_max if req_max is not None else '未设置'}"
+                f"{hint}）。建议调大该模型的 max_tokens 配置或关闭其思考模式")
+        return content.strip()
     
     def chat_stream(self, messages: list[dict], temperature: float = 0.1, **kwargs) -> Iterator[tuple[str, str]]:
         """
