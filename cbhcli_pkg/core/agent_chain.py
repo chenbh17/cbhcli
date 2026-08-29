@@ -618,6 +618,17 @@ class ChainExecutor:
         registry.register(KillProcessTool())
         registry.register(TodoTool())
 
+        # QQ Bot 发消息工具（v5.3.0：链条下游 Agent 也支持主动发 QQ 消息，
+        # 共享主 app 的 qqbot_service，发送走 REST API 无需网关在线）
+        try:
+            from cbhcli_pkg.tools.qqbot_send import QQBotSendTool
+            _qq_service = getattr(self._app, "qqbot_service", None)
+            if _qq_service is not None:
+                _qq_tool = QQBotSendTool(qqbot_service=_qq_service)
+                registry.register(_qq_tool)
+        except Exception:
+            pass  # QQ 模块不可用时静默跳过
+
         # 应用 Agent 工具开关
         registry.set_disabled_tools(config.disabled_tools or [])
 

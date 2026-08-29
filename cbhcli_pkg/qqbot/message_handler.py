@@ -129,6 +129,11 @@ class QQBotMessageHandler:
         self._contexts: dict[tuple, list] = defaultdict(list)
         self._max_context = 10  # 每个对话最多保存 10 条历史
 
+        # 持久化用户注册表（v5.3.0：记录所有发过消息的用户 openid，
+        # 供 qqbot_send_message 工具主动发送/查找，跨进程共享）
+        from cbhcli_pkg.qqbot.qqbot_registry import QQBotUserRegistry
+        self.registry = QQBotUserRegistry()
+
     def handle_event(self, payload: WSPayload):
         """处理 WebSocket DISPATCH 事件
 
@@ -137,6 +142,25 @@ class QQBotMessageHandler:
         msg = QQBotProtocol.extract_message_content(payload)
         if msg is None:
             return  # 不是消息事件，忽略
+
+        # ── 持久化记录发送目标（v5.3.0，尽力而为不影响主流程）──
+        try:
+            if msg['message_type'] == 'c2c':
+                self.registry.record_user(
+                    "c2c", msg['author_id'],
+                    name=msg.get('author_name', ''), bot=self.config.name,
+                    content=msg.get('content', ''),
+                )
+            elif msg['message_type'] == 'group' and msg.get('group_id'):
+                self.registry.record_user(
+                    "group", msg['group_id'],
+                    name="", bot=self.config.name,
+                    content=msg.get('content', ''),
+                    author_name=msg.get('author_name', ''),
+                    author_id=msg.get('author_id', ''),
+                )
+        except Exception:
+            pass
 
         # 构造 QQMessage
         qq_msg = QQMessage(

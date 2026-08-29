@@ -11,8 +11,8 @@
 
 鉴权流程（两步）:
   1. POST https://bots.qq.com/app/getAppAccessToken → access_token
-  2. GET  https://api.sgroup.qq.com/gateway/bot (Bearer token) → WebSocket URL
-  3. WebSocket Identify: Bot {appId}.{access_token}
+  2. GET  https://api.sgroup.qq.com/gateway/bot (Authorization: QQBot {access_token}) → WebSocket URL
+  3. WebSocket Identify: QQBot {access_token}
 
 参考 QQ 开放平台文档:
   https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/reference.html
@@ -254,8 +254,12 @@ class QQBotGateway:
         return self._get_access_token()
 
     def _get_gateway_url(self) -> Optional[str]:
-        """获取 WebSocket 网关地址 (Bearer access_token)
-        
+        """获取 WebSocket 网关地址 (QQBot access_token)
+
+        注意: QQ 官方 API 要求 Authorization 头使用 "QQBot {access_token}" 前缀
+        （与 api_client.py 保持一致），"Bearer {access_token}" 会被拒绝:
+        401 {"message":"请求头Authorization参数格式错误","code":11241}
+
         带重试机制，网络波动时不会一次失败就放弃。
         """
         if not self._ensure_access_token():
@@ -267,7 +271,10 @@ class QQBotGateway:
             try:
                 resp = requests.get(
                     base_url,
-                    headers={"Authorization": f"Bearer {self._access_token}"},
+                    headers={
+                        "Authorization": f"QQBot {self._access_token}",
+                        "X-Union-Appid": self.config.appId,
+                    },
                     timeout=HTTP_TIMEOUT
                 )
                 if resp.status_code == 200:
