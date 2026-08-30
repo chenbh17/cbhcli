@@ -65,7 +65,7 @@
 | `delegate_task` | 委托子任务给子Agent（单个串行 / 多个并行最多100个，实时状态板） |
 | `call_agent` | 调用链条中下游用户Agent执行任务（仅链条绑定时可用） |
 | `image` | 识别图片内容（主模型支持视觉时直发主模型，否则调用其他视觉模型） |
-| `qqbot_send_message` | 通过 QQ Bot 发送消息/文件：可直接指定 openid 主动发送（无需用户先发消息），支持按昵称查找 openid（find_user）、列出已知用户（action=list）、指定 Bot（bot_name），openid 持久化注册表跨进程共享 |
+| `qqbot_send_message` | 通过 QQ Bot 发送消息/文件：可直接指定 openid 主动发送（无需用户先发消息），支持按昵称查找 openid（find_user）、列出已知用户（action=list）、指定 Bot（bot_name），openid 持久化注册表跨进程共享。CLI/Web/Jupyter 全端注册，所有 Agent 可用 |
 | `send_file` 📡 | **仅 Web 端**：向用户发送文件/图片，图片内联显示、文件下载链接 |
 
 ### cbhpacks 数据科学工具（13个，默认关闭）

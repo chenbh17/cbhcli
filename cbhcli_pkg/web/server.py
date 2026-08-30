@@ -70,6 +70,28 @@ from cbhcli_pkg.vector.indexer import MemoryIndexer
 from cbhcli_pkg.context.token_counter import get_token_counter
 from cbhcli_pkg.context.compressor import ContextCompressor, SUMMARY_MARKER
 
+# QQ Bot 发消息工具（Web 端补注册，v5.3.0 修复：此前只在 CLI app.py 注册，
+# Web/Jupyter 端 _build_tool_registry 漏了 QQBotSendTool，导致 Web 界面上
+# 所有 Agent 调用 qqbot_send_message 都报"工具名无法识别"）
+_qqbot_service_instance = None
+
+
+def _get_qqbot_service():
+    """Web 进程级 QQBotService 单例（惰性创建）
+
+    - 仅管理 REST API 发送，不连接 WebSocket 网关（无副作用）
+    - 与 CLI 进程互不干扰：发送走 REST API，token 自动获取
+    - openid 注册表 ~/.cbhcli/qqbot_registry.json 跨进程共享
+    """
+    global _qqbot_service_instance
+    if _qqbot_service_instance is None:
+        try:
+            from cbhcli_pkg.qqbot.qqbot_service import QQBotService
+            _qqbot_service_instance = QQBotService()
+        except Exception:
+            _qqbot_service_instance = False  # 标记不可用（QQ 模块异常）
+    return _qqbot_service_instance or None
+
 
 def _fix_unicode_escapes(obj):
     """修复 LLM 返回的双斜杠 Unicode 转义序列（与 ai_handler.py 中相同）
@@ -422,6 +444,17 @@ def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext,
     registry.register(SkillsCreateTool(app_proxy))
     registry.register(ImageTool(app_proxy))
     registry.register(SendFileTool())
+
+    # QQ Bot 发消息工具（v5.3.0 修复：Web 端此前漏注册，所有 Agent 均可
+    # 通过 qqbot_send_message 主动向 QQ 用户/群发送文本、图片、文件；
+    # 发送走 REST API 不依赖网关在线，openid 注册表跨进程共享）
+    try:
+        _qq_service = _get_qqbot_service()
+        if _qq_service is not None:
+            from cbhcli_pkg.tools.qqbot_send import QQBotSendTool
+            registry.register(QQBotSendTool(qqbot_service=_qq_service))
+    except Exception:
+        pass  # QQ 模块不可用时静默跳过，不影响其他工具
 
     # cbhpacks 数据科学工具
     from cbhcli_pkg.tools.cbhpacks_bins import BinsModelTool

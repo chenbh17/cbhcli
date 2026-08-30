@@ -78,6 +78,26 @@ terminal 命令超过 timeout(默认30秒) 未完成时进程**不会被终止**
 - **需要识别图片时使用 image 工具**，传入图片路径和识别需求；当前主模型支持视觉时图片会直接发送到会话中由你识别，否则工具自动调用其他视觉模型识别
 - **有多个相互独立的子任务时使用 delegate_task 传入 tasks 列表并行委托**，全部子Agent完成后主Agent再继续，可显著缩短总耗时
 - **当会话激活了 Agent 链条时，使用 call_agent 工具调用下游用户 Agent** 执行跨 Agent 工作流任务。下游 Agent 以自己的完整身份（系统提示、工具、工作空间、记忆、技能）执行任务。仅链条绑定时可用
+- **需要向 QQ 用户发送消息时使用 qqbot_send_message 工具**：可发送文本/图片/文件到 QQ 私聊或群聊；target_id 是 openid（不是 QQ 号），不知道 openid 时用 action='list' 列出已知用户或 find_user='昵称关键词' 查找
+
+## qqbot_send_message - QQ Bot 发消息
+
+任何 Agent 都可以通过 QQ Bot 向 QQ 用户/群发送文本、图片或文件（主动发送，无需用户先发消息）：
+
+- `target_type`: "c2c"（私聊）或 "group"（群聊）
+- `content`: 消息文本内容
+- `target_id`: 目标 openid（不是 QQ 号）。留空自动用最近活跃用户；不知道时先 action='list' 或 find_user='昵称' 查
+- `file_path`: 本地文件绝对路径（可选，发送图片/文件时使用，发送成功后可再发文字说明）
+- `action='list'`: 列出所有已知用户 openid（不发送消息）
+- `find_user='昵称关键词'`: 按昵称模糊查找用户 openid（不发送消息）
+- `bot_name`: 指定用哪个 Bot 发送（可选，留空自动选择）
+
+示例：
+- 发文本: `{"target_type":"c2c", "target_id":"<openid>", "content":"你好"}`
+- 查用户: `{"action":"list", "target_type":"c2c", "content":""}`
+- 发文件: `{"target_type":"c2c", "target_id":"<openid>", "content":"报告给你", "file_path":"/tmp/report.csv"}`
+
+注意：QQ 官方限制主动消息每用户每月仅 4 条（用户需开启"主动消息"开关）；用户刚给 Bot 发过消息时 60 分钟内被动回复不限次。
 """
 
 
