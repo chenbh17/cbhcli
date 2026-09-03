@@ -38,6 +38,7 @@ BUILTIN_TOOLS = [
     ("cbhpacks_con_sql",          "数据库连接SQL执行",        "数据科学"),
     ("cbhpacks_con_linux",        "Linux SSH连接命令",        "数据科学"),
     ("cbhpacks_get_random_data",  "生成随机测试数据",         "数据科学"),
+    ("cbhpacks_harness",          "建模护栏校验(穿越/过拟合/分箱质量)", "数据科学"),
 ]
 
 # 工具名到中文描述的映射

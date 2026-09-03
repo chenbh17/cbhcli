@@ -159,6 +159,9 @@ const api = {
     request("/workspace/session/delete", { method: "POST", body: JSON.stringify({ agent_name: a, session_id: s.id, filename: s.filename }) }),
   sessionCopy: (a, s) =>
     request("/workspace/session/copy", { method: "POST", body: JSON.stringify({ agent_name: a, session_id: s.id, filename: s.filename }) }),
+  // CLI 会话只读跟随轮询（问题6，v5.3.1+）
+  cliSessionPoll: (a, session_id) =>
+    request(`/cli_session/poll?agent_name=${enc(a)}&session_id=${enc(session_id)}`),
   chatCompress: (agent_name, model_name, instructions, session_id) =>
     request("/chat/compress", { method: "POST", body: JSON.stringify({ agent_name, model_name, instructions: instructions || "", session_id: session_id || "" }) }),
   chatUpload: (file, a, m) => {
@@ -315,6 +318,50 @@ function renderMd(text) {
     return escapeHtml(text);
   }
 }
+
+/* ---- 图片灯箱预览（v5.3.1+ 问题2）：点击图片放大显示，右键仍可原生保存 ---- */
+function openLightbox(src, opts = {}) {
+  if (!src) return;
+  closeLightbox();
+  const mask = el("div", { class: "lightbox-mask" });
+  const img = el("img", { class: "lightbox-img", src, alt: opts.filename || "图片" });
+  const bar = el("div", { class: "lightbox-bar" });
+  if (opts.filename) bar.append(el("span", { class: "lightbox-name", title: opts.filename }, opts.filename));
+  const dlUrl = opts.downloadUrl || src;
+  bar.append(
+    el("a", { class: "btn btn-sm lightbox-btn", href: dlUrl,
+              download: opts.filename || "", title: "下载图片" }, "⬇ 下载"),
+    el("button", { class: "btn btn-sm lightbox-btn lightbox-close", type: "button" }, "✕ 关闭"));
+  mask.append(el("div", { class: "lightbox-box" }, bar, img));
+  document.body.append(mask);
+  const onKey = (e) => { if (e.key === "Escape") closeLightbox(); };
+  mask._onKey = onKey;
+  document.addEventListener("keydown", onKey);
+  mask.addEventListener("click", (e) => { if (e.target === mask) closeLightbox(); });
+  mask.querySelector(".lightbox-close").addEventListener("click", closeLightbox);
+  // 点击图片本身不关闭（便于查看细节），右键保留浏览器原生菜单（另存为）
+  img.addEventListener("click", (e) => e.stopPropagation());
+  requestAnimationFrame(() => mask.classList.add("show"));
+}
+
+function closeLightbox() {
+  const mask = document.querySelector(".lightbox-mask");
+  if (!mask) return;
+  if (mask._onKey) document.removeEventListener("keydown", mask._onKey);
+  mask.remove();
+}
+
+// 全局点击代理：聊天区内的用户图片 / AI 展示图片 / Markdown 内嵌图片一律灯箱预览
+document.addEventListener("click", (e) => {
+  const img = e.target && e.target.closest ? e.target.closest("img") : null;
+  if (!img || !img.closest("#chat-messages")) return;
+  if (!img.matches(".msg-user-img, .ai-display-img, .md-content img")) return;
+  e.preventDefault();
+  openLightbox(img.src, {
+    filename: img.alt || "",
+    downloadUrl: img.dataset.downloadUrl || "",
+  });
+});
 
 /* ---- Mermaid / ECharts 图表渲染（v5.2.0）----
  * 流式过程中 ```mermaid / ```echarts 代码块按代码显示，回复完成（done）或恢复历史时
@@ -966,6 +1013,8 @@ const state = {
   currentSessionId: null, // 当前后端会话 id（服务器重启后自动找回用，v5.2.8）
   fmPath: "",             // 文件管理器当前浏览目录（空=工作空间根，v5.2.8）
   fmWorkspace: "",        // 文件管理器对应的的工作空间（切换时重置，v5.2.8）
+  cliFollow: "",          // CLI 只读跟随视图的会话 id（问题6，v5.3.1+）
+  cliFollowTimer: null,   // CLI 跟随轮询定时器
 };
 
 /* ---- 面板布局常量（v5.2.8：工作区/文件管理器左右互换 + 拖拽调宽） ---- */
@@ -1242,6 +1291,7 @@ async function refreshStatus() {
         wsSubscribe(state.currentSessionId, ws.lastSeq);
       }
     } else if (!state.streaming && state.currentSessionId
+               && !state.cliFollow   // CLI 跟随视图：会话在 CLI 进程，Web 内存本就不存在，属正常
                && $(".msg-column", chatUI.messages)) {
       // 后端会话丢失（服务器重启/被驱逐）但页面仍有对话内容：按 id 找回
       const sid = state.currentSessionId;
@@ -1263,6 +1313,8 @@ async function restoreLostSession(sessionId) {
     clearMessages();
     renderRestoredMessages(r.messages || []);
     if (r.usage) updateCtxMeter(r.usage);
+    // v5.3.1+（问题6）：找回的会话正由 CLI 运行 → 进入只读跟随视图
+    if (r.cli_running) { enterCliFollow(r.session_id || sessionId); return; }
     wsSubscribe(r.session_id || sessionId, r.run_active ? 0 : (r.run_seq || 0));
     toast("检测到服务重启，会话已自动恢复", "info");
     refreshWorkspaces();
@@ -1289,6 +1341,80 @@ async function refreshCurrentSession() {
     liveRunReset();
     clearMessages();
     renderRestoredMessages(messages || []);
+  } catch (_) {}
+}
+
+/* ===================================================================
+   CLI 会话只读跟随视图（v5.3.1+ 问题6）
+   打开正在 CLI 中运行的会话时：禁用输入，每 3 秒轮询磁盘会话文件
+   （CLI 每轮结束自动落盘 + 心跳上报状态），轮级实时刷新消息。
+   CLI 结束后自动接管会话（载入 Web 内存），用户可无缝续接对话。
+   =================================================================== */
+
+function setComposerDisabled(disabled, hint) {
+  chatUI.input.disabled = disabled;
+  chatUI.sendBtn.disabled = disabled;
+  if (disabled) chatUI.hint.textContent = hint || "";
+  else if (!state.streaming) chatUI.hint.textContent = "";
+}
+
+function showCliFollowBanner(title) {
+  hideCliFollowBanner();
+  const banner = el("div", { class: "cli-follow-banner", id: "cli-follow-banner" },
+    el("span", { class: "cli-follow-dot" }, "●"),
+    el("span", null, "该会话正在 CLI 中运行 · 只读跟随视图（每轮自动刷新）"));
+  msgColumn().append(banner);
+  scrollBottom();
+}
+
+function hideCliFollowBanner() {
+  document.getElementById("cli-follow-banner")?.remove();
+}
+
+function enterCliFollow(sid) {
+  state.cliFollow = sid;
+  setComposerDisabled(true, "该会话正在 CLI 中运行（只读跟随视图）");
+  showCliFollowBanner();
+  clearInterval(state.cliFollowTimer);
+  state.cliFollowTimer = setInterval(pollCliSession, 3000);
+}
+
+function stopCliFollow() {
+  clearInterval(state.cliFollowTimer);
+  state.cliFollowTimer = null;
+  state.cliFollow = "";
+  hideCliFollowBanner();
+  setComposerDisabled(false);
+}
+
+async function pollCliSession() {
+  const sid = state.cliFollow;
+  if (!sid) { stopCliFollow(); return; }
+  try {
+    const r = await api.cliSessionPoll(currentAgent(), sid);
+    if (state.cliFollow !== sid) return;
+    liveRunReset();
+    clearMessages();
+    renderRestoredMessages(r.messages || []);
+    if (!r.cli_running) {
+      // CLI 已结束：接管会话（从磁盘载入 Web 内存），可继续对话
+      stopCliFollow();
+      try {
+        const lr = await api.chatLoad(currentAgent(), currentModel(), "", "", sid);
+        if (lr && lr.session_id === sid && state.currentSessionId === sid) {
+          liveRunReset();
+          clearMessages();
+          renderRestoredMessages(lr.messages || []);
+          if (lr.usage) updateCtxMeter(lr.usage);
+          wsSubscribe(sid, lr.run_seq || 0);
+          toast("CLI 会话已结束，可在 Web 继续对话", "success");
+        }
+      } catch (_) {}
+      refreshStatus();
+      refreshWorkspaces();
+      return;
+    }
+    showCliFollowBanner();  // clearMessages 后恢复横幅
   } catch (_) {}
 }
 
@@ -1351,6 +1477,7 @@ async function sendMessage() {
   const text = chatUI.input.value.trim();
   const a = currentAgent(), m = currentModel();
   if (!a || !m) { toast("请先选择 Agent 和模型", "warn"); return; }
+  if (state.cliFollow) { toast("该会话正在 CLI 中运行，请等待结束", "warn"); return; }
   if (state.streaming) return;
   if (!text && state.attachments.length === 0) return;
 
@@ -1386,8 +1513,9 @@ async function sendMessage() {
     for (const img of imageAtts) {
       const src = img.base64 || img.url;
       if (src) {
-        const imgEl = el("img", { src, alt: img.filename, class: "msg-user-img", title: img.filename });
-        imgEl.addEventListener("click", () => window.open(img.url || src, "_blank"));
+        // v5.3.1+：点击放大预览（全局灯箱代理），右键原生下载
+        const imgEl = el("img", { src, alt: img.filename, class: "msg-user-img", title: img.filename,
+                                  "data-download-url": img.download_url || img.url || "" });
         imgGrid.append(imgEl);
       }
     }
@@ -1537,12 +1665,27 @@ function handleSubscribed(msg) {
     return;
   }
   if (msg.resync) {
-    // 事件日志已裁剪（超长流）：重拉消息后按当前 seq 续订兜底
-    refreshCurrentSession().then(() => {
-      if (msg.session_id) wsSubscribe(msg.session_id, msg.seq || 0);
-    });
+    // v5.3.1+（问题5）：续订游标落在聚合事件块中间（断线重连等），
+    // 部分回放会重复渲染 → 全量重载会话后从头回放当前轮
+    fullResyncSession(msg.session_id);
     return;
   }
+}
+
+/** 全量重载当前会话（resync 兜底：重拉消息 + 运行中则从头回放事件） */
+async function fullResyncSession(sid) {
+  const a = currentAgent(), m = currentModel();
+  if (!a || !m || !sid || sid !== state.currentSessionId) return;
+  try {
+    const r = await api.chatLoad(a, m, "", "", sid);
+    if (!r || r.session_id !== sid || sid !== state.currentSessionId) return;
+    liveRunReset();
+    clearMessages();
+    renderRestoredMessages(r.messages || []);
+    if (r.usage) updateCtxMeter(r.usage);
+    wsSubscribe(sid, r.run_active ? 0 : (r.run_seq || 0));
+    if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
+  } catch (_) {}
 }
 
 /* ---- 全局通知（会话运行状态/列表变化，多浏览器侧边栏同步） ---- */
@@ -1750,11 +1893,47 @@ function ensureToolCard(toolId, name) {
     rec.statusEl.className = `tag tool-status ${cls}`;
     rec.statusEl.textContent = text;
   }
+  /* v5.3.1: 领域 Harness 检查发现（cbhpacks 工具产出）→ 卡片顶部警告块 + 标题徽标 */
+  function renderHarnessBox(rec, findings) {
+    const blocks = findings.filter(f => f.level === "BLOCK");
+    const warns = findings.filter(f => f.level === "WARN" || f.level === "BLOCK");
+    const infos = findings.filter(f => f.level === "INFO");
+    const cls = blocks.length ? " hf-block" : (warns.length ? "" : " hf-info");
+    const box = el("div", { class: "harness-warn-box" + cls });
+    const parts = [];
+    if (warns.length) parts.push(`${warns.length} 项警告`);
+    if (infos.length) parts.push(`${infos.length} 项提示`);
+    box.append(el("div", { class: "harness-warn-title" },
+      `${blocks.length ? "⛔" : "🛡️"} Harness 检查 · ${parts.join("，")}`));
+    for (const f of findings.slice(0, 10)) {
+      const icon = f.level === "BLOCK" ? "🔴" : f.level === "WARN" ? "🟡" : "🔵";
+      box.append(el("div", { class: "hf-line" }, `${icon} [${f.code}] ${f.message || ""}`));
+      if (f.fix) box.append(el("div", { class: "hf-fix" }, `→ ${f.fix}`));
+    }
+    if (findings.length > 10) box.append(el("div", { class: "hf-fix" }, `… 共 ${findings.length} 项`));
+    rec.bodyEl.prepend(box);
+    // 标题徽标（卡片收起时也可见）
+    const badge = el("span", { class: "tag harness-badge" + (blocks.length ? " block" : "") },
+      (blocks.length ? "⛔ " : "⚠️ ") + warns.length);
+    rec.statusEl.insertAdjacentElement("beforebegin", badge);
+    return warns.length;
+  }
   function setToolResult(rec, data) {
     const ok = data.success;
     setToolStatus(rec, ok ? "完成" : "失败", ok ? "green" : "red");
     rec.confirmEl?.remove();
     rec.confirmEl = null;
+
+    // v5.3.1: 领域 Harness 检查发现（cbhpacks 工具产出）——警告块+徽标+醒目系统事件
+    const hfAll = data.harness_findings || [];
+    let hfWarns = 0;
+    if (hfAll.length) {
+      hfWarns = renderHarnessBox(rec, hfAll);
+      if (hfWarns) {
+        const codes = hfAll.filter(f => f.level !== "INFO").map(f => f.code).join(" ");
+        addSysEvent(`🛡️ ${rec.name}: harness ${hfWarns} 项警告（${codes}）`, "warn", "🛡️");
+      }
+    }
 
     // python 工具：代码已在参数区展示，结果区只放终端输出
     const pd = data.preview_data;
@@ -1782,8 +1961,9 @@ function ensureToolCard(toolId, name) {
         for (const img of images) {
           const imgUrl = img.url || "";
           if (imgUrl) {
-            const imgEl = el("img", { src: imgUrl, alt: img.filename, class: "ai-display-img", title: img.filename });
-            imgEl.addEventListener("click", () => window.open(imgUrl, "_blank"));
+            // v5.3.1+：点击放大预览（全局灯箱代理），右键原生下载
+            const imgEl = el("img", { src: imgUrl, alt: img.filename, class: "ai-display-img", title: img.filename,
+                                      "data-download-url": img.download_url || "" });
             imgGrid.append(imgEl);
           }
         }
@@ -1824,8 +2004,9 @@ function ensureToolCard(toolId, name) {
 
     // v5.2.9：write/edit 等工具成功后收起卡片（含自动生成的下载链接），
     // 仅失败或含图片（需直接可见）时展开；用户想看详情点击卡片即可
+    // v5.3.1：harness 警告（WARN/BLOCK）也强制展开，确保用户看见
     const hasImages = displayFiles.some(f => f.is_image);
-    if (!ok || hasImages) rec.cardEl.classList.add("open");
+    if (!ok || hasImages || hfWarns > 0) rec.cardEl.classList.add("open");
     else rec.cardEl.classList.remove("open");
     scrollBottom();
   }
@@ -1856,6 +2037,12 @@ function ensureToolCard(toolId, name) {
       return;
     }
 
+    // v5.3.1+：回放时该确认已被应答 → 只读展示，不重建交互确认卡
+    if (data.answered) {
+      setToolStatus(rec, "已确认", "blue");
+      return;
+    }
+
     // 需确认时展开工具卡片，便于用户审查参数后再决定
     rec.cardEl.classList.add("open");
 
@@ -1877,12 +2064,14 @@ function ensureToolCard(toolId, name) {
     $$("button", confirmEl).forEach(btn => {
       btn.addEventListener("click", async () => {
         $$("button", confirmEl).forEach(b => (b.disabled = true));
+        // v5.3.1+：先解除待应答标记再发请求--responded 事件可能先于
+        // HTTP 响应到达，若仍指向本卡片会被误显示"已在其他窗口应答"
+        if (liveRun.pendingRespondEl === confirmEl) liveRun.pendingRespondEl = null;
         try {
           await api.chatRespond(currentAgent(), currentModel(), btn.dataset.r, state.currentSessionId);
           setToolStatus(rec, "已确认", "blue");
           confirmEl.remove();
           rec.confirmEl = null;
-          if (liveRun.pendingRespondEl === confirmEl) liveRun.pendingRespondEl = null;
         } catch (e) {
           toast(e.message, "error");
           $$("button", confirmEl).forEach(b => (b.disabled = false));
@@ -1893,6 +2082,15 @@ function ensureToolCard(toolId, name) {
 
   async function handleAskUser(data) {
     closeLiveReasoning(); closeLiveContent();
+    // v5.3.1+：回放时提问已被回答 → 只读展示
+    if (data.answered) {
+      const doneEl = el("div", { class: "ask-card" },
+        el("div", { class: "ask-question" }, "❓ " + (data.question || "")),
+        el("div", { class: "sys-event success" }, el("span", { class: "icon" }, "✓"),
+          el("span", null, `已回答: ${data.answer || ""}`)));
+      getAiBody().append(doneEl);
+      return;
+    }
     const askEl = el("div", { class: "ask-card" });
     askEl.append(el("div", { class: "ask-question" }, "❓ " + (data.question || "")));
 
@@ -1903,9 +2101,10 @@ function ensureToolCard(toolId, name) {
     const submit = async (answer) => {
       if (answered) return;
       answered = true;
+      // v5.3.1+：先解除待应答标记（responded 事件可能先于 HTTP 响应到达）
+      if (liveRun.pendingRespondEl === askEl) liveRun.pendingRespondEl = null;
       try {
         await api.chatRespond(currentAgent(), currentModel(), answer, state.currentSessionId);
-        if (liveRun.pendingRespondEl === askEl) liveRun.pendingRespondEl = null;
         askEl.innerHTML = "";
         askEl.append(
           el("div", { class: "ask-question" }, "❓ " + (data.question || "")),
@@ -2129,6 +2328,8 @@ async function restoreMessages() {
         if (r.workspace) state.currentWorkspace = r.workspace;
         if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
         if (r.usage) updateCtxMeter(r.usage);
+        // v5.3.1+（问题6）：CLI 运行中的会话 → 只读跟随视图
+        if (r.cli_running) { enterCliFollow(r.session_id || lastId); refreshWorkspaces(); return; }
         // 空闲会话从 run_seq 续订（跳过上一轮事件回放，消息已含全量，防双份）
         wsSubscribe(r.session_id || lastId, r.run_active ? 0 : (r.run_seq || 0));
         if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
@@ -2149,16 +2350,21 @@ async function restoreMessages() {
     }
     // 无活跃会话（如服务器重启后重新打开页面）→ 自动恢复最近会话，
     // 避免页面空白/进度条归零且上下文丢失
-    const hist = await api.getHistory(a, 1);
-    const latest = (hist.sessions || [])[0];
-    if (!latest) return;
-    const r = await api.chatLoad(a, m, latest.filename, latest.workspace);
-    setSessionId(r.session_id || latest.id || null);
-    if (r.workspace) state.currentWorkspace = r.workspace;
-    if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
-    if (r.usage) updateCtxMeter(r.usage);
-    wsSubscribe(r.session_id || latest.id, r.run_active ? 0 : (r.run_seq || 0));
-    refreshWorkspaces();
+    // v5.3.1+：按时间倒序最多尝试 10 个（作用域外的会话会被 403 拒绝，跳过继续）
+    const hist = await api.getHistory(a, 10);
+    for (const s of hist.sessions || []) {
+      try {
+        const r = await api.chatLoad(a, m, s.filename, s.workspace);
+        setSessionId(r.session_id || s.id || null);
+        if (r.workspace) state.currentWorkspace = r.workspace;
+        if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
+        if (r.usage) updateCtxMeter(r.usage);
+        if (r.cli_running) { enterCliFollow(r.session_id || s.id); refreshWorkspaces(); return; }
+        wsSubscribe(r.session_id || s.id, r.run_active ? 0 : (r.run_seq || 0));
+        refreshWorkspaces();
+        return;
+      } catch (_) { /* 尝试下一个会话 */ }
+    }
   } catch { /* 忽略 */ }
 }
 
@@ -2171,8 +2377,11 @@ function renderRestoredMessages(messages) {
       if (msg.image_urls && msg.image_urls.length) {
         const imgGrid = el("div", { class: "msg-user-images" });
         for (const url of msg.image_urls) {
-          const imgEl = el("img", { src: url, alt: "图片", class: "msg-user-img" });
-          imgEl.addEventListener("click", () => window.open(url, "_blank"));
+          // v5.3.1+：点击放大预览（全局灯箱代理），右键原生下载
+          const dlUrl = url.includes("/api/files/serve/")
+            ? url.replace("/api/files/serve/", "/api/files/download/") : "";
+          const imgEl = el("img", { src: url, alt: "图片", class: "msg-user-img",
+                                    "data-download-url": dlUrl });
           imgGrid.append(imgEl);
         }
         children.push(imgGrid);
@@ -2249,6 +2458,23 @@ function renderRestoredMessages(messages) {
           bodyEl);
         card.querySelector(".tool-card-header").addEventListener("click", () =>
           card.classList.toggle("open"));
+        // v5.3.1: 历史 tool 消息携带的 harness findings（cbhpacks 工具产出）——徽标+警告块
+        if (tc.harness_findings && tc.harness_findings.length) {
+          const histWarns = tc.harness_findings.filter(
+            f => f.level === "WARN" || f.level === "BLOCK").length;
+          const badge = el("span", { class: "tag harness-badge" },
+            `⚠️ ${histWarns}`);
+          card.querySelector(".tool-status").insertAdjacentElement("beforebegin", badge);
+          const box = el("div", { class: "harness-warn-box" });
+          box.append(el("div", { class: "harness-warn-title" },
+            `🛡️ Harness 检查（历史）· ${tc.harness_findings.length} 项发现`));
+          for (const f of tc.harness_findings.slice(0, 10)) {
+            const icon = f.level === "BLOCK" ? "🔴" : f.level === "WARN" ? "🟡" : "🔵";
+            box.append(el("div", { class: "hf-line" }, `${icon} [${f.code}] ${f.message || ""}`));
+            if (f.fix) box.append(el("div", { class: "hf-fix" }, `→ ${f.fix}`));
+          }
+          bodyEl.prepend(box);
+        }
         body.append(card);
       }
       col.append(el("div", { class: "msg-ai" },
@@ -2266,6 +2492,7 @@ async function newSession() {
     "新会话立即可用；当前会话若仍在执行任务，将继续在后台运行。",
     { okText: "新建" });
   if (!ok) return;
+  stopCliFollow();  // v5.3.1+：退出 CLI 跟随视图（若有）
   try {
     // v5.2.9：旧会话不中断（后台继续运行），仅切换到全新会话
     const r = await api.chatReset(currentAgent(), currentModel(), state.currentSessionId);
@@ -2468,17 +2695,19 @@ function wsSessionRow(s) {
     e.stopPropagation();
     showSessionMenu(s, menuBtn);
   });
-  const children = [
-    el("span", { class: "ws-session-title", title: s.title }, s.title || "新会话"),
-  ];
-  // v5.2.9：后台运行状态徽标（WebSocket 通知实时刷新）
-  if (s.running) children.push(el("span", { class: "ws-run-badge" }, "● 运行中"));
-  children.push(el("span", {
-    class: "ws-session-time",
-    title: fmtFullTime(s.created_at),
-  }, fmtFullTime(s.created_at)));
-  children.push(menuBtn);
-  const row = el("div", { class: "ws-session" + (isCurrent ? " active" : "") }, ...children);
+  const titleRow = el("div", { class: "ws-session-row1" },
+    el("span", { class: "ws-session-title", title: s.title }, s.title || "新会话"));
+  // 运行状态徽标：Web 后台运行 / CLI 运行中（v5.3.1+ 问题6）
+  if (s.running && s.cli) titleRow.append(el("span", { class: "ws-run-badge cli" }, "● CLI运行中"));
+  else if (s.running) titleRow.append(el("span", { class: "ws-run-badge" }, "● 运行中"));
+  // v5.3.1+（问题1）：消息数 + 最后对话时间（updated_at，非创建时间）
+  const time = s.updated_at || s.created_at;
+  const metaRow = el("div", { class: "ws-session-row2" },
+    el("span", { class: "ws-session-count" }, `💬 ${s.message_count || 0} 条`),
+    el("span", { class: "ws-session-time", title: fmtFullTime(time) }, fmtFullTime(time)));
+  const row = el("div", { class: "ws-session" + (isCurrent ? " active" : "") },
+    el("div", { class: "ws-session-main" }, titleRow, metaRow),
+    menuBtn);
   row.addEventListener("click", () => openSidebarSession(s));
   return row;
 }
@@ -2589,6 +2818,7 @@ function showWorkspaceMenu(ws, anchor) {
 // 选择该文件夹：切换工作空间并恢复其最新会话（空文件夹则为新会话）
 async function doWorkspaceSelect(ws) {
   if (ws.path === state.currentWorkspace) { switchView("chat"); return; }
+  stopCliFollow();
   try {
     const r = await api.workspaceOpen(currentAgent(), currentModel(), ws.path, true);
     toast(r.message, "success");
@@ -2601,6 +2831,8 @@ async function doWorkspaceSelect(ws) {
     if (r.usage) updateCtxMeter(r.usage);
     setSessionId(r.session_id || null);
     if (r.session_id) {
+      // v5.3.1+（问题6）：最新会话正由 CLI 运行 → 只读跟随视图
+      if (r.cli_running) { enterCliFollow(r.session_id); refreshWorkspaces(); return; }
       wsSubscribe(r.session_id, r.run_active ? 0 : (r.run_seq || 0));
       if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
     } else {
@@ -2618,6 +2850,7 @@ async function doWorkspaceNew(ws) {
     refreshWorkspaces();
     return;
   }
+  stopCliFollow();
   try {
     const r = await api.workspaceOpen(currentAgent(), currentModel(), ws.path, false);
     toast(r.message, "success");
@@ -2660,6 +2893,7 @@ async function openSidebarSession(s) {
   // v5.2.9：点击会话 = 切换到该会话（含后台运行中的会话）。
   // 运行中的会话不中断，画面由 WebSocket 事件回放接管（多浏览器一致）。
   if (s.id && s.id === state.currentSessionId) { switchView("chat"); return; }
+  stopCliFollow();  // v5.3.1+：离开 CLI 跟随视图（若有）
   try {
     const r = await api.chatLoad(currentAgent(), currentModel(), s.filename, s.workspace, s.id);
     setSessionId(r.session_id || s.id || null);
@@ -2674,6 +2908,12 @@ async function openSidebarSession(s) {
     clearMessages();
     renderRestoredMessages(r.messages || []);
     if (r.usage) updateCtxMeter(r.usage);
+    // v5.3.1+（问题6）：CLI 正在运行的会话 → 只读跟随视图（轮级实时）
+    if (r.cli_running) {
+      enterCliFollow(r.session_id || s.id);
+      refreshWorkspaces();
+      return;
+    }
     wsSubscribe(r.session_id || s.id, r.run_active ? 0 : (r.run_seq || 0));
     if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
     refreshStatus();
@@ -2735,6 +2975,7 @@ async function showWorkspaceBrowser() {
       e.target.disabled = true;
       try {
         const r = await api.workspaceOpen(currentAgent(), currentModel(), curPath);
+        stopCliFollow();
         toast(r.message, "success");
         state.currentWorkspace = r.workspace;
         state.wsExpanded[r.workspace] = true;
@@ -2852,14 +3093,17 @@ function initFileManager() {
 
 async function refreshFileManager() {
   if (!$("#fm-list")) return;
-  // 工作空间变化时重置到其根目录
-  if (state.currentWorkspace && state.fmWorkspace !== state.currentWorkspace) {
-    state.fmWorkspace = state.currentWorkspace;
-    state.fmPath = "";
-  }
+  // v5.3.1+ 第四轮：文件管理器锚定【服务启动目录】（与侧边栏同逻辑），
+  // 选择子文件夹作为工作空间后不缩窄，主目录/兄弟文件夹保持可浏览
   let data;
-  try { data = await api.filesList(state.fmPath); } catch { return; }
+  try {
+    data = await api.filesList(state.fmPath);
+  } catch {
+    state.fmPath = "";  // 路径越界（如残留的旧浏览位置）→ 回根目录
+    try { data = await api.filesList(""); } catch { return; }
+  }
   state.fmPath = data.path;
+  state.fmWorkspace = data.workspace;
   renderFileManager(data);
 }
 
@@ -2931,7 +3175,12 @@ function showFileMenu(ent, anchor) {
   };
   if (ent.is_dir) {
     menu.append(
-      mkItem("📂 打开为工作空间", "", () => openFolderAsWorkspace(ent.path)),
+      mkItem("✅ 选择该文件夹", "", () => selectFolderFromFM(ent.path)),
+      mkItem("📂 打开为工作空间（新会话）", "", () => openFolderAsWorkspace(ent.path)),
+      mkItem("📋 复制文件名称", "", () => {
+        copyText(ent.name);
+        toast("已复制文件名称", "success");
+      }),
       mkItem("📋 复制路径", "", () => {
         copyText(ent.path);
         toast("已复制路径", "success");
@@ -2939,6 +3188,10 @@ function showFileMenu(ent, anchor) {
   } else {
     menu.append(
       mkItem("📥 下载", "", () => downloadFile(ent)),
+      mkItem("📋 复制文件名称", "", () => {
+        copyText(ent.name);
+        toast("已复制文件名称", "success");
+      }),
       mkItem("📋 复制路径", "", () => {
         copyText(ent.path);
         toast("已复制路径", "success");
@@ -2955,6 +3208,7 @@ function showFileMenu(ent, anchor) {
 }
 
 async function openFolderAsWorkspace(path) {
+  stopCliFollow();
   try {
     const r = await api.workspaceOpen(currentAgent(), currentModel(), path, false);
     toast(r.message, "success");
@@ -2966,6 +3220,33 @@ async function openFolderAsWorkspace(path) {
     setSessionId(null);
     wsSubscribe(null);
     setStreaming(false);
+    refreshStatus();
+    refreshWorkspaces();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+/* v5.3.1+ 第四轮：文件管理器"选择该文件夹"——切换工作空间并恢复其最新会话
+   （与侧边栏文件夹菜单"选择该文件夹"同逻辑，resume=true） */
+async function selectFolderFromFM(path) {
+  stopCliFollow();
+  try {
+    const r = await api.workspaceOpen(currentAgent(), currentModel(), path, true);
+    toast(r.message, "success");
+    state.currentWorkspace = r.workspace;
+    state.wsExpanded[r.workspace] = true;
+    liveRunReset();
+    switchView("chat");
+    clearMessages();
+    if (r.messages && r.messages.length) renderRestoredMessages(r.messages);
+    if (r.usage) updateCtxMeter(r.usage);
+    setSessionId(r.session_id || null);
+    if (r.session_id) {
+      if (r.cli_running) { enterCliFollow(r.session_id); refreshWorkspaces(); return; }
+      wsSubscribe(r.session_id, r.run_active ? 0 : (r.run_seq || 0));
+      if (r.run_active) { setStreaming(true); ensureLiveTurn(); }
+    } else {
+      wsSubscribe(null);  // 空文件夹：无会话
+    }
     refreshStatus();
     refreshWorkspaces();
   } catch (e) { toast(e.message, "error"); }

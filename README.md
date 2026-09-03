@@ -1,4 +1,4 @@
-# CBHCLI v5.3.0 - AI驱动的终端助手
+# CBHCLI v5.3.1 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -66,10 +66,19 @@
 | `image` | 识别图片内容（主模型支持视觉时直发主模型，否则调用其他视觉模型） |
 | `send_file` 📡 | **仅 Web 端**：向用户发送文件/图片，图片内联显示、文件下载链接 |
 
-### cbhpacks 数据科学工具（13个，默认关闭）
+### cbhpacks 数据科学工具（14个，默认关闭）
 基于 [cbhpacks](https://github.com/chenbh17/cbhpacks) 数据科学工具包封装，覆盖完整的机器学习建模流水线。默认不开启，通过 `/tools on` 手动开启。
 
 **会话级状态缓存（v4.9.3）**：与 python 工具共享会话命名空间 —— 各工具的执行结果变量（如 `bm`/`woe_data`/`iv_data`/`mt`/`clf`/`selected_cols`/`data`）自动注入会话，可在 python 工具中直接使用做二次分析；同参数重复调用自动复用缓存实例（如 fit 后的模型可直接调参/出报告）。`/new` 或 `/reset` 后所有缓存与变量自动释放。
+
+**建模护栏（v5.3.1 Harness）**：关键节点由规则代码**确定性检查**（不依赖 AI 自觉）——分箱（comp_woe_iv/bins_rpt/get_psi）、训练（fit/调参/report）自动注入 A/B/C/D/E 组检查；`cbhpacks_harness` 工具可显式调用全部检查。警告经 CLI 醒目横幅 / Web 卡片徽标+警告块 / PostToolUse hooks 三通道可见，写入 `history/traces/*.jsonl` 审计。数据穿越铁律：**WOE 只在训练集计算**（训练集 data_to_woe 省略参数自动继承 comp_woe_iv 分箱参数；测试集/OOT 必须传 woe_mapping_pkl 用训练集映射，防穿越）。
+
+**护栏假阴性防护（同版本内补强）**：
+- **A0 预填充检测**：check_data 须传原始含 NaN 数据 + nan 参数；传已 fillna 的数据时数据中无缺失信息、填充值安全性无法评估，工具会显式提示（不再静默"全部通过"）
+- **D0/E0 输入结构校验**：check_overfit/check_stability 声明的输入须为真实工具链产出（report 的 confusion_matrix_*.xlsx、get_psi 的 psi_single_rpt_*.xlsx）；手工模拟/缺标准列（type[auc/ks]、psi）的文件会触发结构警告且 D1/E1 不执行，杜绝假阴性
+- **C5 三层泄漏检测**：完美泄漏特征（如 target×10）经 adj_bin 分箱后 WOE/IV 被置 0"洗白"、仅看 iv_data 必漏报——① 从 woe_data 分箱明细重算**修正 IV**（单侧箱 ±0.5 连续化，结果注入 `corrected_iv` 变量）；② **原始数据级点二列相关**（|r|>0.9，不受任何分箱影响）终极兜底；③ comp_woe_iv / check_leakage 内置①+②自动报警
+- **data_to_woe 支持 output_csv**：WOE 转换结果可指定另存路径（如 step3_woe/train_woe.csv），下游训练直接作 train_csv（默认仍写 output_path/woe_transformed_data.csv）
+- **get_psi 月份预校验**：cmp_mth/base_mth 不在数据月份列中时明确报错并列出可用月份（替代裸 KeyError），或建议改用 psi_mth_avg 自动遍历全部月份
 
 | 工具 | 功能 | 方法 |
 |------|------|------|
@@ -86,6 +95,7 @@
 | `cbhpacks_con_sql` | 数据库连接SQL执行 | chrun, chdf, con_mysql, con_hive, get_create_table, to_hive, rfms_sql |
 | `cbhpacks_con_linux` | Linux SSH连接命令 | con_linux, data_trans_linux, jps, hadoop, start_hive |
 | `cbhpacks_get_random_data` | 生成随机测试数据 | (直接生成) |
+| `cbhpacks_harness` | 建模护栏校验（v5.3.1，含 A0/D0/E0 防假阴性 + C5 三层泄漏检测） | check_data, check_bins, check_leakage, check_overfit, check_stability, check_all |
 
 **典型建模流水线**：
 ```
@@ -169,7 +179,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.3.0-py3-none-any.whl
+pip install dist/cbhcli-5.3.1-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -631,6 +641,28 @@ docs/                 # 项目文档
 ├── 开发者指南/         # 开发文档
 ├── 快速开始.md
 └── ...
+
+## 变更记录
+
+### v5.3.1（建模护栏补强，同版本内迭代）
+
+Harness（确定性建模护栏）假阴性防护与检测能力补强：
+
+- **A0 预填充检测（问题1修复）**：`check_data` 须传原始含 NaN 数据 + nan 参数——若传已 `fillna` 的数据，数据中无缺失信息、A1/A2 填充值安全性检查全部失效（假阴性），现显式提示 A0 而非静默"全部通过"
+- **D0/E0 输入结构校验（问题2修复）**：`check_overfit`/`check_stability` 只认真实工具链产出文件（report 的 `confusion_matrix_*.xlsx`、get_psi 的 `psi_single_rpt_*.xlsx`）；手工模拟/缺标准列（`type[train/test]+auc/ks`、`psi`）的文件会触发 D0/E0 结构警告且 D1/E1 不执行（E0 能识别 psi_avg 等候选列并提示改名）
+- **C5 三层泄漏检测（问题3修复）**：完美泄漏特征（如 target×10）经 adj_bin 分箱后 WOE/IV 被置 0"洗白"（实测报告 IV=0、仅看 iv_data 完全漏报）——① 从 woe_data 分箱明细重算**修正 IV**（单侧箱 ±0.5 连续化，结果注入 `corrected_iv` 会话变量）；② **原始数据级点二列相关**（|r|>0.9）终极兜底（覆盖泄漏特征被合并成单箱、分箱明细失效的极端场景）；③ `comp_woe_iv` 与 `check_leakage` 内置①+②自动报警。修正 IV 启发式报警后仍需人工审查分箱明细（bad_rate 0%/100% 箱）最终确认
+- **data_to_woe 支持 output_csv（问题4修复）**：可指定 WOE 转换结果另存路径（下游 cbhpacks_binary_model 训练直接作 train_csv），默认仍写 `output_path/woe_transformed_data.csv`
+- **get_psi 月份预校验（问题5修复）**：cmp_mth/base_mth 不在数据月份列中时明确报错并列出可用月份（替代裸 `KeyError: 202408`），并建议改用 `psi_mth_avg`（用全量数据或自动遍历各月）
+- **B1 文案修正（问题6）**：单好/单坏箱警告改为分类计数（"N 个坏样本=0，M 个好样本=0"），消除"无坏样本/好样本"歧义
+- **get_psi/psi_mth_avg 状态恢复**：底层库 get_psi 循环中途会把实例 df 替换为单月子集且异常路径不恢复，污染会话缓存实例（后续 comp_woe_iv 复用会静默用单月数据分箱）——工具层 try/finally 恒恢复实例状态
+- **report 混淆矩阵 all 行 F1 修正**：底层库 all 行 F1 误用 test 行的 f1（应为 f1_all），修正后 confusion_matrix_*.xlsx 全表正确（该文件是 check_overfit 的输入）
+- **lr_fit/svm_fit NaN 友好预检**：训练特征含 NaN 时返回友好报错（列出缺失列+三种解决方案），替代 sklearn 的 `Input X contains NaN` 晦涩异常
+
+### v5.3.1
+
+- Harness 建模护栏：A（缺失填充）/B（分箱质量）/C（数据穿越）/D（过拟合）/E（稳定性）五组确定性检查，内置到分箱/训练工具并支持 cbhpacks_harness 显式调用
+- 内置 cbhpacks 数据科学 Agent（评分卡/风控建模方向）
+- data_to_woe 分箱参数自动继承 + 传入参数不一致 C2 警告；get_psi 缺失值对比修复；cat_bin 跳过单调性检查等
 
 ## 开发
 

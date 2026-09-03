@@ -611,6 +611,31 @@ class bins_model(get_bins):  # 继承自get_bins类
         joblib.dump(woe_mapping,self.path+'/woe_mapping_'+self.bins_type+'.pkl')
         return woedf,woe_mapping
 
+    def apply_woe(self, new_df, woe_mapping=None):
+        """对任意新数据集（如测试集/OOT）应用已有 woe_mapping 做 WOE 转换，不重新分箱。
+
+        Harness 数据穿越防护（2026-08-25 新增）：WOE 必须在训练集上拟合
+        （分箱边界+WOE 计算），新数据只应用训练集产出的映射；
+        禁止基于新数据自身 bad_rate 重新分箱计算 WOE（数据穿越）。
+
+        Args:
+            new_df: 待转换的数据集 DataFrame（如测试集/OOT 验证集）
+            woe_mapping: WOE 映射字典 {col: {pd.Interval: woe}}；
+                         None 时从 self.path/woe_mapping_<bins_type>.pkl 自动加载
+        Returns:
+            (woedf, woe_mapping): 转换后的数据 + 使用的映射
+        """
+        if woe_mapping is None:
+            woe_mapping = joblib.load(self.path+'/woe_mapping_'+self.bins_type+'.pkl')
+        data=new_df.copy()
+        data[self.cols]=data[self.cols].fillna(self.nan)
+        woedf=data
+        print("正在将数据转换为WOE...")
+        for i in self.cols:
+            if i in woe_mapping:
+                woedf[i]=woedf[i].map(woe_mapping[i])
+        return woedf,woe_mapping
+
     def get_psi(self):
     #psi_data=get_psi(data=data_all,cols=['col1','col2'],mth_col='mth',base_mth=202302,cmp_mth=202303,bins_type='deci_tree_bin',group=6,target='target')
         data=self.df_copy
@@ -639,7 +664,12 @@ class bins_model(get_bins):  # 继承自get_bins类
                 base_bin_edge,base_grp_bins,base_grp_cnt=get_bins.cat_bin(self)
                 base_grp_cnt=pd.cut(base_mth_data[i],base_bin_edge).value_counts().sort_index()
             base_grp_pct=base_grp_cnt/(base_grp_cnt.sum())
-            cmp_grp_cnt=pd.cut(cmp_mth_data[i],base_bin_edge).value_counts().sort_index()
+            # Harness 修复(2026-08-25): cmp 侧缺失值必须先 fillna(nan) 与 base 侧一致，
+            # 否则 pd.cut 对 NaN 产生 NaN 区间被 value_counts(dropna=True) 丢弃，
+            # 缺失样本丢失导致分布失算、产生虚假 PSI（实测缺失率相近却报 PSI=2.0）
+            cmp_grp_cnt=pd.cut(cmp_mth_data[i].fillna(self.nan),base_bin_edge).value_counts().sort_index()
+            # 与 base 侧箱序对齐，cmp 缺失的箱补 0（防 Series 对齐产生 NaN 污染 psi 求和）
+            cmp_grp_cnt=cmp_grp_cnt.reindex(base_grp_cnt.index).fillna(0)
             cmp_grp_pct=cmp_grp_cnt/(cmp_grp_cnt.sum())
             psi=((base_grp_pct-cmp_grp_pct)*np.log((base_grp_pct+0.00001)/(cmp_grp_pct+0.00001))).sum()
             psi_list.append(psi)

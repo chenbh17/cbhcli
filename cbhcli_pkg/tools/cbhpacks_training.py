@@ -10,6 +10,10 @@ import joblib
 import pandas as pd
 from cbhcli_pkg.tools.registry import ToolResult
 from cbhcli_pkg.tools.cbhpacks_session import CbhpacksSessionTool
+from cbhcli_pkg.tools.cbhpacks_guard import (
+    check_time_split, check_overfit, check_feature_ratio,
+    check_cv_folds, check_target_leakage, format_findings, Finding,
+)
 
 _MODEL_TYPE_MAP = {"lr_model.pkl": "lr", "xgb_model.pkl": "xgb", "lgbm_model.pkl": "lgbm",
                    "mlp_model.h5": "keras", "svm_model.pkl": "svm", "rdf_model.pkl": "rdf"}
@@ -78,13 +82,14 @@ class BinaryModelTool(CbhpacksSessionTool):
             "group": {"type": "integer"}, "mth_col": {"type": "string"}, "base_mth": {"type": "integer"},
             "bins_type": {"type": "string", "default": "all"},
             "paras": {"type": "string", "description": "JSON格式"},
-            "score_type": {"type": "string", "default": "roc_auc"}, "cv": {"type": "integer", "default": 2},
+            "score_type": {"type": "string", "default": "roc_auc"}, "cv": {"type": "integer", "default": 5},
             "epochs": {"type": "integer", "default": 5}, "batch_size": {"type": "integer", "default": 100},
             "validation_split": {"type": "number", "default": 0.5},
             "cols_bins_rpt_csv": {"type": "string", "description": "分箱报告Excel路径，来自comp_woe_iv产出的bins_rpt_xxx.xlsx，若有连续+离散两份需先合并"}
         }, "required": ["method"]}
 
     def execute(self, **kwargs):
+        self._findings_buffer = []  # 清空上次残留（异常路径可能未取走）
         try:
             method = kwargs.get("method")
             train_csv = kwargs.get("train_csv")
@@ -101,7 +106,7 @@ class BinaryModelTool(CbhpacksSessionTool):
             bins_type = kwargs.get("bins_type", "all")
             paras = json.loads(kwargs.get("paras", "{}")) if isinstance(kwargs.get("paras"), str) else kwargs.get("paras", {})
             score_type = kwargs.get("score_type", "roc_auc")
-            cv = kwargs.get("cv", 2)
+            cv = kwargs.get("cv", 5)  # 修复(v5.3.1)：2→5，与 D3 建议一致避免默认调参即刷屏提示
             epochs = kwargs.get("epochs", 5)
             batch_size = kwargs.get("batch_size", 100)
             validation_split = kwargs.get("validation_split", 0.5)
@@ -148,6 +153,19 @@ class BinaryModelTool(CbhpacksSessionTool):
 
             # ═══ fit 方法 ═══
             if method in ["lr_fit","xgb_fit","lgbm_fit","mlp_fit","svm_fit","rdf_fit"]:
+                # 修复(v5.3.1) 已知问题18: lr/svm 不支持 NaN——预检给出友好报错，
+                # 替代 sklearn 的 "Input X contains NaN" 晦涩异常
+                if method in ("lr_fit", "svm_fit") and train is not None and cols:
+                    _nan_cols = [c for c in cols if c in train.columns
+                                 and train[c].isna().any()]
+                    if _nan_cols:
+                        return ToolResult(
+                            success=False, output="",
+                            error=f"{method} 不支持 NaN：训练集以下特征含缺失值: {_nan_cols[:10]}"
+                                  f"{'...' if len(_nan_cols) > 10 else ''}。"
+                                  f"解决方案：① 先用 cbhpacks_bins_model.data_to_woe 做WOE转换"
+                                  f"（自动按 nan 参数填充）；② 或先用 fillna(-999) 填充再训练；"
+                                  f"③ 或改用原生支持 NaN 的 xgb_fit/lgbm_fit/rdf_fit")
                 if method == "lgbm_fit":
                     fit_params.setdefault("verbose", -1)
                     fit_params_str = ", ".join(f"{k}={repr(v)}" for k, v in fit_params.items())
@@ -157,6 +175,16 @@ class BinaryModelTool(CbhpacksSessionTool):
                 model_type = method.replace("_fit", "")
                 output_files += [f"  ✅ {model_type}_*.xlsx/pkl — 模型文件"]
                 result_text = f"{method} 训练完成"
+
+                # ═══ Harness: 特征-样本比检查（LR 经验法则：每特征≥10个正样本）═══
+                findings = []
+                if train is not None and cols and target in train.columns:
+                    n_pos = int((train[target] == 1).sum())
+                    findings = check_feature_ratio(model_type, len(cols), n_pos)
+                    harness_note = format_findings(findings)
+                    self._log_findings(findings)
+                    if harness_note:
+                        result_text += f"\n\n{harness_note}"
 
                 if method == "mlp_fit":
                     script_body = f"bm.mlp_fit(epochs={epochs}, batch_size={batch_size}, validation_split={validation_split})"
@@ -172,6 +200,12 @@ class BinaryModelTool(CbhpacksSessionTool):
                 para_dic = bm.para_adj_gs(paras=paras, score_type=score_type, cv=cv)
                 output_files += [f"  ✅ {model_path}/{bm.model_type}_gs_adj*.pkl"]
                 result_text = f"网格搜索调参完成，最佳参数: {para_dic}"
+                # Harness: CV 折数提示
+                findings = check_cv_folds(cv)
+                harness_note = format_findings(findings)
+                self._log_findings(findings)
+                if harness_note:
+                    result_text += f"\n\n{harness_note}"
                 script_body = f"bm.para_adj_gs(paras={paras}, score_type='{score_type}', cv={cv})"
 
             elif method == "para_adj_bs":
@@ -182,6 +216,12 @@ class BinaryModelTool(CbhpacksSessionTool):
                 para_dic = bm.para_adj_bs(paras=paras, score_type=score_type, cv=cv)
                 output_files += [f"  ✅ {model_path}/{bm.model_type}_bs_adj*.pkl"]
                 result_text = f"贝叶斯搜索调参完成，最佳参数: {para_dic}"
+                # Harness: CV 折数提示
+                findings = check_cv_folds(cv)
+                harness_note = format_findings(findings)
+                self._log_findings(findings)
+                if harness_note:
+                    result_text += f"\n\n{harness_note}"
                 script_body = f"bm.para_adj_bs(paras={paras}, score_type='{score_type}', cv={cv})"
 
             # ═══ 报告方法 ═══
@@ -205,7 +245,26 @@ class BinaryModelTool(CbhpacksSessionTool):
                 bins_rpt_all, confusion_matrix, fea_bins_report, fea_report = bm.report(**report_kwargs)
                 output_files += [f"  ✅ confusion_matrix_*.xlsx", f"  ✅ *_full_report.xlsx (含KS/ROC/LIFT图)",
                                  f"  ✅ {train_data_path}/xtest_pred.csv", f"  ✅ bins_rpt_*.xlsx"]
+                # ═══ Harness: 过拟合 + 时间切分检查 ═══
+                findings = check_overfit(confusion_matrix)
+                if mth_col:
+                    # 修复(v5.3.1)：从 pkl 加载模型（重启后 report）没有 xtrain/xtest，
+                    # C1 检查静默跳过会伪装成"已检查通过"——改为显式 INFO 提示
+                    if getattr(bm, 'xtrain', None) is not None \
+                            and getattr(bm, 'xtest', None) is not None:
+                        findings += check_time_split(
+                            getattr(bm, 'xtrain', None), getattr(bm, 'xtest', None), mth_col)
+                    else:
+                        findings.append(Finding(
+                            "INFO", "C1",
+                            "模型从 pkl 加载（无 train/test 切分数据上下文），时间穿越(C1)检查未执行",
+                            "如需时间切分校验，请用 cbhpacks_harness.check_leakage "
+                            "传 train_csv+test_csv+mth_col 显式检查"))
+                harness_note = format_findings(findings)
+                self._log_findings(findings)
                 result_text = f"报告生成完成\n混淆矩阵:\n{confusion_matrix.to_string() if hasattr(confusion_matrix,'to_string') else str(confusion_matrix)}"
+                if harness_note:
+                    result_text += f"\n\n{harness_note}"
                 cols_bins_rpt_code = f", cols_bins_rpt=pd.read_excel('{cols_bins_rpt_csv}')" if cols_bins_rpt_csv else ""
                 script_body = f"bm.report(group={group}, mth_col='{mth_col}', base_mth={base_mth}, bins_type='{bins_type}'{cols_bins_rpt_code})"
             else:
@@ -231,7 +290,7 @@ print("执行完成")
                 exposed.update(train=train, test=test)
             self._expose(**exposed)
 
-            return ToolResult(success=True, output=(
+            return ToolResult(success=True, harness_findings=self._pop_findings(), output=(
                 f"📊 cbhpacks_binary_model.{method} 执行完成\n\n"
                 f"📁 输出文件:\n" + "\n".join(output_files) + f"\n  📁 输出目录: {model_path}/\n\n"
                 f"📋 结果:\n{result_text}\n\n"
@@ -261,6 +320,7 @@ class UnsModelTool(CbhpacksSessionTool):
         }, "required": ["method", "csv_path", "cols"]}
 
     def execute(self, **kwargs):
+        self._findings_buffer = []  # 清空上次残留（异常路径可能未取走）
         try:
             method = kwargs.get("method")
             csv_path = kwargs.get("csv_path")
@@ -316,7 +376,7 @@ um = uns_model(df=df, cols={cols}, target={repr(target)}, mean_key={mean_key}, p
 ''')
             output_files.append(f"  ✅ {path}/run_{method}.py — 可复现源码")
 
-            return ToolResult(success=True, output=(
+            return ToolResult(success=True, harness_findings=self._pop_findings(), output=(
                 f"📊 cbhpacks_uns_model.{method} 执行完成\n\n"
                 f"📁 输出文件:\n" + "\n".join(output_files) + f"\n\n📋 结果:\n{result_text}\n\n"
                 f"💡 已注入 python 会话变量: {', '.join(exposed.keys())}"))
@@ -344,6 +404,7 @@ class LinearModelTool(CbhpacksSessionTool):
         }, "required": ["method", "csv_path", "cols", "target"]}
 
     def execute(self, **kwargs):
+        self._findings_buffer = []  # 清空上次残留（异常路径可能未取走）
         try:
             method = kwargs.get("method")
             csv_path = kwargs.get("csv_path")
@@ -393,7 +454,7 @@ lm = linear_model(df=df, cols={cols}, target="{target}", iv_target="{iv_target o
 ''')
             output_files.append(f"  ✅ {path}/run_{method}.py — 可复现源码")
 
-            return ToolResult(success=True, output=(
+            return ToolResult(success=True, harness_findings=self._pop_findings(), output=(
                 f"📊 cbhpacks_linear_model.{method} 执行完成\n\n"
                 f"📁 输出文件:\n" + "\n".join(output_files) + f"\n\n📋 结果:\n{result_text}\n\n"
                 f"💡 已注入 python 会话变量: {', '.join(exposed.keys())}"))

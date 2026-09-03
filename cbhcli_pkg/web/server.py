@@ -98,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.3.0")
+app = FastAPI(title="CBHCLI Web", version="5.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -200,6 +200,74 @@ def _set_current_workspace(path: str) -> None:
             pass
 
 
+# ---- CLI 会话实时同步（v5.3.1+ 问题6）----
+# CLI 进程对话时通过 /api/cli_notify 上报运行状态（开始/心跳/结束），
+# Web 侧边栏据此显示"CLI 运行中"徽标；打开此类会话进入只读跟随视图
+# （轮询磁盘文件刷新消息，轮级实时）。
+# (agent_name, session_id) -> {"status": running|idle, "workspace", "title", "ts"}
+_cli_sessions: dict[tuple, dict] = {}
+_CLI_RUNNING_TTL = 120.0  # 心跳超时（秒）：CLI 每 30s 心跳，超期视为已结束
+
+
+def _cli_running(agent_name: str, session_id: str) -> bool:
+    """指定会话是否正由 CLI 运行（心跳未超期）。"""
+    import time as _time
+    rec = _cli_sessions.get((agent_name, session_id))
+    if not rec or rec.get("status") != "running":
+        return False
+    return (_time.time() - float(rec.get("ts", 0))) < _CLI_RUNNING_TTL
+
+
+# Web 服务注册文件：CLI 进程据此发现本机运行中的 Web 实例并推送通知。
+# 结构 {端口: {"pid", "ts"}}，多实例共存；启动时清理死进程残留条目。
+_WEB_SERVERS_FILE = CBHCLI_DIR / "web_servers.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _register_web_server(port: int) -> None:
+    import time as _time
+    try:
+        try:
+            with open(_WEB_SERVERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except Exception:
+            data = {}
+        # 清理死进程/超期条目
+        data = {p: info for p, info in data.items()
+                if isinstance(info, dict)
+                and _pid_alive(int(info.get("pid", 0)))
+                and _time.time() - float(info.get("ts", 0)) < 24 * 3600}
+        data[str(port)] = {"pid": os.getpid(), "ts": _time.time()}
+        with open(_WEB_SERVERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _unregister_web_server(port: int) -> None:
+    try:
+        with open(_WEB_SERVERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        info = data.get(str(port))
+        if isinstance(info, dict) and int(info.get("pid", 0)) == os.getpid():
+            data.pop(str(port), None)
+            with open(_WEB_SERVERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def get_config() -> GlobalConfig:
     global _global_config
     if _global_config is None:
@@ -221,6 +289,11 @@ def get_agent_manager() -> AgentManager:
             "workspace_base", str(CBHCLI_DIR / "agents")
         ))
         _agent_manager = AgentManager(workspace_base)
+        # 确保内置 Agent 存在（main/cbhpacks，幂等；v5.3.1，Web/Jupyter 首启也有内置Agent）
+        try:
+            _agent_manager.ensure_builtin_agents()
+        except Exception:
+            pass
     return _agent_manager
 
 
@@ -432,6 +505,7 @@ def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext,
     from cbhcli_pkg.tools.cbhpacks_sql import ConSqlTool
     from cbhcli_pkg.tools.cbhpacks_linux import ConLinuxTool
     from cbhcli_pkg.tools.cbhpacks_data import GetRandomDataTool
+    from cbhcli_pkg.tools.cbhpacks_harness import CbhpacksHarnessTool
 
     registry.register(BinsModelTool())
     registry.register(BinaryModelTool())
@@ -446,6 +520,7 @@ def _build_tool_registry(agent_name: str, app_proxy: _WebAgentContext,
     registry.register(ConSqlTool())
     registry.register(ConLinuxTool())
     registry.register(GetRandomDataTool())
+    registry.register(CbhpacksHarnessTool())
 
     # 应用 Agent 配置中的禁用工具
     if agent_name:
@@ -638,15 +713,21 @@ class WebChatSession:
         return cs
 
     def _sync_python_session(self):
-        """python 工具解释器会话按聊天会话 id 隔离（v5.2.9 多会话并发）。
+        """python 工具与 cbhpacks 工具的解释器会话按聊天会话 id 隔离（v5.2.9 多会话并发）。
 
         旧版全局共享 "default" 一个解释器，多个会话并发执行 python 时
         变量互相污染；现按 session.id 隔离，会话驱逐/删除时同步清理。
+        v5.3.1：cbhpacks 工具（CbhpacksSessionTool 子类，含会话缓存与结果变量注入）
+        必须与 python 工具同会话，否则 cbhpacks 注入的结果变量在 python 工具中不可见，
+        且多聊天会话的 cbhpacks 实例缓存互相污染。
         """
         try:
-            pt = self.tool_registry.get("python") if self.tool_registry else None
-            if pt is not None and hasattr(pt, "set_session_id"):
-                pt.set_session_id(self.session.id if self.session else "default")
+            if not self.tool_registry:
+                return
+            sid = self.session.id if self.session else "default"
+            for tool in self.tool_registry._tools.values():
+                if hasattr(tool, "set_session_id"):
+                    tool.set_session_id(sid)
         except Exception:
             pass
 
@@ -908,6 +989,9 @@ class WebChatSession:
                         if tc["id"] == tcid:
                             tc["result"] = (m.content or "")[:2000]
                             tc["success"] = (m.metadata or {}).get("success")
+                            hf = (m.metadata or {}).get("harness_findings")
+                            if hf:
+                                tc["harness_findings"] = hf
                             break
                     break
         return result
@@ -2188,14 +2272,44 @@ def _parse_sse_line(sse_str: str) -> Optional[dict]:
 
 
 def _publish_event(cs: 'WebChatSession', data: dict) -> None:
-    """发布事件：写入会话事件日志 + 投递给所有订阅者队列。"""
+    """发布事件：写入会话事件日志 + 投递给所有订阅者队列。
+
+    v5.3.1+（问题5）：**回放日志聚合**。reasoning/content 流式增量在一轮
+    运行中可达数千条，若逐条入日志会迅速超过 _MAX_RUN_EVENTS 被裁剪头部，
+    导致迟到订阅者（切走再切回）按 since_seq=0 回放时缺失开头 → 触发 resync
+    → 前端截断到本轮之前，当前轮消息整体丢失。现将**连续同类型增量聚合为
+    单条日志**（一个思考块/内容块各 1 条），日志规模降到"块"级，整轮事件
+    远低于上限，迟到订阅者总能完整回放当前轮。实时订阅者仍收到逐条增量，
+    流式渲染不受影响。
+    """
     if not isinstance(data, dict) or cs is None:
         return
     try:
         cs.run_seq += 1
         entry = dict(data)
         entry["seq"] = cs.run_seq
-        cs.run_events.append(entry)
+        t = entry.get("type")
+        # v5.3.1+：应答事件到达时，把日志中最近一个待应答的确认/提问条目标记
+        # 为已应答--迟到订阅者回放时不再重建可交互确认卡（否则会先闪出
+        # 确认卡再被 responded 事件替换成"已在其他窗口应答"，误导观看者）
+        if t == "responded":
+            for prev in reversed(cs.run_events):
+                pt = prev.get("type")
+                if pt in ("tool_confirm", "ask_user") and not prev.get("answered"):
+                    prev["answered"] = True
+                    prev["answer"] = entry.get("response", "")
+                    break
+        # 聚合连续同类型的流式增量（日志压缩）
+        if t in ("reasoning", "content") and cs.run_events:
+            last = cs.run_events[-1]
+            if last.get("type") == t:
+                last["content"] = (last.get("content") or "") + (entry.get("content") or "")
+                # seq 前移到最新增量，续订游标落在此块之后不回读旧块
+                last["seq"] = entry["seq"]
+            else:
+                cs.run_events.append(entry)
+        else:
+            cs.run_events.append(entry)
         if len(cs.run_events) > _MAX_RUN_EVENTS:
             drop = len(cs.run_events) - _MAX_RUN_EVENTS
             del cs.run_events[:drop]
@@ -2388,14 +2502,26 @@ class _WsClient:
             self._put({"type": "subscribed", "session_id": session_id,
                        "error": "会话不存在"})
             return
+        # v5.3.1+（问题5）回放策略（日志已按块聚合，见 _publish_event）：
+        # - since_seq<=0：完整回放当前/最近一轮（切走再切回、新开的浏览器）
+        # - since_seq>=run_seq：无需回放（空闲会话续订，消息已全量加载）
+        # - 中间值（断线重连续订等）：游标可能落在聚合块中间，部分回放会
+        #   重复渲染整块 → 通知前端全量重载后再从头回放（resync）
         # 快照与订阅之间无 await：asyncio 单线程下原子，事件不丢不重
-        snapshot = [ev for ev in cs.run_events if ev.get("seq", 0) > since_seq]
+        if since_seq <= 0:
+            snapshot = list(cs.run_events)
+            need_resync = False
+        elif since_seq >= cs.run_seq:
+            snapshot = []
+            need_resync = False
+        else:
+            snapshot = []
+            need_resync = True
         q: asyncio.Queue = asyncio.Queue()
         cs.subscribers.append(q)
         self.session_id = session_id
         self.cs = cs
         self.queue = q
-        need_resync = since_seq < cs.run_min_seq
         self._put({"type": "subscribed", "session_id": session_id,
                    "seq": cs.run_seq, "run_active": cs.run_active,
                    "resync": need_resync})
@@ -2698,6 +2824,10 @@ async def _execute_tool_interruptible(cs: 'WebChatSession', tool_name: str,
     无 interrupt() 方法的工具（python/read/write 等）等待其自然结束
     （通常为快速操作；python 代码执行无法安全杀线程）。
     """
+    # Harness 审计注入：cbhpacks 工具执行前获得 tracer（与 CLI tool_executor.execute 对齐，v5.3.1）
+    _tool = cs.tool_registry.get(tool_name)
+    if _tool is not None and hasattr(_tool, "set_tracer"):
+        _tool.set_tracer(getattr(cs, "tracer", None))
     loop = asyncio.get_event_loop()
     future = loop.run_in_executor(
         None, lambda: cs.tool_registry.execute(tool_name, **tool_args))
@@ -3156,6 +3286,10 @@ async def _react_loop_inner(cs: WebChatSession):
                 cs.app_proxy._chain_event_callback = _chain_event_cb
 
                 # 在后台线程执行下游 Agent（其内部确认经上面的回调路由到 SSE）
+                # Harness 审计注入：cbhpacks 工具执行前获得 tracer（v5.3.1）
+                _chain_tool = cs.tool_registry.get(tool_name)
+                if _chain_tool is not None and hasattr(_chain_tool, "set_tracer"):
+                    _chain_tool.set_tracer(getattr(cs, "tracer", None))
                 _chain_future = asyncio.get_event_loop().run_in_executor(
                     None, lambda: cs.tool_registry.execute(tool_name, **tool_args))
 
@@ -3326,16 +3460,21 @@ async def _react_loop_inner(cs: WebChatSession):
                 if result.error:
                     _int_out += f"\n错误: {result.error}"
                 _int_out = _int_out[:MAX_TOOL_OUTPUT_LENGTH]
-                yield _sse({
+                _int_sse = {
                     "type": "tool_result", "tool_name": tool_name,
                     "tool_id": tool_id, "success": False,
                     "preview": _int_out[:7500],
                     "duration_ms": getattr(result, "duration_ms", 0),
-                })
+                }
+                # 修复(v5.3.1) Bug 10：中断路径同样带 harness_findings（与其他路径一致）
+                if getattr(result, "harness_findings", None):
+                    _int_sse["harness_findings"] = result.harness_findings
+                yield _sse(_int_sse)
                 cs.session.add_message(
                     "tool", _int_out or "命令已被用户中断",
                     tool_call_id=tool_id,
-                    metadata={"tool_name": tool_name, "success": False})
+                    metadata={"tool_name": tool_name, "success": False,
+                              "harness_findings": getattr(result, "harness_findings", None) or None})
                 _fill_aborted_tool_msgs(cs, valid_calls)
                 yield _sse({"type": "aborted"})
                 return
@@ -3382,7 +3521,8 @@ async def _react_loop_inner(cs: WebChatSession):
                     cs.hook_manager.run_post_tool_use,
                     tool_name, tool_args,
                     (result.output or result.error or "")[:4000],
-                    cs.session.id)
+                    cs.session.id,
+                    getattr(result, "harness_findings", None))
                 feedback = decision.merged_output()
                 if feedback:
                     result.output = (result.output or "") + \
@@ -3455,6 +3595,9 @@ async def _react_loop_inner(cs: WebChatSession):
                 "preview": preview,
                 "duration_ms": getattr(result, "duration_ms", 0),
             }
+            # 领域 Harness 检查发现（cbhpacks 工具产出；前端卡片徽标+警告块消费）
+            if getattr(result, "harness_findings", None):
+                sse_data["harness_findings"] = result.harness_findings
             if preview_data:
                 sse_data["preview_data"] = preview_data
             # Web 端：AI 发送给用户的文件/图片（display_files）
@@ -3475,7 +3618,8 @@ async def _react_loop_inner(cs: WebChatSession):
 
             cs.session.add_message(
                 "tool", tool_output, tool_call_id=tool_id,
-                metadata={"tool_name": tool_name, "success": result.success})
+                metadata={"tool_name": tool_name, "success": result.success,
+                          "harness_findings": getattr(result, "harness_findings", None) or None})
 
             # 工具结果携带图片（image 工具直发模式）：延迟到所有 tool 消息之后
             # 统一追加带图用户消息（避免插在 tool 消息之间导致 API 报错）
@@ -3775,6 +3919,9 @@ def _load_session_core(agent_name: str, model_name: str, filename: str):
     if data is None:
         raise HTTPException(404, "会话不存在")
 
+    # v5.3.1+（问题4）：拒绝加载当前工作空间之外（本路径及子路径之外）的会话
+    _check_session_scope(data.get("workspace") or str(_SERVER_ROOT))
+
     key = _get_session_key(agent_name, model_name)
 
     # v5.2.9：同 id 会话仍在内存（含后台运行）-> 直接复用，保留运行状态；
@@ -3850,6 +3997,8 @@ async def chat_load(req: Request):
     if session_id:
         live = _sessions_by_id.get(session_id)
         if live is not None and live.agent_name == agent_name:
+            # v5.3.1+（问题4）：运行中/内存中的会话同样受作用域约束
+            _check_session_scope(getattr(live, "workspace", "") or str(_SERVER_ROOT))
             fname = _find_history_file_by_id(agent_name, session_id)
             # v5.2.9 修复：磁盘无文件（新建会话第一轮运行中，尚未落盘）时，
             # 内存副本是唯一真相来源（不存在外部进程更新磁盘的过期问题），
@@ -3868,7 +4017,8 @@ async def chat_load(req: Request):
                         "model": live.model_name,
                         "workspace": _current_workspace,
                         "run_active": bool(getattr(live, "run_active", False)),
-                        "run_seq": getattr(live, "run_seq", 0)}
+                        "run_seq": getattr(live, "run_seq", 0),
+                        "cli_running": _cli_running(agent_name, live.session.id)}
             if fname:
                 filename = fname  # 副本过期：改走文件加载路径从磁盘重载
 
@@ -3882,6 +4032,15 @@ async def chat_load(req: Request):
             if found:
                 filename = found[0].name
     if not filename:
+        # v5.3.1+（问题6）：会话正由 CLI 运行且尚未落盘（首轮进行中）→
+        # 返回只读跟随占位，前端进入 CLI 跟随视图轮询磁盘文件
+        if session_id and _cli_running(agent_name, session_id):
+            return {"message": "CLI 会话运行中（尚未落盘）",
+                    "session_id": session_id, "messages": [],
+                    "usage": None, "model": model_name,
+                    "workspace": _current_workspace,
+                    "run_active": False, "run_seq": 0,
+                    "cli_running": True}
         raise HTTPException(404, "会话不存在")
 
     cs, data = _load_session_core(agent_name, model_name, filename)
@@ -3901,7 +4060,8 @@ async def chat_load(req: Request):
             "model": cs.model_name,
             "workspace": _current_workspace,
             "run_active": bool(getattr(cs, "run_active", False)),
-            "run_seq": getattr(cs, "run_seq", 0)}
+            "run_seq": getattr(cs, "run_seq", 0),
+            "cli_running": _cli_running(agent_name, cs.session.id)}
 
 
 # ===================================================================
@@ -3914,6 +4074,32 @@ def _is_under(p: Path, root: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _ws_in_scope(ws_path: str) -> bool:
+    """会话工作空间是否属于服务器根目录作用域（v5.3.1+ 第四轮修订）。
+
+    作用域基准是【服务启动目录（_SERVER_ROOT）】而非当前工作空间：
+    侧边栏始终展示启动目录下全部子目录的会话，选择某个子文件夹作为
+    工作空间后，主文件夹与其他兄弟文件夹的会话保持可见（用户要求）。
+    空 workspace（旧版/CLI 早期保存）按服务器根目录归属。
+    """
+    try:
+        p = Path(ws_path or str(_SERVER_ROOT)).resolve()
+    except Exception:
+        return False
+    return p == _SERVER_ROOT or _is_under(p, _SERVER_ROOT)
+
+
+def _check_session_scope(workspace: str) -> None:
+    """加载会话前的作用域校验：不属于服务启动目录（含子路径）则拒绝。
+
+    与"选择该文件夹"的 403 行为保持一致--不能通过点击会话条目跳转到
+    服务目录之外的会话（v5.3.1+ 问题4）。
+    """
+    if not _ws_in_scope(workspace):
+        raise HTTPException(
+            403, "该会话不属于本服务目录（仅可打开服务启动目录及其子路径下的会话）")
 
 
 def _ws_display_name(path: str) -> str:
@@ -3929,7 +4115,16 @@ def _ws_display_name(path: str) -> str:
 
 @app.get("/api/workspace/info")
 def workspace_info(agent_name: str):
-    """工作空间列表：按工作空间目录分组，组内为该目录下的会话（含活跃会话）。"""
+    """工作空间列表：按工作空间目录分组，组内为该目录下的会话（含活跃会话）。
+
+    v5.3.1+（问题1/4/6）：
+    - **作用域过滤**：只返回当前工作空间【本路径及子路径】下的会话，
+      其他目录的会话不再显示（更不能被点击跳转）
+    - 每个会话携带 **消息数** 和 **最后对话时间**（updated_at，
+      活跃会话取最近活动时间），侧边栏按最后对话时间倒序
+    - CLI 正在运行的会话（/api/cli_notify 上报）标记 running+cli
+    """
+    import time as _time
     history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
     saved = history_mgr.list_sessions(limit=500)
 
@@ -3949,53 +4144,93 @@ def workspace_info(agent_name: str):
     for cs in list(_sessions_by_id.values()):
         if cs.agent_name != agent_name or not cs.session:
             continue
+        cs_ws = getattr(cs, "workspace", "") or str(_SERVER_ROOT)
+        if not _ws_in_scope(cs_ws):
+            continue  # 当前工作空间之外（本路径及子路径之外）的会话不显示
         has_content = len(cs.session.messages) > 1
         running = bool(getattr(cs, "run_active", False))
         is_default = id(cs) in default_cs_ids
         if not has_content and not running and not is_default:
             continue
         seen_ids.add(cs.session.id)
-        group_of(getattr(cs, "workspace", "") or "")["sessions"].append({
+        # 最后对话时间：运行中=现在；否则取最近活动时间（加载/运行/保存时刷新）
+        last_ts = float(getattr(cs, "last_active_ts", 0) or 0)
+        if running:
+            updated = datetime.now().isoformat()
+        elif last_ts > 0:
+            updated = datetime.fromtimestamp(last_ts).isoformat()
+        else:
+            updated = cs.session.created_at.isoformat()
+        entry = {
             "filename": "", "id": cs.session.id, "title": _session_title(cs),
             "created_at": cs.session.created_at.isoformat(),
+            "updated_at": updated,
             "message_count": len(cs.session.messages),
-            "workspace": getattr(cs, "workspace", "") or str(_SERVER_ROOT),
+            "workspace": cs_ws,
             "model": cs.model_name, "active": True, "running": running,
-        })
+        }
+        # v5.3.1+（问题6）：内存会话同样标记 CLI 运行状态（跟随视图中保持徽标）
+        if _cli_running(agent_name, cs.session.id):
+            entry["running"] = True
+            entry["cli"] = True
+        group_of(cs_ws)["sessions"].append(entry)
 
     # 历史会话（与活跃会话同 id 的跳过，活跃条目更新）
     for s in saved:
         if s.get("id") in seen_ids:
             continue
+        s_ws = s.get("workspace", "") or str(_SERVER_ROOT)
+        if not _ws_in_scope(s_ws):
+            continue  # 作用域外的历史会话不显示（v5.3.1+ 问题4）
         entry = dict(s)
         entry["active"] = False
         entry["running"] = False
-        group_of(s.get("workspace", "") or "")["sessions"].append(entry)
+        # CLI 正在运行的会话：显示"CLI 运行中"徽标（问题6）
+        if _cli_running(agent_name, s.get("id", "")):
+            entry["running"] = True
+            entry["cli"] = True
+        group_of(s_ws)["sessions"].append(entry)
 
-    # 确保当前工作空间 + 历史打开过的工作空间始终在列表中
-    # （打开过的工作空间常驻侧边栏，不因切换到新工作空间而消失）
-    opened = [p for p in _load_opened_workspaces() if Path(p).is_dir()]
+    # v5.3.1+（问题6）：CLI 运行中但尚未落盘的会话（首轮进行中，
+    # autosave 在轮末才写文件）也要进侧边栏，从通知注册表补条目
+    for (ag, sid), rec in list(_cli_sessions.items()):
+        if ag != agent_name or sid in seen_ids:
+            continue
+        if rec.get("status") != "running":
+            continue
+        if _time.time() - float(rec.get("ts", 0)) > _CLI_RUNNING_TTL:
+            continue
+        if _find_history_file_by_id(agent_name, sid):
+            continue  # 已有历史文件，上面历史列表已展示
+        rec_ws = rec.get("workspace") or str(_SERVER_ROOT)
+        if not _ws_in_scope(rec_ws):
+            continue
+        seen_ids.add(sid)
+        ts_iso = datetime.fromtimestamp(float(rec.get("ts", 0))).isoformat()
+        group_of(rec_ws)["sessions"].append({
+            "filename": "", "id": sid,
+            "title": rec.get("title") or "CLI 会话",
+            "created_at": ts_iso, "updated_at": ts_iso,
+            "message_count": 0, "workspace": rec_ws,
+            "active": False, "running": True, "cli": True,
+        })
+
+    # 当前工作空间组始终展示（即使暂无会话）；作用域内的打开记录保持顺序
     group_of(_current_workspace)
-    for p in opened:
-        group_of(p)
 
-    # 组内按时间倒序
+    # 组内按最后对话时间倒序（updated_at 缺失时回落 created_at）
     for g in groups.values():
-        g["sessions"].sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        g["sessions"].sort(
+            key=lambda x: x.get("updated_at") or x.get("created_at") or "",
+            reverse=True)
 
-    # 排序：当前工作空间优先 → 按最近打开顺序 → 仅历史会话出现的按最新会话倒序
+    # 排序：当前工作空间优先，其余按最新会话时间倒序
     cur = [g for g in groups.values() if g["path"] == _current_workspace]
-    seen = {g["path"] for g in cur}
-    opened_rest = []
-    for p in opened:
-        g = groups.get(p)
-        if g and p not in seen:
-            opened_rest.append(g)
-            seen.add(p)
-    hist_rest = [g for g in groups.values() if g["path"] not in seen]
-    hist_rest.sort(key=lambda g: (g["sessions"][0]["created_at"]
-                                  if g["sessions"] else ""), reverse=True)
-    workspaces = cur + opened_rest + hist_rest
+    rest = [g for g in groups.values() if g["path"] != _current_workspace]
+    rest.sort(key=lambda g: ((g["sessions"][0].get("updated_at")
+                              or g["sessions"][0].get("created_at") or "")
+                             if g["sessions"] else ""), reverse=True)
+    workspaces = cur + rest
 
     return {"server_root": str(_SERVER_ROOT),
             "current": _current_workspace,
@@ -4050,6 +4285,7 @@ async def workspace_open(req: Request):
     model_out = None
     run_active_out = False
     run_seq_out = 0
+    cli_running_out = False
     if body.get("resume"):
         history_mgr = SessionHistoryManager(_get_agent_workspace(agent_name))
         latest = None
@@ -4065,12 +4301,24 @@ async def workspace_open(req: Request):
             model_out = cs.model_name
             run_active_out = bool(getattr(cs, "run_active", False))
             run_seq_out = getattr(cs, "run_seq", 0)
+            cli_running_out = _cli_running(agent_name, session_out)
+        else:
+            # v5.3.1+：该目录下有 CLI 运行中但尚未落盘的会话 → 跟随占位
+            for (ag, sid), rec in _cli_sessions.items():
+                if ag != agent_name or rec.get("status") != "running":
+                    continue
+                if (rec.get("workspace") or "") != str(target):
+                    continue
+                session_out = sid
+                cli_running_out = True
+                break
 
     return {"message": f"已打开工作空间: {_ws_display_name(str(target))}",
             "workspace": _current_workspace,
             "messages": messages_out, "usage": usage_out,
             "session_id": session_out, "model": model_out,
-            "run_active": run_active_out, "run_seq": run_seq_out}
+            "run_active": run_active_out, "run_seq": run_seq_out,
+            "cli_running": cli_running_out}
 
 
 @app.post("/api/workspace/sessions/clear")
@@ -4100,13 +4348,149 @@ async def workspace_sessions_clear(req: Request):
             "removed": removed, "was_active": was_active}
 
 
+# ===================================================================
+#  CLI 会话实时同步（v5.3.1+ 问题6）
+#  CLI 进程对话时上报状态，Web 侧边栏显示"CLI 运行中"；打开此类会话
+#  进入只读跟随视图（轮询磁盘文件，轮级实时刷新消息）
+# ===================================================================
+
+class CliNotifyRequest(BaseModel):
+    agent_name: str
+    session_id: str
+    status: str = "idle"          # running | idle
+    workspace: str = ""
+    title: str = ""
+
+
+@app.post("/api/cli_notify")
+async def cli_notify(req: CliNotifyRequest):
+    """CLI 进程上报会话运行状态（开始/心跳/结束）。"""
+    import time as _time
+    if not req.agent_name or not req.session_id:
+        raise HTTPException(400, "缺少 agent_name / session_id")
+    _cli_sessions[(req.agent_name, req.session_id)] = {
+        "status": "running" if req.status == "running" else "idle",
+        "workspace": req.workspace or "",
+        "title": req.title or "",
+        "ts": _time.time(),
+    }
+    # 过期条目清理（防 CLI 崩溃残留）
+    for k in [k for k, v in list(_cli_sessions.items())
+              if _time.time() - float(v.get("ts", 0)) > _CLI_RUNNING_TTL * 2]:
+        _cli_sessions.pop(k, None)
+    _broadcast_global({"type": "sessions_changed"})
+    return {"ok": True}
+
+
+def _export_raw_messages(messages: list[dict]) -> list[dict]:
+    """把磁盘会话文件的原始消息（API 格式）转为前端可恢复的展示结构。
+
+    与 WebChatSession.export_messages 输出一致（user/assistant 聚合 tool
+    结果），供 CLI 会话只读跟随视图使用（CLI 会话不在 Web 内存中）。
+    """
+    import re as _re
+    result = []
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content", "") or ""
+        if role == "system":
+            continue
+        if role == "user":
+            image_urls = []
+            file_attachments = []
+            for match in _re.finditer(r'\[图片: (.+?)\]', content):
+                fname = match.group(1).strip()
+                image_urls.append(f"/api/files/serve/{fname}")
+            for match in _re.finditer(r'\[文件: (.+?) \((.+?)\)\]', content):
+                fname = match.group(1).strip()
+                fpath = match.group(2).strip()
+                upload_dir = CBHCLI_DIR / "web_uploads"
+                rel = str(Path(fpath)).replace(str(upload_dir) + "/", "")
+                rel = rel.replace(str(upload_dir) + "\\", "")
+                if rel == str(Path(fpath)):
+                    rel = Path(fpath).name
+                file_attachments.append({
+                    "filename": fname,
+                    "download_url": f"/api/files/download/{rel}",
+                    "path": fpath,
+                })
+            result.append({
+                "role": "user",
+                "content": content,
+                "image_count": 0,
+                "image_urls": image_urls,
+                "file_attachments": file_attachments,
+            })
+        elif role == "assistant":
+            tool_calls = []
+            for tc in m.get("tool_calls") or []:
+                func = tc.get("function", {})
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                    args = _fix_unicode_escapes(args)
+                except Exception:
+                    args = {}
+                tool_calls.append({
+                    "id": tc.get("id", ""),
+                    "name": func.get("name", ""),
+                    "arguments": args,
+                    "result": None,
+                    "success": None,
+                })
+            result.append({
+                "role": "assistant",
+                "content": content,
+                "reasoning": m.get("reasoning_content") or "",
+                "tool_calls": tool_calls,
+            })
+        elif role == "tool":
+            tcid = m.get("tool_call_id") or ""
+            for item in reversed(result):
+                if item["role"] != "assistant":
+                    continue
+                for tc in item["tool_calls"]:
+                    if tc["id"] == tcid:
+                        tc["result"] = content[:2000]
+                        break
+                break
+    return result
+
+
+@app.get("/api/cli_session/poll")
+def cli_session_poll(agent_name: str, session_id: str):
+    """轮询 CLI 会话的最新内容（直读磁盘文件，绕开 Web 内存会话）。
+
+    CLI 每轮结束自动落盘，此端点返回文件内全部消息 + CLI 是否仍在运行。
+    前端只读跟随视图每 3 秒轮询一次，实现"轮级"实时同步。
+    """
+    if not agent_name or not session_id \
+            or any(c in session_id for c in "*?[]"):
+        raise HTTPException(400, "缺少 agent_name / session_id")
+    filename = _find_history_file_by_id(agent_name, session_id)
+    if not filename:
+        raise HTTPException(404, "会话不存在")
+    data = SessionHistoryManager(
+        _get_agent_workspace(agent_name)).load_session_full(filename)
+    if data is None:
+        raise HTTPException(404, "会话不存在")
+    return {"session_id": session_id,
+            "title": data.get("title", ""),
+            "updated_at": data.get("updated_at") or data.get("created_at", ""),
+            "cli_running": _cli_running(agent_name, session_id),
+            "messages": _export_raw_messages(data.get("messages", []))}
+
+
 @app.get("/api/files/list")
 def files_list(path: str = ""):
-    """文件管理器：列出目录下的文件和文件夹（v5.2.8，限定当前工作空间内）。"""
-    ws = Path(_current_workspace).resolve()
+    """文件管理器：列出目录下的文件和文件夹。
+
+    v5.3.1+ 第四轮：浏览范围限定【服务启动目录】（与侧边栏同逻辑）--
+    选择子文件夹作为工作空间后仍可浏览主目录及兄弟文件夹，不缩窄。
+    """
+    ws = _SERVER_ROOT
     base = Path(path).resolve() if path else ws
     if not (base == ws or _is_under(base, ws)):
-        raise HTTPException(403, "只能浏览当前工作空间内的文件")
+        raise HTTPException(403, "只能浏览服务启动目录下的文件")
     if not base.is_dir():
         raise HTTPException(404, "目录不存在")
     try:
@@ -4127,7 +4511,8 @@ def files_list(path: str = ""):
             })
         except Exception:
             continue
-    return {"path": str(base), "workspace": str(ws), "entries": entries}
+    return {"path": str(base), "workspace": str(ws),
+            "current_workspace": _current_workspace, "entries": entries}
 
 
 def _find_live_session(agent_name: str, session_id: str):
@@ -4443,6 +4828,11 @@ def run_server(port: int = 18888, host: str = "0.0.0.0"):
     import uvicorn
 
     setup_static()
+
+    # CLI 会话同步（v5.3.1+）：注册本实例供 CLI 进程发现并推送运行状态
+    _register_web_server(port)
+    import atexit
+    atexit.register(_unregister_web_server, port)
 
     from cbhcli_pkg import __version__
     print(f"CBHCLI Web v{__version__}")

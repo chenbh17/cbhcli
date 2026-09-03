@@ -321,7 +321,7 @@ max_iter：默认100，算法求解最大迭代次数，默认是100。
         print(f"ROCAUC————test:{auc_score:.4f}，train:{auc_score_train:.4f}，all:{auc_score_all:.4f}")
         confusion_matrix=pd.DataFrame([['test',accuracy,precision,recall,f1,auc_score,ks]
                                       ,['train',accuracy_train,precision_train,recall_train,f1_train,auc_score_train,ks_train]
-                                      ,['all',accuracy_all,precision_all,recall_all,f1,auc_score_all,ks_all]]
+                                      ,['all',accuracy_all,precision_all,recall_all,f1_all,auc_score_all,ks_all]]  # 修复: all行F1误用test的f1
                                       ,columns=['type','accuracy','precision','recall','F1','auc','ks'])
         confusion_matrix.to_excel(self.model_path+'/confusion_matrix_'+self.model_type+'_'+self.adj+'.xlsx',index=None)
         

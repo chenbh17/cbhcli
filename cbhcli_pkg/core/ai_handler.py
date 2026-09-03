@@ -747,7 +747,12 @@ class AIHandler:
                     token_count=self.token_counter.count_tokens(output),
                     tool_call_id=tc["id"]
                 )
-                tool_msg.metadata = {"tool_name": tc["tool"], "success": getattr(result, 'success', False)}
+                # 修复(v5.3.1) Bug 7：metadata 补 harness_findings（与 Web 端一致）——
+                # 否则 CLI 会话在 Web /resume 时历史 tool 卡片的警告徽标丢失
+                tool_msg.metadata = {
+                    "tool_name": tc["tool"], "success": getattr(result, 'success', False),
+                    "harness_findings": getattr(result, "harness_findings", None) or None,
+                }
                 self.session.messages.append(tool_msg)
 
                 # 工具结果携带图片（image 工具直发模式）：延迟到所有 tool 消息之后

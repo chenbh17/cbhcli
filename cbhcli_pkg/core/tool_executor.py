@@ -114,6 +114,10 @@ class ToolExecutor:
                 arguments.get("allow_multiple", False),
             )
             return ToolResult(success=True, output=f"用户回答: {answer}")
+        # Harness 审计注入：支持审计钩子的工具（如 cbhpacks_*）执行前获得 tracer
+        tool = self.tool_registry.get(tool_name)
+        if tool is not None and hasattr(tool, "set_tracer"):
+            tool.set_tracer(self.tracer)
         return self.tool_registry.execute(tool_name, **arguments)
 
     # 自带显示的工具（跳过 executor 的头部和结果显示）
@@ -239,12 +243,13 @@ class ToolExecutor:
                 result = self.execute(tool_name, arguments)
             result.duration_ms = int((time.monotonic() - start) * 1000)
 
-            # ⑥ PostToolUse 钩子（反馈追加给模型）
+            # ⑥ PostToolUse 钩子（反馈追加给模型；harness_findings 供用户钩子消费）
             if self.hook_manager and self.hook_manager.has_hooks("PostToolUse"):
                 decision = self.hook_manager.run_post_tool_use(
                     tool_name, arguments,
                     result.output or result.error or "",
-                    session_id=self.session_id
+                    session_id=self.session_id,
+                    harness_findings=getattr(result, "harness_findings", None),
                 )
                 for warn in decision.warnings:
                     print(f"{C_YELLOW}   ⚠️ 钩子: {warn}{C_RESET}")
@@ -760,14 +765,57 @@ class ToolExecutor:
 
         return True
 
+    def _display_harness(self, result: ToolResult):
+        """醒目显示 Harness 检查发现（独立于输出预览截断，用户必然可见）
+
+        v5.3.1: cbhpacks 工具的领域护栏警告追加在 output 末尾，
+        非 verbose 模式预览仅显示前 12 行必然被截掉——故单独渲染警告横幅。
+        """
+        findings = getattr(result, "harness_findings", None) or []
+        if not findings:
+            return
+        blocks = [f for f in findings if f.get("level") == "BLOCK"]
+        warns = [f for f in findings if f.get("level") == "WARN"]
+        infos = [f for f in findings if f.get("level") == "INFO"]
+        if not (blocks or warns):
+            return  # 纯 INFO 不出横幅（避免噪音），随输出文本可见
+        width = _separator_width()
+        # 修复(v5.3.1) Bug 15：顶线宽度按标题实际显示宽度动态计算（emoji 在不同
+        # 终端宽度 1/2 不定，写死 26 会导致顶线与底线差 1-2 列）
+        from cbhcli_pkg.core.text_width import display_width as _dw
+        if blocks:
+            title = f"┌─ 🔴 Harness 拦截: {len(blocks)} 项 "
+            print(f"{C_ERROR}  {title}{'─' * max(4, width - 2 - _dw(title))}{C_RESET}")
+            color = C_ERROR
+        else:
+            title = f"┌─ ⚠️ Harness 警告: {len(warns)} 项 "
+            print(f"{C_YELLOW}  {title}{'─' * max(4, width - 2 - _dw(title))}{C_RESET}")
+            color = C_YELLOW
+        shown = blocks + warns
+        for f in shown[:8]:
+            icon = "🔴" if f.get("level") == "BLOCK" else "🟡"
+            msg = f.get("message", "")[:160]
+            print(f"{color}  │ {icon} [{f.get('code', '?')}] {msg}{C_RESET}")
+            fix = f.get("fix", "")
+            if fix:
+                print(f"{color}  │     → {fix[:120]}{C_RESET}")
+        if len(shown) > 8:
+            print(f"{color}  │ … 共 {len(shown)} 项{C_RESET}")
+        print(f"{color}  └─{'─' * width}{C_RESET}")
+
     def _display_result(self, result: ToolResult):
         """显示执行结果（✓/✗ 状态行 + 耗时 + ⎿ 树形结果）"""
         duration = getattr(result, "duration_ms", 0)
         duration_str = f" {C_DIM}· {duration / 1000:.1f}s{C_RESET}" \
             if duration >= 100 else ""
 
+        # Harness 警告计数（状态行直接示警，用户第一眼可见）
+        hf = getattr(result, "harness_findings", None) or []
+        hf_warns = sum(1 for f in hf if f.get("level") in ("WARN", "BLOCK"))
+        harness_flag = f" {C_YELLOW}⚠️ harness {hf_warns} 项警告{C_RESET}" if hf_warns else ""
+
         if result.success:
-            print(f"{C_TOOL_GREEN}  ● 完成{C_RESET}{duration_str}")
+            print(f"{C_TOOL_GREEN}  ● 完成{C_RESET}{duration_str}{harness_flag}")
             # 优先使用 display_output，否则使用 output
             display = result.display_output if result.display_output is not None else result.output
             output = display[:MAX_TOOL_OUTPUT_LENGTH] if display else ""
@@ -799,6 +847,9 @@ class ToolExecutor:
                 print(f"{C_ERROR}{prefix}{line}{C_RESET}")
             if len(err_lines) > 8:
                 print(f"{C_DIM}     … 共 {len(err_lines)} 行{C_RESET}")
+
+        # Harness 警告横幅（独立于上面的预览截断，必然可见）
+        self._display_harness(result)
 
         print(f"{C_SEP}{'─' * _separator_width()}{C_RESET}")
 
