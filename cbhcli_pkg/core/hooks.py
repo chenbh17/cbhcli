@@ -143,7 +143,7 @@ class HookManager:
 
     def run(self, event: str, tool_name: str = "",
             arguments: Optional[dict] = None, result: str = "",
-            session_id: str = "") -> HookDecision:
+            session_id: str = "", harness_findings: Optional[list] = None) -> HookDecision:
         """执行某事件匹配的所有钩子，返回汇总决策
 
         任何钩子异常/超时都不会中断主流程，仅记录警告。
@@ -168,6 +168,9 @@ class HookManager:
             "cwd": os.getcwd(),
             "session_id": session_id,
         }
+        # 领域 Harness 检查发现（cbhpacks 工具产出；其他工具无此字段）
+        if harness_findings:
+            payload["harness_findings"] = harness_findings
 
         env = os.environ.copy()
         env.update({
@@ -176,6 +179,10 @@ class HookManager:
             "CBHCLI_AGENT": self.agent_name,
             "CBHCLI_SESSION_ID": session_id,
         })
+        if harness_findings:
+            n_warn = sum(1 for f in harness_findings
+                         if f.get("level") in ("WARN", "BLOCK"))
+            env["CBHCLI_HARNESS_WARNS"] = str(n_warn)
 
         for entry in entries:
             try:
@@ -218,9 +225,17 @@ class HookManager:
         return self.run("PreToolUse", tool_name, arguments, session_id=session_id)
 
     def run_post_tool_use(self, tool_name: str, arguments: dict,
-                          result: str, session_id: str = "") -> HookDecision:
-        return self.run("PostToolUse", tool_name, arguments, result,
-                        session_id=session_id)
+                          result: str, session_id: str = "",
+                          harness_findings: Optional[list] = None) -> HookDecision:
+        """PostToolUse 事件（result 后追加 harness_findings 供用户钩子消费）
+
+        harness_findings: [{level, code, message, fix}]（cbhpacks 领域护栏产出，可为 None）。
+        用户钩子脚本可从 stdin JSON 的 harness_findings 字段读取，做通知/落盘/外部系统对接。
+        """
+        decision = self.run("PostToolUse", tool_name, arguments, result,
+                            session_id=session_id,
+                            harness_findings=harness_findings)
+        return decision
 
     def run_simple(self, event: str, session_id: str = "",
                    extra_args: Optional[dict] = None) -> HookDecision:

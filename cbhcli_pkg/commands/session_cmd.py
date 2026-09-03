@@ -37,10 +37,10 @@ def register_session_commands(parser, app):
         """列出或恢复历史会话（交互式选择）"""
         if not app.current_agent_name:
             return "❌ 请先选择Agent"
-        
+
         if not app.session_history:
             return "❌ 会话历史管理器未初始化"
-        
+
         sessions = app.session_history.list_sessions(50)
         if not sessions:
             return "📭 暂无历史会话"
@@ -48,9 +48,13 @@ def register_session_commands(parser, app):
         # 如果提供了参数，直接用参数选择
         choice = args.strip()
 
+        def _is_group_ref(s: str) -> bool:
+            """D1/D2 形式的目录编号（用于排除关键词搜索分支）"""
+            return bool(s) and s[0] in "dD" and s[1:].isdigit()
+
         # 关键词搜索：参数非编号且非已有文件名时，按标题过滤全部历史
         # （历史会话很多时，旧会话超出默认列表窗口，可用关键词找回）
-        if choice and not choice.isdigit() \
+        if choice and not choice.isdigit() and not _is_group_ref(choice) \
                 and app.session_history.load_session(choice) is None:
             kw = choice.lower()
             matched = [s for s in app.session_history.list_sessions(500)
@@ -60,47 +64,99 @@ def register_session_commands(parser, app):
             sessions = matched[:50]
             choice = ""  # 展示匹配列表，重新选择
 
+        # ---- v5.3.1+ 第四轮：按工作目录层级分组（会话与目录编号同页显示）----
+        import os as _os
+        _cwd = _os.getcwd()
+        _home = _os.path.expanduser("~")
+
+        def _under_cwd(ws: str) -> bool:
+            return bool(ws) and (
+                ws == _cwd or ws.startswith(_cwd.rstrip("/") + "/"))
+
+        # 按工作目录分组（组内按最后对话时间倒序）
+        _groups = {}
+        for s in sessions:
+            _groups.setdefault(s.get("workspace") or "", []).append(s)
+        for ss in _groups.values():
+            ss.sort(key=lambda x: (x.get("updated_at") or x.get("created_at") or ""),
+                   reverse=True)
+
+        _group_list = []  # (优先级, 组最新时间, 目录, 会话列表)
+        for ws, ss in _groups.items():
+            latest = max((x.get("updated_at") or x.get("created_at") or "")
+                         for x in ss)
+            pri = 2 if not ws else (0 if _under_cwd(ws) else 1)
+            _group_list.append((pri, latest, ws, ss))
+        # 先按组最新时间倒序，再稳定排序让当前目录组置顶、历史组垫底
+        _group_list.sort(key=lambda t: t[1], reverse=True)
+        _group_list.sort(key=lambda t: t[0])
+        _ordered = [s for _, _, _, ss in _group_list for s in ss]
+
         if not choice:
-            # 无参数时显示交互式选择菜单
-            lines = ["📋 选择要恢复的会话 (输入编号或文件名):\n"]
-            for i, s in enumerate(sessions, 1):
-                created = s.get("created_at", "")[:16].replace("T", " ")
-                title = s.get("title", "")[:40]
-                count = s.get("message_count", 0)
-                lines.append(f"  {i:2d}. [{created}] {title} ({count} 条消息)")
+            # 无参数时显示交互式层级选择菜单
+            lines = ["📋 选择要恢复的会话 (输入会话编号；D+目录编号恢复该目录最新会话):\n"]
+            num = 0
+            for gi, (pri, latest, ws, ss) in enumerate(_group_list, 1):
+                if ws:
+                    disp = ws
+                    if disp.startswith(_home):
+                        disp = "~" + disp[len(_home):]
+                    mark = " 📍" if ws == _cwd else ""
+                    lines.append(f"  [D{gi}] 📂 {disp}{mark}  ({len(ss)} 个会话)")
+                else:
+                    lines.append(f"  [D{gi}] 🗂 历史（未记录工作目录）  ({len(ss)} 个会话)")
+                for s in ss:
+                    num += 1
+                    updated = (s.get("updated_at")
+                               or s.get("created_at", ""))[:16].replace("T", " ")
+                    title = s.get("title", "")[:40]
+                    count = s.get("message_count", 0)
+                    lines.append(f"      {num:2d}. [{updated}] {title} ({count} 条消息)")
             lines.append(f"\n   0. 取消")
-            lines.append("   提示: /resume <关键词> 可按标题搜索更多历史会话")
+            lines.append("   提示: /resume <关键词> 按标题搜索；D编号恢复目录最新会话；📍=当前目录")
             lines.append("")
 
             print("\n" + "\n".join(lines))
-            choice = ask_text("请选择 [编号/文件名]: ").strip()
+            choice = ask_text("请选择 [会话编号/D目录编号/文件名]: ").strip()
 
             if not choice or choice == '0':
                 return "已取消"
-        
-        # 解析用户选择
-        filename = choice
-        messages = app.session_history.load_session(filename)
-        if messages is None:
-            # 尝试用数字索引查找
-            try:
-                idx = int(filename) - 1
-                if 0 <= idx < len(sessions):
-                    filename = sessions[idx]["filename"]
-                    messages = app.session_history.load_session(filename)
-                else:
-                    return f"❌ 无效的会话编号: {choice}"
-            except ValueError:
-                return f"❌ 找不到会话文件: {filename}"
-        
+
+        # 解析用户选择：D目录编号 → 恢复该目录下最新会话
+        if _is_group_ref(choice):
+            gi = int(choice[1:]) - 1
+            if not (0 <= gi < len(_group_list)):
+                return f"❌ 无效的目录编号: {choice}"
+            target = _group_list[gi][3][0]  # 组内时间倒序第一条=最新
+            filename = target["filename"]
+            messages = app.session_history.load_session(filename)
+            if messages is None:
+                return f"❌ 加载会话失败: {filename}"
+        else:
+            filename = choice
+            messages = app.session_history.load_session(filename)
+            if messages is None:
+                # 尝试用数字索引查找（按分组展示顺序编号）
+                try:
+                    idx = int(filename) - 1
+                    if 0 <= idx < len(_ordered):
+                        filename = _ordered[idx]["filename"]
+                        messages = app.session_history.load_session(filename)
+                    else:
+                        return f"❌ 无效的会话编号: {choice}"
+                except ValueError:
+                    return f"❌ 找不到会话文件: {filename}"
+
         if messages is None:
             return f"❌ 加载会话失败: {filename}"
         
         # 保存当前会话到 history
         if app.session and len(app.session.messages) > 1:
             try:
+                import os as _os
                 ctx_msgs = app.session.get_context_messages()
-                app.session_history.save_session(ctx_msgs, app.session.id)
+                app.session_history.save_session(
+                    ctx_msgs, app.session.id, workspace=_os.getcwd())
             except Exception:
                 pass
         

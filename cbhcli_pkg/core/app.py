@@ -1,6 +1,7 @@
 """主应用 - CBHCLIApp"""
 import os
 import json
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +57,7 @@ from cbhcli_pkg.tools.cbhpacks_preprocess import ColsOperateTool, DescDfTool, De
 from cbhcli_pkg.tools.cbhpacks_sql import ConSqlTool
 from cbhcli_pkg.tools.cbhpacks_linux import ConLinuxTool
 from cbhcli_pkg.tools.cbhpacks_data import GetRandomDataTool
+from cbhcli_pkg.tools.cbhpacks_harness import CbhpacksHarnessTool
 
 from cbhcli_pkg.context.token_counter import get_token_counter
 from cbhcli_pkg.context.compressor import ContextCompressor
@@ -354,6 +356,8 @@ class CBHCLIApp:
         self.tool_registry.register(ConSqlTool())
         self.tool_registry.register(ConLinuxTool())
         self.tool_registry.register(GetRandomDataTool())
+        # cbhpacks 建模护栏校验工具（默认关闭，/tools on 开启）
+        self.tool_registry.register(CbhpacksHarnessTool())
 
         # QQ Bot 服务和工具
         self.qqbot_service = QQBotService()
@@ -469,9 +473,15 @@ class CBHCLIApp:
     
     def _init_agent(self):
         """初始化Agent"""
-        # 确保存在main agent（不触发索引）
-        if not self.agent_manager.load_agent("main"):
-            self.agent_manager.create_agent("main", "主默认Agent")
+        # 确保内置 Agent 存在（main/cbhpacks，幂等，不触发索引；v5.3.1）
+        # 创建失败不阻止启动（磁盘异常等场景 main 缺失时下方 _load_agent 会自然降级）
+        created = []
+        try:
+            created = self.agent_manager.ensure_builtin_agents()
+        except Exception:
+            pass
+        # main 首次创建时才设置默认激活（默认 Agent 始终为 main）
+        if "main" in created:
             self.global_config.set_active_agent("main")
         
         # 加载当前Agent
@@ -651,7 +661,10 @@ class CBHCLIApp:
         if save_current and self.session and len(self.session.messages) > 1:
             try:
                 ctx_msgs = self.session.get_context_messages()
-                self.session_history.save_session(ctx_msgs, self.session.id)
+                # v5.3.1+（问题7）：记录会话工作空间（当前目录），
+                # Web 侧边栏按工作空间分类展示
+                self.session_history.save_session(
+                    ctx_msgs, self.session.id, workspace=os.getcwd())
             except Exception:
                 pass
         
@@ -1176,7 +1189,8 @@ class CBHCLIApp:
                     if self.session and self.session_history and len(self.session.messages) > 1:
                         try:
                             ctx_msgs = self.session.get_context_messages()
-                            self.session_history.save_session(ctx_msgs, self.session.id)
+                            self.session_history.save_session(
+                                ctx_msgs, self.session.id, workspace=os.getcwd())
                         except Exception:
                             pass
                     print("\n再见!")
@@ -1219,8 +1233,10 @@ class CBHCLIApp:
         try:
             if getattr(self, "session", None) and getattr(self, "session_history", None) \
                     and len(self.session.messages) > 1:
+                # v5.3.1+（问题7）：记录工作空间（当前目录），供 Web 按路径分类
                 self.session_history.save_session(
-                    self.session.get_context_messages(), self.session.id)
+                    self.session.get_context_messages(), self.session.id,
+                    workspace=os.getcwd())
         except Exception:
             pass  # 保存失败不影响对话
 
@@ -1270,6 +1286,24 @@ class CBHCLIApp:
         # 设置记忆更新回调
         handler.on_memory_update(self._update_memory)
 
+        # v5.3.1+（问题6）：通知 Web 侧"该 CLI 会话运行中"，并按 30s 心跳
+        # 保活，结束时发 idle。全部静默失败，不影响对话。
+        from cbhcli_pkg.core import web_notify
+        _hb_stop = threading.Event()
+        _agent = self.current_agent_name or "main"
+        _sid = self.session.id if self.session else ""
+        if _sid:
+            web_notify.notify_web_async(
+                _agent, _sid, "running", workspace=os.getcwd(),
+                title=(web_notify.session_title_of(self.session)
+                       or user_input[:50]))
+
+            def _heartbeat():
+                while not _hb_stop.wait(30):
+                    web_notify.notify_web(_agent, _sid, "running",
+                                          workspace=os.getcwd())
+            threading.Thread(target=_heartbeat, daemon=True).start()
+
         try:
             # 处理请求
             handler.process_request(user_input)
@@ -1287,6 +1321,13 @@ class CBHCLIApp:
             # 每轮对话结束自动保存（v5.2.6）：正常/中断/异常出口统一落盘，
             # 应用崩溃或被 kill 时最多丢失正在生成的当前轮
             self._autosave_session()
+            # v5.3.1+：通知 Web 本轮结束（停止心跳 + idle）。
+            # 必须【同步】发送：exec/quit 等场景进程随即退出，
+            # 守护线程会被杀死导致 idle 通知丢失、徽标卡在"运行中"
+            _hb_stop.set()
+            if _sid:
+                web_notify.notify_web(_agent, _sid, "idle",
+                                      workspace=os.getcwd())
     
     def _update_memory(self, user_input: str, ai_response: str):
         """更新记忆回调 - 仅用于保存会话历史

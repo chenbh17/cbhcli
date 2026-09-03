@@ -199,16 +199,23 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 .ws-sessions { padding: 2px 0 4px 14px; }
 .ws-session {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 8px 6px 12px;
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px 5px 12px;
   border-radius: var(--radius-sm);
   cursor: pointer; color: var(--text-1); font-size: 12.5px;
 }
 .ws-session:hover { background: var(--bg-hover); color: var(--text-0); }
 .ws-session.active { background: var(--accent-dim); color: var(--accent-hover); }
+/* v5.3.1+（问题1）：双行布局——标题/徽标 + 消息数/最后对话时间 */
+.ws-session-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ws-session-row1 { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ws-session-row2 { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .ws-session-title {
   flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ws-session-count {
+  color: var(--text-dim); font-size: 10px; flex-shrink: 0; white-space: nowrap;
 }
 .ws-session-time {
   color: var(--text-dim); font-size: 10px; flex-shrink: 0;
@@ -225,7 +232,12 @@ body.resizing { cursor: col-resize; user-select: none; }
   animation: pulse 1.6s ease-in-out infinite;
   white-space: nowrap;
 }
-/* 悬停显示三点管理按钮（暂时隐藏时间标签让位） */
+/* v5.3.1+（问题6）：CLI 运行中徽标（橙色区分 Web 后台运行） */
+.ws-run-badge.cli {
+  color: var(--warning);
+  background: var(--warning-dim);
+}
+/* 悬停显示三点管理按钮（暂时隐藏时间行让位） */
 .ws-session-menu {
   display: none;
   flex-shrink: 0;
@@ -238,7 +250,7 @@ body.resizing { cursor: col-resize; user-select: none; }
   line-height: 1;
 }
 .ws-session:hover .ws-session-menu { display: flex; }
-.ws-session:hover .ws-session-time { display: none; }
+.ws-session:hover .ws-session-row2 { display: none; }
 .ws-folder-head:hover .ws-folder-menu { display: flex; }
 .ws-session-menu:hover { background: var(--bg-3); color: var(--text-0); }
 
@@ -940,6 +952,47 @@ body.resizing { cursor: col-resize; user-select: none; }
   min-width: 0;
 }
 .tool-status { flex-shrink: 0; }
+
+/* ── v5.3.1 领域 Harness 检查发现（cbhpacks 工具产出）── */
+.harness-badge {
+  flex-shrink: 0;
+  background: #d97706;
+  color: #fff;
+  font-weight: 700;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  animation: harnessPulse 1.6s ease-in-out 2;
+}
+.harness-badge.block { background: #dc2626; }
+@keyframes harnessPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(217, 119, 6, .55); }
+  50% { box-shadow: 0 0 0 5px rgba(217, 119, 6, 0); }
+}
+.harness-warn-box {
+  border-left: 3px solid #f59e0b;
+  background: rgba(245, 158, 11, .09);
+  padding: 8px 10px;
+  margin: 4px 0 8px;
+  border-radius: 4px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  word-break: break-all;
+}
+.harness-warn-box.hf-block {
+  border-left-color: #ef4444;
+  background: rgba(239, 68, 68, .12);
+}
+.harness-warn-box.hf-info {
+  border-left-color: #3b82f6;
+  background: rgba(59, 130, 246, .08);
+}
+.harness-warn-title { font-weight: 700; color: #fbbf24; margin-bottom: 4px; }
+.hf-block .harness-warn-title { color: #f87171; }
+.hf-info .harness-warn-title { color: #60a5fa; }
+.hf-line { color: var(--text, #d1d5db); margin: 2px 0; }
+.hf-fix { color: #9ca3af; font-size: 11.5px; margin: 0 0 3px 18px; }
+
 .tool-card-body {
   display: none;
   border-top: 1px solid var(--border);
@@ -1790,4 +1843,58 @@ body.resizing { cursor: col-resize; user-select: none; }
 .cbh-diagram-code pre::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 3px;
+}
+
+/* ===================================================================
+   图片灯箱预览（v5.3.1+ 问题2）
+   =================================================================== */
+.lightbox-mask {
+  position: fixed; inset: 0; z-index: 2000;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; transition: opacity 0.16s ease;
+  cursor: zoom-out;
+}
+.lightbox-mask.show { opacity: 1; }
+.lightbox-box {
+  display: flex; flex-direction: column; gap: 10px;
+  max-width: 94vw; max-height: 94vh;
+  align-items: center;
+  cursor: default;
+}
+.lightbox-bar {
+  display: flex; align-items: center; gap: 10px;
+  max-width: 94vw;
+}
+.lightbox-name {
+  color: var(--text-1); font-size: 12.5px;
+  max-width: 56vw;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.lightbox-btn { text-decoration: none; cursor: pointer; }
+.lightbox-img {
+  max-width: 92vw; max-height: 82vh;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  cursor: default;
+  user-select: none;
+}
+
+/* ===================================================================
+   CLI 会话只读跟随视图横幅（v5.3.1+ 问题6）
+   =================================================================== */
+.cli-follow-banner {
+  display: flex; align-items: center; gap: 8px;
+  margin: 10px 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--warning-dim);
+  border: 1px solid var(--warning);
+  color: var(--warning);
+  font-size: 12.5px;
+}
+.cli-follow-dot {
+  animation: pulse 1.4s ease-in-out infinite;
+  font-size: 14px;
 }

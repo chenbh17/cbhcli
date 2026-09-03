@@ -102,9 +102,11 @@ class SessionHistoryManager:
         
         # 保存会话数据（标题优先级: 显式传入 > 已有文件 > 首条用户消息提取）
         # 标题统一压缩换行/连续空白为单空格（避免列表折行伪装成编号）
+        # v5.3.1+：updated_at 每次保存刷新（最后对话时间），created_at 保持首次创建时间
         session_data = {
             "id": session_id,
             "created_at": created_at,
+            "updated_at": datetime.now().isoformat(),
             "title": " ".join((title or "").split())
                      or " ".join(existing_title.split())
                      or " ".join((first_user_msg or "").split())
@@ -144,6 +146,8 @@ class SessionHistoryManager:
                     # 后行首出现"1、"等字样被误认为列表编号
                     "title": " ".join((data.get("title", "") or "").split()),
                     "created_at": data.get("created_at", ""),
+                    # v5.3.1+：最后对话时间（每次保存刷新；旧文件无此字段回落创建时间）
+                    "updated_at": data.get("updated_at") or data.get("created_at", ""),
                     "message_count": data.get("message_count", 0),
                     "workspace": data.get("workspace", "")
                 })

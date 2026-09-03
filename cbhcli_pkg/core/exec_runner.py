@@ -285,8 +285,10 @@ def _save_session(app) -> None:
     try:
         if app.session and app.session_history \
                 and len(app.session.messages) > 1:
+            import os as _os
             app.session_history.save_session(
-                app.session.get_context_messages(), app.session.id)
+                app.session.get_context_messages(), app.session.id,
+                workspace=_os.getcwd())
     except Exception:
         pass
 
