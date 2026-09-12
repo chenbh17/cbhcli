@@ -40,6 +40,27 @@ class MCPToolAdapter(BaseTool):
             "properties": {},
             "required": []
         })
+
+    # 会话失效的错误特征（v5.3.3）
+    # 进程级连接缓存让多个会话复用同一个 MCP 会话，服务器重启或会话
+    # 过期时旧 session id 会失效，此时重新握手一次并重试即可恢复。
+    _SESSION_ERR_HINTS = ("session", "Session", "404", "410", "Not Found",
+                          "not found")
+
+    def _call_with_retry(self, kwargs: dict):
+        """调用 MCP 工具；会话失效时重新握手并重试一次（v5.3.3）"""
+        try:
+            return self._mcp_client.call_tool(self._tool_info["name"], kwargs)
+        except Exception as exc:
+            text = str(exc)
+            if not any(h in text for h in self._SESSION_ERR_HINTS):
+                raise
+            try:
+                self._mcp_client.reset_session()
+                self._mcp_client.initialize()
+            except Exception:
+                raise exc
+            return self._mcp_client.call_tool(self._tool_info["name"], kwargs)
     
     def execute(self, **kwargs) -> ToolResult:
         """执行 MCP 工具
@@ -52,7 +73,7 @@ class MCPToolAdapter(BaseTool):
         """
         try:
             # 调用 MCP 工具
-            results = self._mcp_client.call_tool(self._tool_info["name"], kwargs)
+            results = self._call_with_retry(kwargs)
             
             # 确保 results 是列表
             if not isinstance(results, list):

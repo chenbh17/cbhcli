@@ -120,7 +120,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.3.1")
+app = FastAPI(title="CBHCLI Web", version="5.3.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -631,6 +631,7 @@ class WebChatSession:
         self.subscribers: list = []                    # 订阅者队列（asyncio.Queue，每个 WebSocket 一个）
         self.respond_waiting = False                   # 是否正等待前端应答（工具确认/ask_user）
         self.last_active_ts: float = 0.0               # 最近一次运行时间戳（空闲会话驱逐排序用）
+        self._usage_cache = None                       # usage_stats 签名缓存（v5.3.3）
 
     # --------------------------------------------------------------
     #  构造
@@ -799,6 +800,7 @@ class WebChatSession:
                 )
             except Exception:
                 pass
+        self._usage_cache = None    # 工具变化影响上下文占比，缓存失效（v5.3.3）
 
     def rebuild_tools_sync(self):
         """供管理 API 调用：工具开关 / MCP 配置变更后同步会话工具。"""
@@ -928,9 +930,24 @@ class WebChatSession:
     # --------------------------------------------------------------
 
     def usage_stats(self) -> dict:
+        """token 统计（v5.3.3：带签名缓存，避免重复全量计算）
+
+        精确统计需要 tiktoken 编码全部消息文本，大会话单次 100ms+；
+        而前端在刷新/切换/状态轮询时会反复调用。用「消息数 + 内容总长度」
+        作签名缓存结果，内容一变签名即变（会话追加/流式/压缩都会变）。
+        """
+        msgs = self.session.messages
+        content_len = 0
+        for m in msgs:
+            content_len += len(m.content or "")
+        sig = (len(msgs), content_len)
+        cache = getattr(self, "_usage_cache", None)
+        if cache is not None and cache[0] == sig:
+            return dict(cache[1])
+
         total = self.session.get_total_tokens(self.token_counter)
         self.context_window.update(total)
-        return {
+        result = {
             "token_estimate": total,
             "model_limit": self.context_window.model_limit,
             "ctx_percentage": round(self.context_window.usage_percentage() * 100, 1),
@@ -940,6 +957,8 @@ class WebChatSession:
             "auto_compress": self.auto_compress,
             "compression_ratio": self.context_window.compression_ratio,
         }
+        self._usage_cache = (sig, dict(result))
+        return result
 
     def export_messages(self, limit: Optional[int] = None) -> list[dict]:
         """导出为前端可恢复的展示结构（assistant 消息聚合 tool 结果）。
@@ -3832,6 +3851,7 @@ async def chat_switch_model(req: Request):
         cs.app_proxy.context_compressor = cs.context_compressor
     cs.model_name = new_model
     cs.session_key = new_key
+    cs._usage_cache = None       # 模型上限/计数器变化，token 缓存失效（v5.3.3）
     cs._rebuild_system_prompt()  # 原地更新首条 system 消息
 
     # 会话键迁移: (agent, old_model) -> (agent, new_model)（仅当 cs 是旧默认会话）
@@ -4857,6 +4877,46 @@ def _get_lan_ips() -> list[str]:
     return sorted(ips, key=_sort_key)
 
 
+def _prewarm_runtime():
+    """后台预热（不阻塞服务启动，v5.3.3）
+
+    - 初始化向量库（chromadb 首次打开约 0.7s，避免首个会话请求时卡顿）
+    - 预连接各 Agent 的 MCP 服务器并写入进程级连接缓存：MCP 握手是
+      会话创建里最慢的一步（0.8~1.0s 网络往返），预热后用户新建/
+      恢复会话/切换 Agent 都直接命中缓存（毫秒级）
+    """
+    try:
+        _init_vector_store()
+    except Exception:
+        pass
+
+    names: list = []
+    try:
+        active = get_config().get_active_agent()
+        if active:
+            names.append(active)
+    except Exception:
+        pass
+    try:
+        for d in sorted((CBHCLI_DIR / "agents").iterdir()):
+            if d.is_dir() and d.name not in names:
+                names.append(d.name)
+    except Exception:
+        pass
+
+    for name in names:
+        try:
+            agent_config = _get_agent_config(name)
+            if not agent_config:
+                continue
+            if not (agent_config.workspace_path / "mcp.json").exists():
+                continue
+            registry = ToolRegistry()
+            MCPManager(name, agent_config.workspace_path, registry)
+        except Exception:
+            continue
+
+
 def run_server(port: int = 18888, host: str = "0.0.0.0"):
     import uvicorn
 
@@ -4866,6 +4926,9 @@ def run_server(port: int = 18888, host: str = "0.0.0.0"):
     _register_web_server(port)
     import atexit
     atexit.register(_unregister_web_server, port)
+
+    # 后台预热（v5.3.3）：向量库 + MCP 连接缓存，让首次会话加载即命中缓存
+    threading.Thread(target=_prewarm_runtime, daemon=True).start()
 
     from cbhcli_pkg import __version__
     print(f"CBHCLI Web v{__version__}")

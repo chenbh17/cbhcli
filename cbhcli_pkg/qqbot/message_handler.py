@@ -10,9 +10,12 @@
   QQ 消息 → 解析 → 提取上下文 → AI 处理 → 格式化回复 → 发送回 QQ
 """
 import re
+import json
 import logging
-from collections import defaultdict
-from dataclasses import dataclass
+import threading
+from collections import defaultdict, OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Callable
 
 from cbhcli_pkg.qqbot.qqbot_config import QQBotConfig
@@ -42,10 +45,16 @@ class QQMessage:
     raw_payload: Optional[dict] = None
     attachments: list = None  # 附件列表
     role: str = "user"   # "user" 或 "assistant"（AI 回复） [{url, content_type, filename, size, width, height}]
+    ref_content: str = ""           # 被引用消息文本（引用回复时）
+    ref_attachments: list = None    # 被引用消息的附件 [{url, content_type, filename, size, width, height}]
+    ref_author_name: str = ""       # 被引用消息发送者昵称
+    at_bot: bool = False            # 群聊中是否 @了机器人（全量消息判定）
 
     def __post_init__(self):
         if self.attachments is None:
             self.attachments = []
+        if self.ref_attachments is None:
+            self.ref_attachments = []
 
     @property
     def has_images(self) -> bool:
@@ -63,16 +72,24 @@ class QQMessage:
         return any(not a.get('content_type', '').startswith('image/') for a in self.attachments)
 
 
-def _strip_bot_mention(content: str) -> str:
-    """去除文本开头的 @机器人 提及
+def _strip_bot_mention(content: str) -> tuple[str, bool]:
+    """去除文本中的 @机器人 提及
 
     QQ 群聊 @消息 格式: <@!bot_id> 或 @bot_name
+    提及 id 当前为 16 进制，正则放宽为任意非 > 字符（防未来格式变化）。
+
+    Returns:
+        (清理后的文本, 是否含 @机器人提及)
     """
-    # 去除 <@!xxxxx> 格式
-    content = re.sub(r'<@!\d+>\s*', '', content)
+    original = content
+    # 先去除提及标签前客户端塞的裸 @/空白（手打 @ 再选人、引用回复会产生 "@<@id> 文本"，
+    # 必须在 <@> 标签剥离之前执行，否则标签剥离后裸 @ 留在正文开头）
+    content = re.sub(r'^[@\s]+(?=<@)', '', content)
+    # 去除 <@xxxxx> / <@!xxxxx> 格式（提及 id 为机器人或普通成员，统一剥离）
+    content = re.sub(r'<@!?[^>]+>\s*', '', content)
     # 去除 CQ 码 @
     content = re.sub(r'\[CQ:at,qq=\d+\]\s*', '', content)
-    return content.strip()
+    return content.strip(), (original != content)
 
 
 def _parse_media_from_content(content: str) -> dict:
@@ -129,19 +146,166 @@ class QQBotMessageHandler:
         self._contexts: dict[tuple, list] = defaultdict(list)
         self._max_context = 10  # 每个对话最多保存 10 条历史
 
+        # ── 群全量消息 @机器人 判定（v5.3.1）──
+        # 群消息范围设置为"全部消息"后，同一条 @机器人 消息会同时以
+        # GROUP_AT_MESSAGE_CREATE 和 GROUP_MESSAGE_CREATE 两种事件送达，
+        # 需按 msg_id 去重；全量副本中 <@bot_id> 提及标签的 id 即机器人
+        # 自身 id（AT 事件开头提及时可直接学习），全量消息中任意位置的
+        # <@bot_id> 都算被 @。
+        self._bot_mention_ids: set[str] = set()   # 机器人提及 id（学习得到）
+        self._seen_msg_ids: OrderedDict = OrderedDict()  # msg_id → 已按@处理(bool)
+        self._seen_max = 500                     # 去重窗口大小
+        self._state_lock = threading.Lock()
+
         # 持久化用户注册表（v5.3.0：记录所有发过消息的用户 openid，
         # 供 qqbot_send_message 工具主动发送/查找，跨进程共享）
         from cbhcli_pkg.qqbot.qqbot_registry import QQBotUserRegistry
         self.registry = QQBotUserRegistry()
 
+    # ── bot 提及 id 持久化（跨重启学习）──
+
+    _MENTION_STATE_FILE = Path.home() / ".cbhcli" / "qqbot_mention_ids.json"
+
+    def _load_mention_state(self):
+        """从磁盘加载学习到的 bot 提及 id"""
+        try:
+            if self._MENTION_STATE_FILE.exists():
+                with open(self._MENTION_STATE_FILE, 'r') as f:
+                    data = json.load(f)
+                ids = data.get(self.config.name)
+                if isinstance(ids, list):
+                    with self._state_lock:
+                        self._bot_mention_ids.update(str(i) for i in ids)
+        except Exception:
+            pass
+
+    def _save_mention_state(self):
+        """保存学习到的 bot 提及 id 到磁盘（跨 Bot 隔离）"""
+        try:
+            data = {}
+            if self._MENTION_STATE_FILE.exists():
+                try:
+                    with open(self._MENTION_STATE_FILE, 'r') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            with self._state_lock:
+                data[self.config.name] = sorted(self._bot_mention_ids)
+            self._MENTION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._MENTION_STATE_FILE, 'w') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _find_mention_ids(self, content: str) -> list[str]:
+        """提取文本中全部 <@id> 提及 id（id 当前为 16 进制，放宽为任意非 > 字符）"""
+        return [m.group(1) for m in re.finditer(r'<@!?([^>]+)>', content)]
+
+    def learn_bot_id(self, bot_id: str):
+        """学习机器人自身提及 id（qqbot_service 启动时经 get_me_info 注入）
+
+        该 id 即群聊 @机器人 时 <@id> 标签中的提及 id，用于全量消息 @判定。
+        """
+        bot_id = str(bot_id or '').strip()
+        if not bot_id:
+            return
+        with self._state_lock:
+            if bot_id not in self._bot_mention_ids:
+                self._bot_mention_ids.add(bot_id)
+                logger.info(f"[{self.config.name}] 学习到机器人提及 id: {bot_id[:12]}...")
+        self._save_mention_state()
+
+    def _is_at_bot(self, event_type: str, content: str, mentions: list) -> bool:
+        """判断群消息是否 @机器人
+
+        - GROUP_AT_MESSAGE_CREATE：本身即 @机器人 消息，恒 True
+        - GROUP_MESSAGE_CREATE（全量）：提及标签中含已学习的 bot 提及 id 才算
+          （mentions 列表的 id 是消息中 @ 的用户，全量副本中含机器人自身）
+        """
+        if event_type == "GROUP_AT_MESSAGE_CREATE":
+            return True
+        mention_ids = set(self._find_mention_ids(content)) | set(mentions or [])
+        if not mention_ids:
+            return False
+        with self._state_lock:
+            return bool(mention_ids & self._bot_mention_ids)
+
     def handle_event(self, payload: WSPayload):
         """处理 WebSocket DISPATCH 事件
 
         这是 QQBotGateway 事件回调的入口。
+
+        群全量消息（GROUP_MESSAGE_CREATE）处理规则：
+        1. 仅当 @机器人 时才进入 AI 处理，其余消息忽略（旁观不回话）
+        2. 与 GROUP_AT_MESSAGE_CREATE 同 msg_id 的重复推送去重
+        3. 借 AT 事件学习机器人自身提及 id，供全量消息 @判定
         """
         msg = QQBotProtocol.extract_message_content(payload)
         if msg is None:
             return  # 不是消息事件，忽略
+
+        # 惰性加载持久化的 bot 提及 id
+        if not getattr(self, "_mention_state_loaded", False):
+            self._mention_state_loaded = True
+            self._load_mention_state()
+
+        event_type = msg.get('event_type', '')
+        content = msg.get('content', '')
+        mentions = msg.get('mentions', []) or []
+
+        # v5.3.1：事件级日志（排查 @判定/去重问题用）
+        logger.info(
+            f"[{self.config.name}] 收到事件 {event_type} "
+            f"msg_id={msg.get('msg_id', '')[:16]}... "
+            f"author={msg.get('author_id', '')[:8]}... "
+            f"content={json.dumps(content, ensure_ascii=False)[:80]} "
+            f"mentions={[m[:8] + '...' if len(m) > 8 else m for m in (mentions or [])]} "
+            f"atts={len(msg.get('attachments', []) or [])} "
+            f"ref={len(msg.get('ref_attachments', []) or [])}"
+        )
+
+        # ── 群消息：@机器人 判定 + 去重 + 提及 id 学习 ──
+        is_group = msg.get('message_type') == 'group'
+        is_at_bot = False
+        if is_group:
+            raw_content = content
+            # AT 事件开头的 <@bot_id> 提及 id 即机器人自身 → 学习
+            if event_type == "GROUP_AT_MESSAGE_CREATE":
+                mention_ids = self._find_mention_ids(raw_content)
+                if mention_ids:
+                    with self._state_lock:
+                        added = [i for i in mention_ids if i not in self._bot_mention_ids]
+                        self._bot_mention_ids.update(mention_ids)
+                    if added:
+                        logger.info(f"学习到机器人提及 id: {added}")
+                        self._save_mention_state()
+                is_at_bot = True
+            else:
+                # 全量消息：任意位置含已学习 bot 提及 id 才算被 @
+                is_at_bot = self._is_at_bot(event_type, raw_content, mentions)
+
+            # 同一条消息 AT/全量双事件去重（bunqq 同款策略）：
+            # - 全量副本先到且未被识别为 @机器人（提及 id 尚未学习）→ 静默丢弃，
+            #   AT 副本后到时补处理
+            # - 已按 @处理过 → 正常去重
+            with self._state_lock:
+                msg_id = msg.get('msg_id', '')
+                if msg_id and msg_id in self._seen_msg_ids:
+                    if event_type == "GROUP_AT_MESSAGE_CREATE" and \
+                            self._seen_msg_ids[msg_id] is False:
+                        # AT 副本后到补处理（此前全量副本因未识别被丢弃）
+                        pass
+                    else:
+                        return  # 重复消息，忽略
+                if msg_id:
+                    self._seen_msg_ids[msg_id] = is_at_bot
+                    if len(self._seen_msg_ids) > self._seen_max:
+                        # 修剪最旧的一半
+                        while len(self._seen_msg_ids) > self._seen_max // 2:
+                            self._seen_msg_ids.popitem(last=False)
+
+            if not is_at_bot:
+                return  # 全量消息未 @机器人 → 不响应（旁观）
 
         # ── 持久化记录发送目标（v5.3.0，尽力而为不影响主流程）──
         try:
@@ -174,15 +338,19 @@ class QQBotMessageHandler:
             group_id=msg.get('group_id'),
             raw_payload=payload.d,
             attachments=msg.get('attachments', []),
+            ref_content=msg.get('ref_content', ''),
+            ref_attachments=msg.get('ref_attachments', []) or [],
+            ref_author_name=msg.get('ref_author_name', ''),
+            at_bot=is_at_bot,
         )
 
         # 群聊消息：去除 @机器人 前缀
         if qq_msg.message_type == 'group':
-            qq_msg.content = _strip_bot_mention(qq_msg.content)
+            qq_msg.content, _ = _strip_bot_mention(qq_msg.content)
 
-        # 空消息跳过（除非有附件）
+        # 空消息跳过（除非有附件或引用内容）
         if not qq_msg.content.strip():
-            if qq_msg.attachments:
+            if qq_msg.attachments or qq_msg.ref_attachments:
                 # 纯媒体消息：生成描述
                 parts = []
                 for att in qq_msg.attachments:
@@ -196,9 +364,26 @@ class QQBotMessageHandler:
                         parts.append(f"[语音: {fn or '未命名'}]")
                     else:
                         parts.append(f"[文件: {fn or '未命名'} ({ct})]")
+                for att in qq_msg.ref_attachments:
+                    ct = att.get('content_type', '')
+                    fn = att.get('filename', '')
+                    if ct.startswith('image/'):
+                        parts.append(f"[引用图片: {fn or '未命名'}]")
+                    elif ct.startswith('audio/'):
+                        parts.append(f"[引用语音: {fn or '未命名'}]")
+                    elif ct:
+                        parts.append(f"[引用文件: {fn or '未命名'} ({ct})]")
+                if qq_msg.ref_content:
+                    prefix = f"引用 {qq_msg.ref_author_name}: " if qq_msg.ref_author_name else "引用: "
+                    parts.append(prefix + qq_msg.ref_content)
                 qq_msg.content = ' '.join(parts)
             else:
-                return
+                # 引用消息也可能只有引用文本没有新文本
+                if qq_msg.ref_content:
+                    prefix = f"引用 {qq_msg.ref_author_name}: " if qq_msg.ref_author_name else "引用: "
+                    qq_msg.content = prefix + qq_msg.ref_content
+                else:
+                    return
 
         # 保存上下文
         ctx_key = (qq_msg.author_id, qq_msg.message_type)

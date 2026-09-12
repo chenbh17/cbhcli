@@ -144,6 +144,24 @@ class QQBotService:
             instance.started_at = time.time()
             self._instances[bot_name] = instance
 
+            # 学习机器人自身 openid（v5.3.1：全量群消息 @机器人 判定用）。
+            # get_me_info (/users/@me) 返回的 id 即群聊 <@id> 提及的机器人提及 id，
+            # 提前学习可避免"全量副本先到但提及 id 未学习导致 @机器人被静默丢弃"。
+            try:
+                handler = instance.message_handler
+                if handler is not None:
+                    # 先加载磁盘上历史学习到的提及 id（跨重启保留）
+                    handler._load_mention_state()
+                    handler._mention_state_loaded = True
+                    me = instance.api_client.get_me_info()
+                    if me and not me.get('error') and me.get('id'):
+                        handler.learn_bot_id(me['id'])
+                        logger.info(f"Bot '{bot_name}' 自身 openid 已学习: {str(me['id'])[:12]}...")
+                else:
+                    logger.warning(f"Bot '{bot_name}' message_handler 缺失，跳过提及 id 学习")
+            except Exception as e:
+                logger.warning(f"学习 bot 自身 openid 失败（不影响启动）: {e}")
+
             # 在后台线程运行
             instance._gateway_thread = threading.Thread(
                 target=instance.gateway.run,

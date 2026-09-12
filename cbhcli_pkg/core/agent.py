@@ -665,7 +665,7 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /agent [add|rm|use] <name> - Agent管理
 - /model [add|use|rm|config|embedding|rerank] - 模型管理
 - /new 或 /reset - 创建新会话（自动保存当前会话到history）
-- /resume [编号|关键词] - 列出或恢复历史会话（关键词按标题搜索）
+- /resume [编号|关键词] - 列出或恢复历史会话（关键词按标题搜索；恢复后终端回显历史对话）
 - /history - 查看历史会话列表
 - /ctx - 查看上下文使用情况
 - /comp [指令] - 手动压缩上下文（可带保留/丢弃指令）
@@ -732,10 +732,13 @@ MCP (Model Context Protocol) 允许连接外部工具服务器，扩展工具能
 **重要原则：MCP命令由用户直接输入，AI不要用工具执行！**
 
 命令参考：
-- /mcp add <名称> <URL> [header名=值 ...] - 添加服务器
+- /mcp add [名称] <URL> [header名=值 ...] - 添加服务器（名称可省略，自动从 URL 推导）
 - /mcp list - 列出所有 | /mcp rm <名称> - 移除
 - /mcp refresh <名称> - 重连刷新 | /mcp tools <名称> - 查看工具
 - /mcp on|off <服务器> <工具名> - 启用/禁用工具
+
+header 写法：值含空格时用引号包裹（如 Authorization="Bearer xxx"）；
+值支持 ${环境变量} 占位符，连接时展开（配置不落明文 Key）。
 
 添加后工具自动注册，名称格式为 mcp_服务器名_工具名。
 

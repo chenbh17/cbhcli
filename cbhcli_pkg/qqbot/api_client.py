@@ -451,10 +451,14 @@ class QQBotAPIClient:
     def get_me_info(self) -> dict:
         """获取 Bot 自身信息
 
+        注意：QQ 官方接口是 /users/@me（无 /v2 前缀，@me 不是路径参数），
+        用 /v2/users/me 会 404 "不支持的调用" (code 11001)。
+        返回的 id 即群聊 AT 事件中 <@id> 提及的机器人提及 id。
+
         Returns:
-            Bot 信息 JSON
+            Bot 信息 JSON（含 id/username/avatar 等）
         """
-        url = f"{self.api_base}/v2/users/me"
+        url = f"{self.api_base}/users/@me"
         return self._get(url)
 
     # ════════════════════════════════════════════════

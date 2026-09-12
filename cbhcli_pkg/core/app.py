@@ -2,6 +2,7 @@
 import os
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -310,6 +311,71 @@ class CBHCLIApp:
         self._init_commands()
         self._init_ui()
         self._init_agent()
+
+        # v5.3.1（QQ并发修复）：会话互斥锁——CLI 主线程与 QQ Bot 回调线程
+        # 共享同一会话 (app.session)，必须串行处理 AI 请求，防止两路同时
+        # 写 session.messages 导致消息序列交错损坏（API 400）。
+        #   CLI 端：acquire() 无限等待，Ctrl+C → 请求中断 QQ 任务后继续等
+        #   QQ 端：acquire(timeout=150)，超时回复"有 CLI 任务处理中"
+        self._session_lock = threading.Lock()
+        # QQ 任务中断事件：CLI 端 Ctrl+C 时置位，QQ 回调线程的 AIHandler
+        # 在流式读取/工具循环中检测到即抛 KeyboardInterrupt 立即中止；
+        # 每次 QQ 任务开始时清零（中断只作用于当前正在运行的任务）
+        self._qq_interrupt = threading.Event()
+        # 当前 QQ 任务运行的回调线程（None=无 QQ 任务）
+        self._qq_active_thread: Optional[threading.Thread] = None
+
+    # ── 会话互斥与 QQ 任务中断 ──
+
+    @property
+    def session_busy(self) -> bool:
+        """是否有 AI 任务（CLI 或 QQ）正在占用会话"""
+        return self._session_lock.locked()
+
+    def _request_interrupt_qq(self) -> bool:
+        """CLI 主线程 Ctrl+C 时调用：请求中断正在运行的 QQ Bot 任务
+
+        Returns:
+            True=已发出中断请求 / False=没有正在运行的 QQ 任务
+        """
+        if self._qq_active_thread is not None and self._qq_active_thread.is_alive():
+            self._qq_interrupt.set()
+            print(f"\n{C_DIM}⏳ 已请求中断 QQ Bot 任务，等待其收尾...{C_RESET}")
+            return True
+        return False
+
+    def _acquire_session_cli(self):
+        """CLI 主线程获取会话锁（阻塞等待 QQ 任务完成）
+
+        等待期间 Ctrl+C → 请求中断 QQ 任务后继续等待；
+        无 QQ 任务却被占用（异常状态）→ 第二次 Ctrl+C 放弃本次输入。
+        """
+        while True:
+            try:
+                self._session_lock.acquire()
+                break
+            except KeyboardInterrupt:
+                if self._request_interrupt_qq():
+                    continue  # 已请求中断 QQ，继续等待锁释放
+                raise        # 无 QQ 任务可中断 → 按常规中断处理
+
+    def _acquire_session_qq(self, timeout: float = 150.0) -> bool:
+        """QQ 回调线程获取会话锁（限时等待 CLI 任务完成）
+
+        CLI 任务由终端用户驱动，QQ 消息不可插队——群聊被动回复窗口仅
+        5 分钟，超时后放弃并向 QQ 用户回复忙提示。
+
+        Returns:
+            True=获得会话 / False=等待超时（CLI 任务仍在处理）
+        """
+        deadline = time.time() + timeout
+        while True:
+            # 限时探测式获取，可感知 CLI 长任务
+            remain = deadline - time.time()
+            if remain <= 0:
+                return False
+            if self._session_lock.acquire(timeout=min(remain, 0.5)):
+                return True
     
     def _init_config(self):
         """初始化配置"""
@@ -876,13 +942,33 @@ class CBHCLIApp:
         app_ref = self  # 捕获引用
         
         def handle_qq_message(qq_msg) -> str:
-            """处理 QQ 消息：转发给 Agent → AI 处理 → 返回回复"""
+            """处理 QQ 消息：转发给 Agent → AI 处理 → 返回回复
+
+            v5.3.1（QQ并发修复）：与 CLI 共享同一会话，AI 请求全程持有
+            会话锁串行执行；CLI 端 Ctrl+C 可通过 interrupt_event 中断本任务。
+            """
+            # ---- 会话互斥（v5.3.1）----
+            # CLI 任务运行中时限时等待（群聊被动回复窗口仅 5 分钟），
+            # 超时则直接回复忙提示，不排队堆积
+            if not app_ref._acquire_session_qq(timeout=150.0):
+                return ("⏳ 当前 CLI 端有任务正在处理，暂时无法响应。"
+                        "请稍后再发消息。")
+            # 登记本任务线程 + 清零中断标志（中断只作用于本次任务）
+            app_ref._qq_active_thread = threading.current_thread()
+            app_ref._qq_interrupt.clear()
+            try:
+                return _handle_qq_message_locked(app_ref, bot_name, qq_msg)
+            finally:
+                app_ref._qq_active_thread = None
+                app_ref._session_lock.release()
+
+        def _handle_qq_message_locked(app_ref, bot_name: str, qq_msg) -> str:
+            """QQ 消息实际处理逻辑（调用方必须已持有会话锁）"""
             from cbhcli_pkg.core.model import LLMClient
             
             # ---- 斜杠命令处理 ----
             content = qq_msg.content.strip()
-            session_key = (qq_msg.author_id, qq_msg.message_type)
-            
+            session_key = (qq_msg.author_id, qq_msg.message_type)            
             if content.startswith('/'):
                 cmd = content.split()[0].lower()
                 
@@ -957,60 +1043,75 @@ class CBHCLIApp:
             if qq_msg.group_id:
                 context_prefix += f"群ID: {qq_msg.group_id}\n"
             
-            # 处理附件
+            # 处理附件（含引用消息附件）
             image_base64_list = []
             download_dir = Path.home() / ".cbhcli" / "qqbot_downloads"
-            
-            if qq_msg.attachments:
-                download_dir.mkdir(parents=True, exist_ok=True)
-                att_desc_parts = []
-                
-                for att in qq_msg.attachments:
+
+            def _download_attachment(att) -> str:
+                """下载单个附件到本地，返回本地路径（失败返回空串）
+
+                v5.3.1 修复：QQ 官方附件 url 常不带协议头（如
+                //multimedia.nt.qq.com/...），直接 requests.get 会抛
+                MissingSchema 异常导致附件"识别不到"——补 https: 前缀。
+                """
+                url = att.get('url', '') or ''
+                fn = att.get('filename', '') or 'unnamed'
+                if not url:
+                    return ""
+                if url.startswith('//'):
+                    url = 'https:' + url
+                elif not url.startswith(('http://', 'https://')):
+                    url = 'https://' + url.lstrip('/')
+                try:
+                    import requests as _r
+                    file_resp = _r.get(url, timeout=30)
+                    if file_resp.status_code == 200:
+                        safe_fn = fn.replace('/', '_').replace('\\', '_')
+                        local_path = str(download_dir / safe_fn)
+                        counter = 1
+                        while Path(local_path).exists():
+                            name, ext = safe_fn.rsplit('.', 1) if '.' in safe_fn else (safe_fn, '')
+                            local_path = str(download_dir / f"{name}_{counter}.{ext}" if ext else f"{name}_{counter}")
+                            counter += 1
+                        with open(local_path, 'wb') as f:
+                            f.write(file_resp.content)
+                        return local_path
+                except Exception:
+                    pass
+                return ""
+
+            def _describe_attachments(att_list, ref_prefix: str = "") -> list:
+                """生成附件描述列表，图片在视觉模型可用时直接编入 image_base64_list"""
+                parts = []
+                for att in (att_list or []):
                     ct = att.get('content_type', '')
                     fn = att.get('filename', '') or 'unnamed'
-                    url = att.get('url', '')
-                    
-                    local_path = ""
-                    if url:
-                        try:
-                            import requests as _r
-                            file_resp = _r.get(url, timeout=30)
-                            if file_resp.status_code == 200:
-                                safe_fn = fn.replace('/', '_').replace('\\', '_')
-                                local_path = str(download_dir / safe_fn)
-                                counter = 1
-                                while Path(local_path).exists():
-                                    name, ext = safe_fn.rsplit('.', 1) if '.' in safe_fn else (safe_fn, '')
-                                    local_path = str(download_dir / f"{name}_{counter}.{ext}" if ext else f"{name}_{counter}")
-                                    counter += 1
-                                with open(local_path, 'wb') as f:
-                                    f.write(file_resp.content)
-                        except Exception:
-                            local_path = ""
-                    
+                    local_path = _download_attachment(att)
+
                     if ct.startswith('image/'):
-                        att_desc_parts.append(f"[图片: {fn}]")
+                        parts.append(f"[{ref_prefix}图片: {fn}]")
                         if local_path:
-                            att_desc_parts[-1] += f" → {local_path}"
-                        if llm.supports_vision and local_path:
-                            try:
-                                import base64 as _b64
-                                with open(local_path, 'rb') as f:
-                                    image_base64_list.append(_b64.b64encode(f.read()).decode('utf-8'))
-                            except Exception:
-                                pass
+                            parts[-1] += f" → {local_path}"
+                            if llm.supports_vision:
+                                try:
+                                    import base64 as _b64
+                                    with open(local_path, 'rb') as f:
+                                        image_base64_list.append(_b64.b64encode(f.read()).decode('utf-8'))
+                                except Exception:
+                                    pass
                     elif ct.startswith('video/'):
-                        att_desc_parts.append(f"[视频: {fn}]")
+                        parts.append(f"[{ref_prefix}视频: {fn}]")
                         if local_path:
-                            att_desc_parts[-1] += f" → {local_path}"
+                            parts[-1] += f" → {local_path}"
                     elif ct.startswith('audio/') or ct == 'voice':
                         # 语音消息：优先用 QQ 官方 ASR，没有则自动调用本地脚本识别
+                        # （引用消息中的语音不覆盖正文，仅作为引用内容展示）
                         asr_text = att.get('asr_refer_text', '')
                         if asr_text:
-                            qq_msg.content = asr_text
-                            att_desc_parts.append(f"[语音识别: {asr_text}]")
-                        elif local_path:
-                            # QQ ASR 不可用，自动调用本地识别脚本
+                            if not ref_prefix:
+                                qq_msg.content = asr_text
+                            parts.append(f"[{ref_prefix}语音识别: {asr_text}]")
+                        elif local_path and not ref_prefix:
                             try:
                                 import subprocess as _sp
                                 script = "/home/administrator/.cbhcli/agents/qqbot/skills/qq-voice-recognition/script/recognize_qq_voice.py"
@@ -1021,26 +1122,44 @@ class CBHCLIApp:
                                 if result.returncode == 0 and result.stdout.strip():
                                     asr_text = result.stdout.strip()
                                     qq_msg.content = asr_text
-                                    att_desc_parts.append(f"[语音识别: {asr_text}]")
+                                    parts.append(f"[{ref_prefix}语音识别: {asr_text}]")
                                 else:
-                                    att_desc_parts.append(f"[语音: {fn}] → {local_path}")
+                                    parts.append(f"[{ref_prefix}语音: {fn}] → {local_path}")
                             except Exception:
-                                att_desc_parts.append(f"[语音: {fn}] → {local_path}")
+                                parts.append(f"[{ref_prefix}语音: {fn}] → {local_path}")
                         else:
-                            att_desc_parts.append(f"[语音: {fn}]")
+                            parts.append(f"[{ref_prefix}语音: {fn}]")
                     else:
-                        att_desc_parts.append(f"[文件: {fn}]")
+                        parts.append(f"[{ref_prefix}文件: {fn}]")
                         if local_path:
-                            att_desc_parts[-1] += f" → {local_path}"
-                
+                            parts[-1] += f" → {local_path}"
+                return parts
+
+            if qq_msg.attachments or qq_msg.ref_attachments:
+                download_dir.mkdir(parents=True, exist_ok=True)
+                att_desc_parts = _describe_attachments(qq_msg.attachments)
+                ref_att_desc_parts = _describe_attachments(qq_msg.ref_attachments, ref_prefix="引用")
+
+                # v5.3.1（bug3 修复）：引用消息的原文也注入上下文——
+                # QQ 引用回复时 content 只有新文本（或空），被引用内容在
+                # ref_content/ref_attachments 中，必须显式带给 AI
+                ref_desc_parts = list(ref_att_desc_parts)
+                if qq_msg.ref_content:
+                    who = f" {qq_msg.ref_author_name}" if qq_msg.ref_author_name else ""
+                    ref_desc_parts.insert(0, f"引用{who}: {qq_msg.ref_content}")
+                if ref_desc_parts:
+                    context_prefix += "用户引用了一条历史消息:\n"
+                    for p in ref_desc_parts:
+                        context_prefix += f"  {p}\n"
+
                 if att_desc_parts:
                     context_prefix += f"附件已下载到 {download_dir}/:\n"
                     for p in att_desc_parts:
                         context_prefix += f"  {p}\n"
                     context_prefix += "你可以使用 read 工具读取文件内容。\n"
-            
+
             context_prefix += f"\n用户消息: {qq_msg.content}"
-            
+
             # 5. 创建 AIHandler 并处理（使用 app_ref 的会话，与 CLI 共享）
             handler = AIHandler(
                 llm_client=llm,
@@ -1050,7 +1169,9 @@ class CBHCLIApp:
             )
             handler.subagent_scheduler = app_ref.subagent_scheduler
             handler.agent_name = target_agent
-
+            # v5.3.1（QQ并发修复）：注入中断事件——CLI 端 Ctrl+C 置位后，
+            # 流式循环/工具循环检测点抛 KeyboardInterrupt 立即中止本任务
+            handler.interrupt_event = app_ref._qq_interrupt
             # 注入备用主模型列表（与 CLI handler 保持一致）
             from cbhcli_pkg.config.global_config import GlobalConfig
             gc = GlobalConfig()
@@ -1120,6 +1241,11 @@ class CBHCLIApp:
                     bot.message_handler._contexts[ctx_key].append(reply_msg)
                 
                 return reply
+            except KeyboardInterrupt:
+                # v5.3.1（QQ并发修复）：CLI 端 Ctrl+C 中断了本 QQ 任务
+                # （interrupt_event 检测点抛出）——回复简短说明，
+                # 不打印堆栈（CLI 终端由主循环打印提示）
+                return "⏹️ 任务已被 CLI 端中断（用户按了 Ctrl+C）。如需继续请重新发送消息。"
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).error(f"QQ消息AI处理失败: {e}", exc_info=True)
@@ -1207,14 +1333,21 @@ class CBHCLIApp:
                 if output:
                     print(f"\n{output}\n")
                     continue
-                
+
                 # 处理AI请求
                 if self.llm_client and self.session:
+                    # v5.3.1：QQ 任务运行中时提示等待（命令仍可正常执行，
+                    # 但 AI 请求必须串行——CLI 与 QQ 共享同一会话）
+                    if self.session_busy:
+                        print(f"\n{C_DIM}⏳ QQ Bot 任务正在处理中，等待其完成...（Ctrl+C 可中断它）{C_RESET}")
                     self._handle_ai_request(user_input)
                 else:
                     print(f"\n{C_DIM}当前Agent未配置模型。请使用 /model 命令配置模型。{C_RESET}")
                 
             except KeyboardInterrupt:
+                # v5.3.1：QQ 任务运行中时，Ctrl+C 优先用于中断 QQ 任务
+                if self._request_interrupt_qq():
+                    continue
                 print(f"\n\n{C_DIM}操作被中断。输入 'quit' 退出。{C_RESET}")
                 continue
             except Exception as e:
@@ -1241,7 +1374,20 @@ class CBHCLIApp:
             pass  # 保存失败不影响对话
 
     def _handle_ai_request(self, user_input: str):
-        """处理AI请求 - 委托给AIHandler"""
+        """处理AI请求 - 委托给AIHandler
+
+        v5.3.1：CLI 与 QQ Bot 共享同一会话，AI 请求全程持有会话锁串行执行
+        （获取在 run() 主循环中完成，见 _acquire_session_cli）
+        """
+        # v5.3.1：确保拿到会话锁（run() 已提示等待，这里二次防御获取）
+        self._acquire_session_cli()
+        try:
+            self._handle_ai_request_locked(user_input)
+        finally:
+            self._session_lock.release()
+
+    def _handle_ai_request_locked(self, user_input: str):
+        """处理AI请求（调用方必须已持有会话锁）"""
         # 检查上下文压缩
         self._check_and_compress_context()
 

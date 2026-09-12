@@ -1015,6 +1015,7 @@ const state = {
   fmWorkspace: "",        // 文件管理器对应的的工作空间（切换时重置，v5.2.8）
   cliFollow: "",          // CLI 只读跟随视图的会话 id（问题6，v5.3.1+）
   cliFollowTimer: null,   // CLI 跟随轮询定时器
+  stickBottom: true,      // 是否跟随滚动到底部（v5.3.2+：用户往上翻后不再强制置底）
 };
 
 /* ---- 面板布局常量（v5.2.8：工作区/文件管理器左右互换 + 拖拽调宽） ---- */
@@ -1140,6 +1141,12 @@ function initChatView() {
   // 粘贴图片
   chatUI.input.addEventListener("paste", handlePaste);
 
+  // 滚动跟随状态：用户滚离底部后不再被流式输出强制拉回（v5.3.2+）
+  chatUI.messages.addEventListener("scroll", () => {
+    state.stickBottom = isNearBottom();
+    updateJumpBtn();
+  }, { passive: true });
+
   state.statusTimer = setInterval(refreshStatus, 5000);
 }
 
@@ -1250,8 +1257,61 @@ function msgColumn() {
   return col;
 }
 
-function scrollBottom() {
-  chatUI.messages.scrollTop = chatUI.messages.scrollHeight;
+/* 滚动跟随（v5.3.2+）
+ * 流式输出（思考/工具/回答）不再无条件把滚动条拽到底部：只有用户本来
+ * 就贴着底部时才跟随；用户一旦往上翻阅历史，就保持当前位置不打扰，
+ * 直到用户自己滚回底部或点击"回到底部"按钮。
+ */
+const SCROLL_PIN_PX = 48;   // 距底部多少像素内视为"贴着底部"
+
+function isNearBottom() {
+  const m = chatUI.messages;
+  if (!m) return true;
+  return m.scrollHeight - m.scrollTop - m.clientHeight <= SCROLL_PIN_PX;
+}
+
+/** 回到底部并按需恢复跟随 */
+function jumpToBottom() {
+  state.stickBottom = true;
+  const m = chatUI.messages;
+  if (m) {
+    // 用瞬时滚动：平滑滚动过程中触发的 scroll 事件会把"贴底"判定算成
+    // false，反而把跟随状态又关掉（实测按钮点不动）
+    m.scrollTop = m.scrollHeight;
+  }
+  updateJumpBtn();
+}
+
+/** 滚动到底部。
+ *  force=true：用户主动动作（发消息/切会话/需要应答的交互）→ 强制置底并恢复跟随；
+ *  默认：仅当用户仍贴着底部时跟随（流式输出期间不打断向上翻阅）。
+ */
+function scrollBottom(force) {
+  if (force) state.stickBottom = true;
+  if (state.stickBottom) {
+    const m = chatUI.messages;
+    if (m) m.scrollTop = m.scrollHeight;
+  }
+  updateJumpBtn();
+}
+
+/** "回到底部"悬浮按钮（仅在用户离开底部时出现） */
+function ensureJumpBtn() {
+  if (chatUI.jumpBtn) return chatUI.jumpBtn;
+  const view = $("#view-chat");
+  if (!view) return null;
+  const btn = el("button", { class: "jump-bottom-btn hidden", type: "button",
+                            title: "回到底部（恢复自动跟随）" }, "↓");
+  btn.addEventListener("click", jumpToBottom);
+  view.append(btn);
+  chatUI.jumpBtn = btn;
+  return btn;
+}
+
+function updateJumpBtn() {
+  const btn = ensureJumpBtn();
+  if (!btn) return;
+  btn.classList.toggle("hidden", state.stickBottom);
 }
 
 /* ---- 状态栏 ---- */
@@ -1364,7 +1424,7 @@ function showCliFollowBanner(title) {
     el("span", { class: "cli-follow-dot" }, "●"),
     el("span", null, "该会话正在 CLI 中运行 · 只读跟随视图（每轮自动刷新）"));
   msgColumn().append(banner);
-  scrollBottom();
+  scrollBottom(true);
 }
 
 function hideCliFollowBanner() {
@@ -1543,7 +1603,7 @@ async function sendMessage() {
   autoGrow();
   state.attachments = [];
   renderAttachments();
-  scrollBottom();
+  scrollBottom(true);   // 自己发消息：强制置底并恢复跟随
 
   // v5.2.9：POST 发送立即返回，实时事件经 WebSocket 到达（多浏览器一致）。
   // 用户气泡已在本地渲染；run_start 事件到达时因 sentLocally 跳过重复渲染。
@@ -1786,7 +1846,7 @@ function renderIncomingUserMessage(text) {
   col.append(el("div", { class: "msg-user" },
     el("div", { class: "msg-user-bubble" },
       el("div", { class: "msg-user-text" }, text || ""))));
-  scrollBottom();
+  scrollBottom(true);   // 其他浏览器发来新消息：置底并恢复跟随
 }
 
 /** 其他浏览器已应答：撤销本浏览器的待确认/待回答 UI */
@@ -2059,7 +2119,7 @@ function ensureToolCard(toolId, name) {
     rec.confirmEl = confirmEl;
     liveRun.pendingRespondEl = confirmEl;  // v5.2.9：其他浏览器应答后统一撤销
     getAiBody().append(confirmEl);
-    scrollBottom();
+    scrollBottom(true);   // 需要用户确认：强制置底，避免用户漏看
 
     $$("button", confirmEl).forEach(btn => {
       btn.addEventListener("click", async () => {
@@ -2152,7 +2212,7 @@ function ensureToolCard(toolId, name) {
 
     liveRun.pendingRespondEl = askEl;  // v5.2.9：其他浏览器应答后统一撤销
     getAiBody().append(askEl);
-    scrollBottom();
+    scrollBottom(true);   // 需要用户回答：强制置底，避免用户漏看
     inputEl.focus();
   }
 
@@ -2483,7 +2543,7 @@ function renderRestoredMessages(messages) {
   }
   // 恢复的历史消息中渲染 mermaid / echarts 图表
   void renderDiagrams(col);
-  scrollBottom();
+  scrollBottom(true);   // 加载/切换会话：置底并恢复跟随
 }
 
 /* ---- 新会话 / 压缩 ---- */
@@ -4750,7 +4810,7 @@ async function loadMCPView() {
 function showAddMCP(agent, onDone) {
   const nameInput = el("input", { class: "input", placeholder: "服务器名称" });
   const urlInput = el("input", { class: "input", placeholder: "http://localhost:3000/sse" });
-  const headersInput = el("textarea", { class: "input", rows: 3, placeholder: '每行一个 Header，格式: Key=Value\n例如:\nAuthorization=Bearer xxx' });
+  const headersInput = el("textarea", { class: "input", rows: 3, placeholder: '每行一个 Header，格式: Key=Value\n例如:\nAuthorization=Bearer xxx\n或占位符: Authorization=Bearer ${API_KEY}' });
 
   openModal({
     title: "添加 MCP 服务器",
@@ -4758,7 +4818,7 @@ function showAddMCP(agent, onDone) {
       el("div", { class: "form-row" }, el("label", null, "名称 *"), nameInput),
       el("div", { class: "form-row" }, el("label", null, "URL *"), urlInput),
       el("div", { class: "form-row" }, el("label", null, "HTTP Headers（可选）"), headersInput,
-        el("div", { class: "form-hint" }, "每行一个，格式 Key=Value"))),
+        el("div", { class: "form-hint" }, "每行一个，格式 Key=Value；值支持 ${ENV} 占位（连接时展开，不落明文）"))),
     footer: [
       el("button", { class: "btn", onclick: () => $("#modal-root").innerHTML = "" }, "取消"),
       el("button", {

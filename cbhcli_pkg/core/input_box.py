@@ -350,7 +350,9 @@ class ChatInputBox:
         """显示提示符并获取用户输入
 
         Returns:
-            用户输入文本（已 strip），EOFError 时返回 "quit"，KeyboardInterrupt 时返回 ""
+            用户输入文本（已 strip），EOFError 时返回 "quit"，
+            KeyboardInterrupt 时向上传播（run() 主循环统一处理：
+            QQ 任务运行中 → 请求中断 QQ 任务；否则打印中断提示）
         """
         # 同样使用元组列表而非 HTML（<style class> 会被解析器丢弃）
         prompt_text = [("class:prompt", "❯ ")]
@@ -364,8 +366,9 @@ class ChatInputBox:
             return user_input.strip()
         except EOFError:
             return "quit"
-        except KeyboardInterrupt:
-            return ""
+        # v5.3.1（QQ并发修复）：Ctrl+C 不再吞掉——向上传播到 run() 主循环，
+        # 由其 except KeyboardInterrupt 分支优先请求中断正在运行的 QQ 任务
+        # （旧版返回 "" 会导致 run() 里 continue，QQ 任务无法被 Ctrl+C 中断）
 
     def print_user_echo(self, user_input: str):
         """打印用户输入回显（提交后高亮显示）

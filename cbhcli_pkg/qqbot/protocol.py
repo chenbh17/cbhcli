@@ -59,6 +59,7 @@ class Intent(IntEnum):
 EVENT_TYPES = {
     "C2C_MESSAGE_CREATE": "C2C 私聊消息",
     "GROUP_AT_MESSAGE_CREATE": "群聊@消息",
+    "GROUP_MESSAGE_CREATE": "群聊消息(全量)",
     "AT_MESSAGE_CREATE": "频道@消息",
     "DIRECT_MESSAGE_CREATE": "频道私信",
     "MESSAGE_CREATE": "频道消息",
@@ -199,8 +200,8 @@ class QQBotProtocol:
     def extract_message_content(payload: WSPayload) -> Optional[dict]:
         """从 DISPATCH 事件中提取消息内容
 
-        支持 C2C_MESSAGE_CREATE 和 GROUP_AT_MESSAGE_CREATE 事件。
-        同时提取附件（图片、文件等）。
+        支持 C2C_MESSAGE_CREATE / GROUP_AT_MESSAGE_CREATE / GROUP_MESSAGE_CREATE 事件。
+        同时提取附件（图片、文件等）与引用消息（msg_elements）。
 
         Returns:
             包含以下字段的字典:
@@ -213,6 +214,10 @@ class QQBotProtocol:
                 group_id: 群组 ID（仅群聊事件）
                 message_type: "c2c" 或 "group"
                 attachments: 附件列表 [{url, content_type, filename, size, width, height}]
+                ref_content: 被引用消息文本（仅引用消息，可能为空串）
+                ref_attachments: 被引用消息的附件列表（可能为空）
+                ref_author_name: 被引用消息发送者昵称（可能为空）
+                mentions: 群聊中被 @ 的用户列表（仅 GROUP_MESSAGE_CREATE 全量消息，供 @机器人 判定）
         """
         if not QQBotProtocol.is_dispatch(payload):
             return None
@@ -224,7 +229,7 @@ class QQBotProtocol:
 
         # 提取附件（图片/文件）
         attachments = []
-        raw_attachments = data.get('attachments', [])
+        raw_attachments = data.get('attachments') or []
         for att in raw_attachments:
             attachments.append({
                 'url': att.get('url', ''),
@@ -237,33 +242,91 @@ class QQBotProtocol:
                 'asr_refer_text': att.get('asr_refer_text', ''),
             })
 
+        # 提取引用消息（message_type=103 时 msg_elements 携带被引用内容）
+        # 结构: [{content, attachments, message_type, msg_idx, author: {id, bot, username, ...}}]
+        # 匹配规则与 nonebot adapter-qq 一致：message_scene.ext 中的 ref_msg_idx=<msg_idx>
+        # 对应的元素即被引用消息。author 可能缺失（QQ 群引用消息不下发 author）。
+        ref_content, ref_attachments, ref_author_name = "", [], ""
+        msg_elements = data.get('msg_elements') or []
+        if msg_elements:
+            ref_msg_idx = ""
+            scene = data.get('message_scene')
+            if isinstance(scene, dict):
+                for ext in (scene.get('ext') or []):
+                    if isinstance(ext, str) and ext.startswith('ref_msg_idx='):
+                        ref_msg_idx = ext[len('ref_msg_idx='):]
+                        break
+            target = None
+            if ref_msg_idx:
+                for el in msg_elements:
+                    if isinstance(el, dict) and el.get('msg_idx') == ref_msg_idx:
+                        target = el
+                        break
+            if target is None and isinstance(msg_elements[0], dict):
+                # 兜底：无 ref_msg_idx 时取第一个元素（QQ 客户端引用回复基本只带一个）
+                target = msg_elements[0]
+            if target is not None:
+                ref_content = (target.get('content') or '').strip()
+                ref_author = target.get('author') or {}
+                ref_author_name = ref_author.get('username', '') or ''
+                for att in (target.get('attachments') or []):
+                    url = att.get('url', '')
+                    if url and not url.startswith(('http://', 'https://')):
+                        url = 'https://' + url.lstrip('/')
+                    ref_attachments.append({
+                        'url': url,
+                        'content_type': att.get('content_type', ''),
+                        'filename': att.get('filename', ''),
+                        'size': att.get('size', 0),
+                        'width': att.get('width'),
+                        'height': att.get('height'),
+                    })
+
         if event_type == "C2C_MESSAGE_CREATE":
             author = data.get('author', {})
             return {
                 'msg_id': data.get('id', ''),
                 'content': data.get('content', '').strip(),
-                'author_id': author.get('id', ''),
-                'author_name': author.get('username', ''),
+                'author_id': author.get('user_openid') or author.get('id', ''),
+                'author_name': author.get('username', '') or author.get('union_user_account', ''),
                 'timestamp': data.get('timestamp', ''),
                 'event_type': event_type,
                 'group_id': None,
                 'message_type': 'c2c',
                 'attachments': attachments,
+                'ref_content': ref_content,
+                'ref_attachments': ref_attachments,
+                'ref_author_name': ref_author_name,
+                'mentions': [],
             }
 
-        elif event_type == "GROUP_AT_MESSAGE_CREATE":
+        elif event_type in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
             author = data.get('author', {})
             group_id = data.get('group_openid', data.get('group_id', ''))
+            # 群聊发送者：member_openid 优先（群场景主键），回退 union_openid/id
+            author_id = author.get('member_openid') or author.get('union_openid') \
+                or author.get('id', '')
+            # 全量消息（GROUP_MESSAGE_CREATE）附带 mentions 列表，供上层判定
+            # 是否 @机器人（提及 id 在全量副本中即机器人自身 id）
+            mentions = []
+            if event_type == "GROUP_MESSAGE_CREATE":
+                for m in (data.get('mentions') or []):
+                    if isinstance(m, dict) and m.get('id'):
+                        mentions.append(m.get('id'))
             return {
                 'msg_id': data.get('id', ''),
                 'content': data.get('content', '').strip(),
-                'author_id': author.get('id', ''),
-                'author_name': author.get('username', ''),
+                'author_id': author_id,
+                'author_name': author.get('username', '') or '',
                 'timestamp': data.get('timestamp', ''),
                 'event_type': event_type,
                 'group_id': group_id,
                 'message_type': 'group',
                 'attachments': attachments,
+                'ref_content': ref_content,
+                'ref_attachments': ref_attachments,
+                'ref_author_name': ref_author_name,
+                'mentions': mentions,
             }
 
         return None
