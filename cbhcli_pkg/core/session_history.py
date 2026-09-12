@@ -1,8 +1,122 @@
 """会话历史管理 - 保存和恢复会话记录"""
 import json
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+
+# ===================================================================
+#  会话元数据缓存（v5.3.3）
+# ===================================================================
+# 问题：list_sessions() 过去对每个历史文件做完整 json.load()，会话多时
+# （几百个文件、上百 MB）侧边栏刷新 / CLI /resume 每次都要解析全部消息
+# 内容，实测 cbhcli agent（500 个文件）单次 0.45s 且随会话增长持续变慢。
+# 方案：① 元数据字段在 JSON 开头（messages 之前），只读文件头部 8KB 即可
+#         解析出 id/title/时间/消息数/工作空间，不必解析整个 messages；
+#       ② 按 (mtime_ns, size) 缓存元数据，文件未变则零解析。
+_META_CACHE: dict = {}          # filepath(str) -> (mtime_ns, size, meta)
+_META_CACHE_LOCK = threading.Lock()
+_META_CACHE_MAX = 3000
+_META_HEAD_BYTES = 8192
+
+
+def _normalize_meta(data: dict) -> dict:
+    """从会话数据中提取列表展示所需的元数据字段"""
+    return {
+        "id": data.get("id", "") or "",
+        # 压缩标题中的换行/连续空白，避免列表显示折行
+        # 后行首出现"1、"等字样被误认为列表编号
+        "title": " ".join((data.get("title", "") or "").split()),
+        "created_at": data.get("created_at", "") or "",
+        # 最后对话时间（每次保存刷新；旧文件无此字段回落创建时间）
+        "updated_at": (data.get("updated_at") or data.get("created_at", "") or ""),
+        "message_count": data.get("message_count", 0) or 0,
+        "workspace": data.get("workspace", "") or "",
+    }
+
+
+def _meta_from_head(filepath: Path) -> Optional[dict]:
+    """只读文件头部解析会话元数据（不解析 messages 数组）
+
+    依赖 save_session 的写入格式（json.dump indent=2，元数据字段在
+    messages 之前）；格式不符时返回 None，由调用方回退到完整解析。
+    """
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(_META_HEAD_BYTES)
+    except OSError:
+        return None
+    text = head.decode("utf-8", errors="ignore")
+    meta: dict = {}
+    for line in text.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s == "{":
+            continue
+        if s.startswith('"messages"'):
+            break
+        if not s.startswith('"'):
+            return None
+        s = s.rstrip(",")
+        key_part, sep, value_part = s.partition('": ')
+        if not sep:
+            return None
+        try:
+            meta[key_part[1:]] = json.loads(value_part)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if "message_count" not in meta and "id" not in meta:
+        return None
+    return _normalize_meta(meta)
+
+
+def _read_session_meta(filepath: Path) -> Optional[dict]:
+    """读取（带缓存的）会话元数据"""
+    try:
+        st = filepath.stat()
+    except OSError:
+        return None
+    sig = (st.st_mtime_ns, st.st_size)
+    key = str(filepath)
+    with _META_CACHE_LOCK:
+        hit = _META_CACHE.get(key)
+    if hit is not None and hit[0] == sig[0] and hit[1] == sig[1]:
+        return hit[2]
+
+    meta = _meta_from_head(filepath)
+    if meta is None:
+        # 回退：完整解析（兼容手工编辑/非标准格式的历史文件）
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+        meta = _normalize_meta(data)
+
+    with _META_CACHE_LOCK:
+        _META_CACHE[key] = (sig[0], sig[1], meta)
+        if len(_META_CACHE) > _META_CACHE_MAX:
+            overflow = list(_META_CACHE.keys())[:len(_META_CACHE) - _META_CACHE_MAX]
+            for k in overflow:
+                _META_CACHE.pop(k, None)
+    return meta
+
+
+def _cache_meta_after_save(filepath: Path, meta: dict) -> None:
+    """保存/重命名后立即刷新元数据缓存（省去下次列表的解析）"""
+    try:
+        st = filepath.stat()
+    except OSError:
+        return
+    with _META_CACHE_LOCK:
+        _META_CACHE[str(filepath)] = (st.st_mtime_ns, st.st_size, dict(meta))
+
+
+def _drop_meta_cache(filepath: Path) -> None:
+    with _META_CACHE_LOCK:
+        _META_CACHE.pop(str(filepath), None)
 
 
 class SessionHistoryManager:
@@ -118,6 +232,7 @@ class SessionHistoryManager:
         
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(session_data, f, ensure_ascii=False, indent=2)
+        _cache_meta_after_save(filepath, _normalize_meta(session_data))
         
         return str(filepath)
     
@@ -135,24 +250,13 @@ class SessionHistoryManager:
         
         sessions = []
         for filepath in sorted(self.history_dir.glob("*.json"), reverse=True):
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                sessions.append({
-                    "filename": filepath.name,
-                    "filepath": str(filepath),
-                    "id": data.get("id", ""),
-                    # v5.2.8：压缩标题中的换行/连续空白，避免列表显示折行
-                    # 后行首出现"1、"等字样被误认为列表编号
-                    "title": " ".join((data.get("title", "") or "").split()),
-                    "created_at": data.get("created_at", ""),
-                    # v5.3.1+：最后对话时间（每次保存刷新；旧文件无此字段回落创建时间）
-                    "updated_at": data.get("updated_at") or data.get("created_at", ""),
-                    "message_count": data.get("message_count", 0),
-                    "workspace": data.get("workspace", "")
-                })
-            except (json.JSONDecodeError, KeyError):
+            meta = _read_session_meta(filepath)
+            if meta is None:
                 continue
+            entry = dict(meta)
+            entry["filename"] = filepath.name
+            entry["filepath"] = str(filepath)
+            sessions.append(entry)
             
             if len(sessions) >= limit:
                 break
@@ -185,8 +289,10 @@ class SessionHistoryManager:
             data["title"] = title
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            _cache_meta_after_save(filepath, _normalize_meta(data))
             return True
         except (json.JSONDecodeError, OSError):
+            _drop_meta_cache(filepath)
             return False
 
     def load_session(self, filename: str) -> Optional[list[dict]]:
@@ -225,4 +331,5 @@ class SessionHistoryManager:
             return False
         
         filepath.unlink()
+        _drop_meta_cache(filepath)
         return True

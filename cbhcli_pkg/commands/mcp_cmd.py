@@ -1,4 +1,7 @@
 """MCP 命令处理"""
+import re
+from urllib.parse import urlparse
+
 from cbhcli_pkg.core.prompt_utils import ask_text
 from cbhcli_pkg.commands.parser import SlashCommand
 
@@ -58,7 +61,7 @@ def _mcp_help() -> str:
 用法: /mcp <子命令> [参数]
 
 子命令:
-  add <名称> <URL> [header名=值 ...]  添加 MCP 服务器
+  add [名称] <URL> [header名=值 ...]  添加 MCP 服务器（名称可省略，自动从 URL 推导）
   list                                列出所有 MCP 服务器
   rm <名称>                           移除 MCP 服务器
   refresh <名称>                      重新连接并刷新工具
@@ -66,9 +69,14 @@ def _mcp_help() -> str:
   on <服务器> <工具名>                 启用指定工具
   off <服务器> <工具名>                禁用指定工具
 
+header 写法:
+  ● 值含空格时用引号包裹：Authorization="Bearer sk-xxx"
+  ● 值支持 ${环境变量} 占位符，连接时展开（mcp.json 不落明文）
+
 示例:
   /mcp add myserver http://localhost:8080/mcp
-  /mcp add authed http://localhost:8080/mcp Authorization=Bearer xxx
+  /mcp add authed http://localhost:8080/mcp Authorization="Bearer sk-xxx"
+  /mcp add https://host/path/mcp Authorization="Bearer ${API_KEY}"
   /mcp list
   /mcp tools myserver
   /mcp off myserver some_tool
@@ -76,26 +84,114 @@ def _mcp_help() -> str:
   /mcp rm myserver"""
 
 
+def _split_args(text: str) -> list[str]:
+    """引号感知的空白拆分（v5.3.2）。
+
+    支持用单/双引号包裹含空白的值，例如：
+        Authorization="Bearer sk-xxx"
+        "Authorization=Bearer sk-xxx"
+    引号本身会被剥离；引号未配对时回退到普通空白拆分（保持旧输入行为）。
+    说明：不用 shlex——posix 模式会吞掉值中的反斜杠，改变既有输入的语义。
+    """
+    tokens: list[str] = []
+    buf: list[str] = []
+    quote = None
+    for ch in text:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch.isspace():
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if quote is not None:
+        return text.split()  # 引号未配对，回退到普通拆分
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
+# URL 中不具区分度的通用片段（推导服务器名称时跳过）
+_GENERIC_URL_SEGMENTS = {
+    "mcp", "sse", "stream", "streamable", "message", "messages",
+    "api", "v1", "v2", "v3", "http", "https", "server", "servers",
+}
+
+
+def _looks_like_url(text: str) -> bool:
+    """参数是否形如 URL（用于省略名称时自动识别）"""
+    return text.lower().startswith(("http://", "https://"))
+
+
+def _derive_server_name(url: str) -> str:
+    """从 URL 推导服务器名称（省略名称时使用）。
+
+    取路径最后一段有意义的片段；若路径无可取片段（如 .../mcp、.../v1），
+    则取主机名中最有意义的段。非法字符替换为 '-'，兜底 'mcp-server'。
+    """
+    try:
+        parsed = urlparse(url)
+        segments = [seg for seg in parsed.path.split("/")
+                    if seg and seg.lower() not in _GENERIC_URL_SEGMENTS]
+        candidate = segments[-1] if segments else ""
+        if not candidate and parsed.hostname:
+            host = parsed.hostname
+            if re.fullmatch(r"[0-9.]+", host):
+                candidate = host  # IP 地址：整体使用
+            else:
+                host_parts = [p for p in host.split(".")
+                              if p.lower() not in _GENERIC_URL_SEGMENTS]
+                candidate = host_parts[0] if host_parts else host
+        candidate = re.sub(r"[^0-9A-Za-z_\-]+", "-", candidate).strip("-")
+        return candidate or "mcp-server"
+    except Exception:
+        return "mcp-server"
+
+
 def _mcp_add(args: str, app) -> str:
-    """添加 MCP 服务器"""
+    """添加 MCP 服务器
+
+    v5.3.2：
+    - 名称可省略（第一个参数是 URL 时自动推导名称）
+    - header 值支持引号包裹含空白（Authorization="Bearer sk-xxx"）
+    - header 值支持 ${环境变量} 占位符（连接时展开，不落明文）
+    """
+    usage = "❌ 用法: /mcp add [名称] <URL> [header名=值 ...]"
     if not args.strip():
-        return "❌ 用法: /mcp add <名称> <URL> [header名=值 ...]"
-    
-    parts = args.strip().split()
-    if len(parts) < 2:
-        return "❌ 用法: /mcp add <名称> <URL> [header名=值 ...]"
-    
-    name = parts[0]
-    url = parts[1]
-    
-    # 解析 headers
+        return usage
+
+    parts = _split_args(args)
+    if not parts:
+        return usage
+
+    auto_named = False
+    if _looks_like_url(parts[0]):
+        # 省略名称：从 URL 自动推导
+        name, url, rest = _derive_server_name(parts[0]), parts[0], parts[1:]
+        auto_named = True
+    else:
+        if len(parts) < 2:
+            return usage
+        name, url, rest = parts[0], parts[1], parts[2:]
+
+    # 解析 headers（值可用引号包裹以包含空白；${ENV} 占位符在连接时展开）
     headers = {}
-    for part in parts[2:]:
+    for part in rest:
         if "=" in part:
             key, _, value = part.partition("=")
-            headers[key] = value
-    
+            if key:
+                headers[key] = value
+
     result = app.mcp_manager.add_server(name, url, headers if headers else None)
+    if auto_named and result.startswith("❌"):
+        result += (f"\n💡 名称 '{name}' 由 URL 自动推导；"
+                   f"也可显式指定：/mcp add <名称> <URL> ...")
     _rebuild_prompt(app)
     return result
 

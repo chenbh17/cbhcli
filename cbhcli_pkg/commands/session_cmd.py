@@ -4,6 +4,112 @@ from cbhcli_pkg.commands.parser import SlashCommand
 from cbhcli_pkg.context.compressor import SUMMARY_MARKER
 
 
+# ===================================================================
+#  /resume 历史回显（v5.3.3）
+# ===================================================================
+# 恢复历史会话后在终端回显历史对话内容（对齐 Web 端"恢复后显示历史消息"）。
+# 只展示 user / assistant 消息：工具调用折叠成一行摘要，工具结果不展开
+# （完整历史已加载进上下文）；单条消息超长时截断，避免旧的长回复刷屏。
+_RESUME_PREVIEW_MSGS = 20       # 最多回显最近多少条消息
+_RESUME_PREVIEW_CHARS = 1500    # 单条消息最多回显多少字符
+
+
+def _term_width(default: int = 80) -> int:
+    """终端宽度（限制在合理范围内，避免超宽分隔线）"""
+    try:
+        import shutil
+        return max(40, min(shutil.get_terminal_size((default, 24)).columns, 120))
+    except Exception:
+        return default
+
+
+def _render_markdown_block(text: str, prefix: str = "") -> None:
+    """用 CLI 的 Markdown 渲染器渲染一段静态文本（复用 AI 回复的渲染效果）"""
+    try:
+        from cbhcli_pkg.core.markdown_renderer import MarkdownStreamRenderer
+        renderer = MarkdownStreamRenderer()
+        if prefix:
+            renderer.set_prefix(prefix)
+        renderer.feed(text if text.endswith("\n") else text + "\n")
+        renderer.flush()
+    except Exception:
+        # 渲染失败时退回纯文本，保证历史内容总能显示
+        print(f"{prefix}{text}")
+
+
+def _print_resumed_history(messages: list, title: str = "") -> None:
+    """恢复会话后回显历史对话（v5.3.3）
+
+    Args:
+        messages: 会话原始消息列表（含 system/tool，函数内部自行过滤）
+        title: 会话标题（可选，用于回显头部）
+    """
+    from cbhcli_pkg.core.constants import (
+        C_RESET, C_DIM, C_SEP, C_USER_BG, C_USER_FG, C_AI_TEXT,
+    )
+
+    items = []          # (role, content, tool_calls)
+    for msg in messages:
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = (msg.get("content") or "").strip()
+        tool_calls = msg.get("tool_calls") or []
+        if not content and not tool_calls:
+            continue
+        items.append((role, content, tool_calls))
+
+    if not items:
+        return
+
+    shown = items[-_RESUME_PREVIEW_MSGS:]
+    omitted = len(items) - len(shown)
+    width = _term_width()
+
+    print(f"\n{C_SEP}{'─' * width}{C_RESET}")
+    head = "📜 历史会话回显"
+    if title:
+        head += f" · {title[:60]}"
+    head += f"（共 {len(items)} 条消息"
+    if omitted > 0:
+        head += f"，显示最近 {len(shown)} 条"
+    head += "）"
+    print(f"{C_DIM}{head}{C_RESET}")
+    print(f"{C_SEP}{'─' * width}{C_RESET}")
+
+    for role, content, tool_calls in shown:
+        if role == "user":
+            text, truncated = content, False
+            if len(text) > _RESUME_PREVIEW_CHARS:
+                text, truncated = text[:_RESUME_PREVIEW_CHARS], True
+            lines = text.split("\n")
+            print(f"{C_USER_BG}{C_USER_FG}▌ > {lines[0]}{C_RESET}")
+            for line in lines[1:]:
+                print(f"{C_USER_BG}{C_USER_FG}    {line}{C_RESET}")
+            if truncated:
+                print(f"{C_DIM}    …（内容过长，已截断）{C_RESET}")
+        else:
+            if content:
+                text, truncated = content, False
+                if len(text) > _RESUME_PREVIEW_CHARS:
+                    text, truncated = text[:_RESUME_PREVIEW_CHARS], True
+                _render_markdown_block(text, prefix=f"\n{C_AI_TEXT}AI: {C_RESET}")
+                if truncated:
+                    print(f"{C_DIM}  …（内容过长，已截断）{C_RESET}")
+            if tool_calls:
+                names = []
+                for tc in tool_calls:
+                    fn = ((tc.get("function") or {}).get("name")) or "?"
+                    names.append(fn)
+                uniq = list(dict.fromkeys(names))
+                extra = f"，共 {len(names)} 次调用" if len(names) > len(uniq) else ""
+                print(f"{C_DIM}   🔧 工具调用: {', '.join(uniq)}{extra}{C_RESET}")
+        print()
+    print(f"{C_SEP}{'─' * width}{C_RESET}")
+    print(f"{C_DIM}（以上为历史回显，完整上下文已恢复，可继续对话）{C_RESET}")
+
+
+
 def register_session_commands(parser, app):
     """注册会话相关命令"""
     
@@ -190,6 +296,18 @@ def register_session_commands(parser, app):
         
         # 统计恢复的消息
         user_count = sum(1 for m in messages if m.get("role") == "user")
+
+        # v5.3.3：恢复后在终端回显历史对话（对齐 Web 端"恢复会话后显示历史消息"）
+        try:
+            _title = ""
+            for _s in _ordered:
+                if _s.get("filename") == filename:
+                    _title = _s.get("title") or ""
+                    break
+            _print_resumed_history(messages, title=_title)
+        except Exception:
+            pass     # 回显失败不影响会话恢复本身
+
         return f"✅ 已恢复会话（{user_count} 轮对话，{len(messages)} 条消息）"
     
     parser.register(SlashCommand(

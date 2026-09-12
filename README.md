@@ -1,4 +1,4 @@
-# CBHCLI v5.3.1 - AI驱动的终端助手
+# CBHCLI v5.3.3 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -16,7 +16,7 @@
 - **Markdown渲染** - CLI界面支持Markdown格式渲染，代码高亮、表格、列表等美观显示
 - **LaTeX公式渲染** - 支持LaTeX数学公式渲染，行内公式与块级公式均可正常显示
 - **ReAct持续交付** - ReAct循环中自动压缩上下文，突破上下文窗口限制实现长任务持续交付
-- **聊天输入框** - 基于 prompt_toolkit 原生补全系统，字素簇宽度感知，支持中英文/emoji（含ZWJ/VS16/旗帜/肤色）输入退格无错位、resize防抖防重叠、斜杠命令补全菜单
+- **聊天输入框** - 基于 prompt_toolkit 原生补全系统，字素簇宽度感知，支持中英文/emoji（含ZWJ/VS16/旗帜/肤色）输入退格无错位、终端缩放抗 reflow 防重复（重绘范围与清除范围严格一致）、斜杠命令补全菜单
 - **统一交互输入** - 所有交互式提问（/model add 等）统一使用 prompt_toolkit 输入系统，中英文/emoji 退格行为一致
 - **状态栏** - 输入框下方状态栏以文字标签+高对比配色显示：模型/上下文/Agent/技能/完整路径
 - **并行子Agent** - AI智能拆分多个独立子任务并行委托（最多100个并发），rich.Live 实时状态板展示每个子Agent当前步骤，全部完成后主Agent再继续
@@ -109,7 +109,7 @@ cbhpacks_get_random_data → cbhpacks_desc_df → cbhpacks_cols_encode → cbhpa
 
 ### Web 界面（v4.9.4 全面重构，v5.2.9 实时架构升级）
 基于 FastAPI + 原生 JS SPA（零构建依赖，marked 内置离线可用），对标 CLI 全部功能与逻辑：
-- **实时对话（WebSocket）** - 流式渲染 Markdown、思考块折叠、工具调用卡片（默认收起，失败/含图自动展开）、工具确认条（允许/拒绝/全部允许/始终允许该命令）、ask_user 交互问答、自我反思重试提示、工具运行中随时中断；**多个浏览器打开同一会话画面完全一致**，多浏览器同时弹出确认时首个应答生效
+- **实时对话（WebSocket）** - 流式渲染 Markdown、思考块折叠、工具调用卡片（默认收起，失败/含图自动展开）、工具确认条（允许/拒绝/全部允许/始终允许该命令）、ask_user 交互问答、自我反思重试提示、工具运行中随时中断；**多个浏览器打开同一会话画面完全一致**，多浏览器同时弹出确认时首个应答生效；**滚动跟随**（用户往上翻阅历史时不再被流式输出强制拽到底部，右下角"回到底部"按钮一键返回）
 - **会话后台运行** - 新建/切换会话不中断正在执行的任务，后台继续运行并在侧边栏显示"●运行中"徽标；每轮自动落盘，刷新页面自动恢复到上次会话
 - **工作区会话管理** - 左侧栏按工作空间文件夹分组展示会话（可折叠），会话/文件夹三点菜单（重命名/复制/删除/选择该文件夹/新增会话/删除全部）；打开任意文件夹作为工作空间，Agent 随之感知新工作目录
 - **文件管理器** - 双面板（工作区⇄文件管理器左右互换、拖拽调宽），文件下载/复制路径/文件夹打开为工作空间
@@ -179,7 +179,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.3.1-py3-none-any.whl
+pip install dist/cbhcli-5.3.3-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -251,7 +251,7 @@ AI会通过 Function Calling 自动调用工具完成任务，例如：
 ```
 /new 或 /reset    # 创建新会话（自动保存当前会话到history文件夹）
 /resume           # 列出历史会话（最近50条）
-/resume 1         # 恢复第1个历史会话
+/resume 1         # 恢复第1个历史会话（恢复后回显历史对话内容）
 /resume 打包      # 按标题关键词搜索历史会话
 /history          # 查看历史会话列表
 /comp             # 手动压缩上下文
@@ -462,9 +462,12 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 ### 添加 MCP 服务器
 ```bash
 /mcp add myserver http://localhost:8080/mcp
-# 带认证：
-/mcp add authed http://localhost:8080/mcp Authorization=Bearer xxx
+# 带认证（值含空格时用引号包裹）：
+/mcp add authed http://localhost:8080/mcp Authorization="Bearer xxx"
+# 名称可省略（自动从 URL 推导）：
+/mcp add https://dashscope.aliyuncs.com/api/v1/mcps/TextGenerateImage/mcp Authorization="Bearer ${DASHSCOPE_API_KEY}"
 ```
+说明：header 值支持 `${环境变量}` / `$环境变量` 占位符，连接时展开（mcp.json 中不落明文 Key）；变量未设置时连接失败信息会明确提示。
 
 ### 管理 MCP 服务器
 ```bash
@@ -498,7 +501,7 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/model embedding` | 配置嵌入模型 |
 | `/model rerank` | 配置重排序模型 |
 | `/reset` 或 `/new` | 创建新会话（自动保存当前会话） |
-| `/resume [编号\|关键词]` | 列出或恢复历史会话（关键词按标题搜索） |
+| `/resume [编号\|关键词]` | 列出或恢复历史会话（关键词按标题搜索；恢复后回显历史对话） |
 | `/history` | 查看历史会话列表 |
 | `/comp [指令]` | 压缩上下文（可带保留/丢弃指令） |
 | `/undo-compress [编号]` | 撤销最近一次上下文压缩（恢复压缩前原始消息） |
@@ -516,7 +519,7 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/embedding status` | 查看索引状态 |
 | `/embedding clear` | 清除向量索引 |
 | `/embedding reindex` | 重新索引（清除后重建） |
-| `/mcp add <名> <URL>` | 添加 MCP 服务器 |
+| `/mcp add [名] <URL> [header=值]` | 添加 MCP 服务器（名可省略；值含空格用引号；支持 ${ENV}） |
 | `/mcp list` | 列出 MCP 服务器 |
 | `/mcp tools [名]` | 查看服务器工具 |
 | `/mcp rm [名]` | 移除 MCP 服务器 |
@@ -566,7 +569,7 @@ cbhcli_pkg/
 │   ├── app.py              # 主应用
 │   ├── input_box.py        # 聊天输入框组件（原生补全系统）
 │   ├── text_width.py       # 字素簇宽度计算（emoji/CJK精确对齐）
-│   ├── resize_fix.py       # 终端resize防抖（防输入框重复显示）
+│   ├── resize_fix.py       # 终端 resize 修复（重绘范围=清除范围，防输入框重复显示）
 │   ├── prompt_utils.py     # 统一交互输入（替代内置input）
 │   ├── agent.py            # Agent管理
 │   ├── session.py          # 会话管理
@@ -643,6 +646,34 @@ docs/                 # 项目文档
 └── ...
 
 ## 变更记录
+
+### v5.3.3
+
+**会话加载全面提速 + CLI 恢复会话回显历史**：
+
+- **Web 加载提速（MCP 连接进程级缓存）**：新建会话 / 恢复历史会话 / 切换 Agent 时不再重复 MCP 握手（每次 0.8~1.0s 的网络往返），改为复用进程内已建立的连接与工具定义 —— 实测会话创建 1656ms → 3ms。配置内容变化（增删服务器/改 header/启停工具）自动失效重连，`/mcp refresh` 仍强制刷新；服务器短暂不可用时记负缓存（120s 内不重复阻塞），工具调用遇会话失效会重新握手重试一次
+- **服务启动后台预热**：Web 服务启动后立即在后台线程初始化向量库并预连接各 Agent 的 MCP 服务器，用户第一次操作即命中缓存
+- **会话列表零解析（元数据缓存）**：侧边栏/CLI `/resume` 列会话不再为每个历史文件解析整份 `messages`（500 个文件实测 445ms → 9ms），改为只读文件头部的元数据字段 + 按 mtime/size 缓存
+- **`usage_stats` 签名缓存**：大会话（700+ 条消息）的 token 统计从每次 100ms+ 降为一次计算后直接复用（内容变化自动失效）
+- **CLI `/resume` 恢复后回显历史对话**：对齐 Web 端 —— 用户消息灰底高亮、AI 回复按 Markdown 渲染（代码块/表格/公式）、工具调用折叠为一行摘要；默认回显最近 20 条、单条超长截断，完整上下文照常恢复
+- **修复所有交互式命令报 `is_done` 错误**（`core/resize_fix.py`，v5.3.2 第四轮引入）：`Renderer.render` 的 resize 包装签名漏了 `is_done` 参数，导致 `/resume` 菜单、`/undo-compress`、`/mcp add` 等所有走交互输入的命令都"命令执行失败"；现改为 `*args/**kwargs` 原样透传（`_report_wrapper`、`_debounced_on_resize` 一并加固）
+
+### v5.3.2
+
+MCP 接入体验增强（带认证的远程 MCP 服务，如阿里云百炼）：
+
+- **`/mcp add` 支持引号包裹含空白的 header 值**：`Authorization="Bearer sk-xxx"` —— 旧版按空白拆分会把 token 丢掉（只剩 `Bearer`），现支持单/双引号包裹（引号未配对时回退旧行为，兼容不变）
+- **名称可省略**：`/mcp add <URL> [header...]` 自动从 URL 推导服务器名（`.../TextGenerateImage/mcp` → `TextGenerateImage`；自动跳过 mcp/sse/v1 等通用段）
+- **header 值支持 `${环境变量}` / `$环境变量` 占位符**：连接时展开，CLI / Web / 手写 mcp.json 全端生效；配置可只存占位符（API Key 不落明文）；变量缺失时连接失败信息会明确提示缺哪个变量
+- 连接层 headers 改为副本展开：展开的明文不回写配置（顺带不再把 `Accept`/`Content-Type` 写进 mcp.json）
+- 帮助文案与 README 中会丢 token 的错误认证示例已修正
+
+**同版本迭代追加：CLI 终端 resize 输入框残留 ❯ 彻底修复（`cbhcli_pkg/core/resize_fix.py` 第四轮重写）**
+
+- **现象**：终端窗口拖小后输入框出现"一串 ❯"（每次改窗口多一个旧 `❯`，旧版实测 2→3→4→5 递增）
+- **根因**：终端 resize 后 reflow（长行重折 + 滚屏）时，**xterm.js 类终端（Jupyter 终端、VS Code 终端）光标停在旧行不跟随内容**，而旧实现直接用 CPR 光标行推算"旧区域顶" → 每 resize 残留一行
+- **修复**：清除起点改用双路估算 —— ① CPR 反推（光标跟随内容时准确，**偏移按新宽度用干渲染重算**，修复多行输入折行数变化导致的 ±N 行偏差）；② 区域顶估算 `上次区域顶 − 区域自身 reflow 增长`（识别"光标根本没动"的陈旧光标终端，宁可多清也不残留）。reflow 增长按"同逻辑行拼接 + 只统计真会写进终端的格子"估算，间隙先吸收增量
+- **回归**：真实 cbhcli × 终端仿真台（xterm.js）下，`❯` 恒为 1（旧版逐次累积），banner/历史内容不被擦除，输入/提交/多行输入均正常；`tests/terminal_resize/` 新增 scene14（细粒度拖拽）、scene15（内容完整性编号校验）。**用户实测确认修复 ✓**（重启 cbhcli 后拖小窗口，输入框不再残留一串 `❯`）
 
 ### v5.3.1（建模护栏补强，同版本内迭代）
 

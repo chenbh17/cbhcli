@@ -34,6 +34,22 @@ class MCPClient:
         """生成下一个请求 ID"""
         self._request_id += 1
         return self._request_id
+
+    def clone(self) -> "MCPClient":
+        """复制一个客户端实例，复用已建立的 MCP 会话（v5.3.3）
+
+        用于「进程级 MCP 连接缓存」：多个会话共享同一份已握手的连接，
+        但各自持有独立的客户端对象--独立的请求 id 计数（避免并发调用
+        时 JSON-RPC id 冲突），共享 url/headers/Mcp-Session-Id，
+        从而跳过重复的 initialize 网络握手。
+        """
+        new = MCPClient(self.url, dict(self.headers), self.timeout)
+        new._session_id = self._session_id
+        return new
+
+    def reset_session(self) -> None:
+        """丢弃当前 MCP 会话（会话失效后重新握手用，v5.3.3）"""
+        self._session_id = None
     
     def _parse_sse_response(self, response: requests.Response) -> dict:
         """解析 SSE 响应或普通 JSON 响应
@@ -199,7 +215,7 @@ class MCPClient:
             "capabilities": {},
             "clientInfo": {
                 "name": "CBHCLI",
-                "version": "5.3.1"
+                "version": "5.3.3"
             }
         })
     

@@ -1,11 +1,89 @@
 """MCP 管理器 - 每个 Agent 独立管理 MCP 连接"""
+import hashlib
 import json
+import os
+import re
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 from cbhcli_pkg.core.mcp_client import MCPClient
 from cbhcli_pkg.core.mcp_tool_adapter import MCPToolAdapter
 from cbhcli_pkg.tools.registry import ToolRegistry
+
+
+# ${VAR} / $VAR 环境变量占位符（v5.3.2）
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+# ===================================================================
+#  进程级 MCP 连接缓存（v5.3.3）
+# ===================================================================
+# 问题：每次创建会话（Web 新建会话/恢复历史会话/切 Agent）都会重新
+# initialize 所有 MCP 服务器，实测每次 0.8~1.0 秒（纯网络握手），
+# 是"加载卡顿"的最大来源。
+# 方案：同一进程内按「mcp.json 内容」缓存已建立的连接与工具定义，
+# 后续会话直接从缓存重建工具（毫秒级，零网络请求）。
+# 失效条件：mcp.json 内容变化（增删服务器/改 headers/启停工具）→
+# 缓存 key 变化 → 自动重新连接；手动 refresh 也会刷新缓存。
+_CONN_CACHE: dict = {}                 # key -> {server_name: entry}
+_CONN_CACHE_LOCK = threading.Lock()
+_CONN_CACHE_MAX = 16                   # 最多保留多少份不同配置的缓存
+_CONN_RETRY_AFTER = 120.0              # 连接失败后多久允许重试（秒）
+
+# entry: {"client": MCPClient|None, "tools": list[dict], "url": str,
+#         "failed_at": float}
+
+
+
+def _expand_env_vars(value: str) -> tuple[str, list[str]]:
+    """展开 ${VAR} / $VAR 占位符。
+
+    未设置的环境变量保留占位符原样，并计入缺失列表（由调用方提示用户）。
+
+    Returns:
+        (展开后的字符串, 缺失的环境变量名列表)
+    """
+    missing: list[str] = []
+
+    def _replace(match):
+        var = match.group(1) or match.group(2)
+        actual = os.environ.get(var)
+        if actual is None:
+            missing.append(var)
+            return match.group(0)
+        return actual
+
+    return _ENV_VAR_PATTERN.sub(_replace, value), missing
+
+
+def _conn_cache_key(config_file, servers: list[dict]) -> str:
+    """按「配置文件 + 服务器配置内容」生成缓存 key（v5.3.3）
+
+    用内容而非 mtime：连接过程本身会重写 mcp.json（_save_config），
+    mtime 每次都会变，用它做 key 会导致缓存永不命中。
+    """
+    try:
+        payload = json.dumps(servers, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        payload = str(servers)
+    digest = hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
+    return f"{config_file}|{digest}"
+
+
+def _conn_cache_get(key: str) -> Optional[dict]:
+    with _CONN_CACHE_LOCK:
+        entry = _CONN_CACHE.get(key)
+        return dict(entry) if entry else None
+
+
+def _conn_cache_update_server(key: str, server_name: str, entry: dict) -> None:
+    with _CONN_CACHE_LOCK:
+        bucket = _CONN_CACHE.setdefault(key, {})
+        bucket[server_name] = dict(entry)
+        while len(_CONN_CACHE) > _CONN_CACHE_MAX:
+            _CONN_CACHE.pop(next(iter(_CONN_CACHE)))
+
 
 
 class MCPManager:
@@ -96,13 +174,98 @@ class MCPManager:
         self._connect_all_servers()
     
     def _connect_all_servers(self):
-        """连接所有已配置的服务器"""
+        """连接所有已配置的服务器（v5.3.3：优先复用进程级连接缓存）
+
+        缓存命中时直接克隆已握手的客户端 + 复用工具定义注册（毫秒级，
+        零网络请求）；未命中才真正连接并写回缓存。这样同一进程内
+        新建会话/恢复会话/切 Agent 都不再重复 0.8~1.0 秒的 MCP 握手。
+        """
+        key = _conn_cache_key(self.config_file, self._servers)
+        cached = _conn_cache_get(key)
+        if cached is not None:
+            # ---- 缓存命中：逐服务器重建工具（无网络请求）----
+            now = time.time()
+            missing = cached.get("_missing") or {}
+            for server in self._servers:
+                name = server.get("name")
+                entry = cached.get(name)
+                if entry is None:
+                    # 缓存里没有（上次连接失败）：短时间内部不重试，
+                    # 避免每次创建会话都卡在失败服务器的超时上
+                    if now - float(missing.get(name, 0.0)) < _CONN_RETRY_AFTER:
+                        continue
+                    if not self._try_connect(server):
+                        missing[name] = now
+                        _conn_cache_update_server(key, "_missing", missing)
+                    continue
+                if entry.get("client") is None:
+                    # 负缓存（上次连接失败）
+                    if now - float(entry.get("failed_at", 0.0)) < _CONN_RETRY_AFTER:
+                        continue
+                    self._try_connect(server)
+                    continue
+                try:
+                    self._register_cached_server(server, entry)
+                except Exception:
+                    pass
+            return
+
+        # ---- 缓存未命中：真正连接（首次 / 配置变化）----
         for server in self._servers:
             try:
-                self._connect_server(server)
+                self._try_connect(server)
             except Exception:
                 # 连接失败不阻塞启动
                 pass
+
+    def _try_connect(self, server: dict) -> bool:
+        """连接一台服务器并写缓存（失败写负缓存，v5.3.3）
+
+        Returns:
+            是否连接成功
+        """
+        name = server.get("name") or ""
+        ok = False
+        try:
+            self._connect_server(server)      # 成功后内部写缓存
+            ok = name in self._clients
+        except Exception:
+            ok = False
+        if not ok:
+            key = _conn_cache_key(self.config_file, self._servers)
+            _conn_cache_update_server(key, name, {
+                "client": None, "tools": [], "failed_at": time.time(),
+                "url": server.get("url", ""),
+            })
+        return ok
+
+    def _register_cached_server(self, server: dict, entry: dict) -> int:
+        """用缓存条目重建某服务器的工具（不发起网络请求，v5.3.3）
+
+        Returns:
+            注册的工具数量
+        """
+        name = server.get("name") or ""
+        base_client = entry.get("client")
+        if base_client is None:
+            return 0
+        client = base_client.clone()      # 独立请求计数，共享 MCP 会话
+        tools = entry.get("tools") or []
+        enabled_tools = server.get("enabled_tools")  # None = 全部启用
+        if enabled_tools is not None:
+            tools = [t for t in tools if t.get("name") in enabled_tools]
+        registered = 0
+        for tool_info in tools:
+            try:
+                adapter = MCPToolAdapter(client, tool_info, name)
+                self._mcp_tools[adapter.name] = adapter
+                self.tool_registry.register(adapter)
+                registered += 1
+            except Exception:
+                continue
+        self._clients[name] = client
+        return registered
+
     
     def _save_config(self):
         """保存 MCP 配置"""
@@ -316,7 +479,8 @@ class MCPManager:
                 try:
                     client = self._clients.get(server_name)
                     if not client:
-                        client = MCPClient(server_config["url"], server_config.get("headers", {}))
+                        headers, _ = self._client_headers(server_config)
+                        client = MCPClient(server_config["url"], headers)
                         client.initialize()
                     
                     all_tools = client.list_tools()
@@ -360,6 +524,25 @@ class MCPManager:
         # 重新连接
         return self._connect_server(server)
     
+    def _client_headers(self, server: dict) -> tuple[dict, list[str]]:
+        """生成用于实际连接的 headers 副本（v5.3.2）。
+
+        - 对值中的 ${VAR} / $VAR 占位符做环境变量展开：配置里可只存占位符，
+          API Key 不必明文落盘到 mcp.json
+        - 返回副本而非原地修改：展开后的明文不会写回配置文件
+        - 同时返回缺失的环境变量名列表，供连接失败时提示用户
+
+        Returns:
+            (headers 副本, 缺失的环境变量名列表)
+        """
+        headers = dict(server.get("headers") or {})
+        missing: list[str] = []
+        for key, value in list(headers.items()):
+            if isinstance(value, str) and "$" in value:
+                headers[key], miss = _expand_env_vars(value)
+                missing.extend(miss)
+        return headers, missing
+
     def _connect_server(self, server: dict) -> str:
         """连接 MCP 服务器并注册工具
         
@@ -371,7 +554,7 @@ class MCPManager:
         """
         name = server["name"]
         url = server["url"]
-        headers = server.get("headers", {})
+        headers, missing_env = self._client_headers(server)
         
         try:
             # 创建客户端
@@ -382,10 +565,12 @@ class MCPManager:
             
             # 获取工具列表
             tools = client.list_tools()
+            all_tools = list(tools)      # 缓存用全量（注册时再按 enabled 过滤）
             
             if not tools:
                 self._clients[name] = client
                 self._save_config()
+                self._cache_conn_result(server, client, all_tools)
                 return f"⚠️  已连接 MCP 服务器: {name}（无可用工具）"
             
             # 过滤启用的工具
@@ -403,11 +588,29 @@ class MCPManager:
             
             self._clients[name] = client
             self._save_config()
+            self._cache_conn_result(server, client, all_tools)
             
             return f"✅ 已添加 MCP 服务器: {name}（{registered} 个工具）"
             
         except Exception as e:
-            return f"❌ 连接 MCP 服务器失败: {name}\n错误: {str(e)}"
+            message = f"❌ 连接 MCP 服务器失败: {name}\n错误: {str(e)}"
+            if missing_env:
+                message += ("\n⚠️ 环境变量未设置: " + ", ".join(missing_env)
+                            + "（headers 中的 ${...} 占位符无法展开，请先 export 后再试）")
+            return message
+
+    def _cache_conn_result(self, server: dict, client: MCPClient,
+                           tools: list) -> None:
+        """把连接结果写入进程级缓存（v5.3.3，供后续会话零网络重建工具）"""
+        try:
+            key = _conn_cache_key(self.config_file, self._servers)
+            _conn_cache_update_server(key, server.get("name") or "", {
+                "client": client, "tools": list(tools or []),
+                "url": server.get("url", ""), "failed_at": 0.0,
+            })
+        except Exception:
+            pass
+
     
     def _register_tool_from_server(self, server: dict) -> str:
         """从服务器重新注册所有启用的工具"""
