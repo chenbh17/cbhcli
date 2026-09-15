@@ -2,6 +2,7 @@
 import json
 import re
 import sys
+import threading
 import uuid
 from typing import Optional, Callable, TYPE_CHECKING
 
@@ -229,7 +230,10 @@ class AIHandler:
             self._c_text = C_AI_TEXT
             self._c_dim = C_DIM
             self._label = display_label
-            
+
+        # 中断事件（QQ Bot 回调线程中运行的 AI 任务，由 CLI 主线程 Ctrl+C
+        # 通过 set() 触发中断；流式循环每 chunk 检查一次，工具循环每轮检查一次）
+        self.interrupt_event: Optional['threading.Event'] = None
         # 思考内容滚动显示管理器
         self.thinking_display = ThinkingDisplay(max_lines=THINKING_MAX_LINES, label=self._label)
 
@@ -278,8 +282,17 @@ class AIHandler:
         # v5.2.3：压缩失败冷却标记（每个用户请求独立）——失败后本请求内不再重试
         self._compress_failed_this_request = False
 
+        # 外部中断检查（QQ Bot 任务在回调线程中运行，CLI 主线程
+        # Ctrl+C 通过 interrupt_event 触发；中断后本轮任务立即结束）
+        if self.interrupt_event is not None and self.interrupt_event.is_set():
+            raise KeyboardInterrupt
+
         # --- ReAct 循环 ---
         for round_idx in range(MAX_TOOL_ROUNDS):
+            # 每轮循环开头检查外部中断
+            if self.interrupt_event is not None and self.interrupt_event.is_set():
+                raise KeyboardInterrupt
+
             # 检查上下文是否接近上限，自动压缩
             self._check_and_compress_in_react(round_idx)
 
@@ -411,6 +424,12 @@ class AIHandler:
 
             stream = client.chat_stream(messages, **stream_kwargs)
             for chunk_type, content in stream:
+                # 外部中断检查（QQ 任务在回调线程运行时，CLI 主线程
+                # Ctrl+C 触发 interrupt_event → 立即中断流式读取）
+                if self.interrupt_event is not None and self.interrupt_event.is_set():
+                    stream.close()
+                    raise KeyboardInterrupt
+
                 if chunk_type == "reasoning":
                     if not is_reasoning:
                         is_reasoning = True
