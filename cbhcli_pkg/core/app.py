@@ -83,6 +83,7 @@ from cbhcli_pkg.commands.qqbot_cmd import register_qqbot_commands
 from cbhcli_pkg.commands.fallback_cmd import register_fallback_commands
 from cbhcli_pkg.commands.harness_cmd import register_harness_commands
 from cbhcli_pkg.commands.chain_cmd import register_chain_commands
+from cbhcli_pkg.commands.auth_cmd import register_auth_commands
 
 
 class SlashCommandHelper:
@@ -508,6 +509,7 @@ class CBHCLIApp:
         register_fallback_commands(self.command_parser, self)
         register_harness_commands(self.command_parser, self)
         register_chain_commands(self.command_parser, self)
+        register_auth_commands(self.command_parser, self)   # /login /logout /whoami /ping
         
         # 注册help命令
         def help_handler(args):
@@ -879,6 +881,7 @@ class CBHCLIApp:
         old_mode = self.permission_engine.mode
         self.permission_engine.set_mode(mode)
         if getattr(self, "tracer", None):
+            # 模式变更审计：tracer 镜像统一上报（v5.4.0，见 core/tracer.py）
             self.tracer.log_mode_change(old_mode, mode)
         self._update_system_prompt()
         return True
@@ -1311,14 +1314,21 @@ class CBHCLIApp:
                     continue
                 
                 if user_input.lower() == 'quit':
-                    # 退出前保存当前会话
-                    if self.session and self.session_history and len(self.session.messages) > 1:
-                        try:
-                            ctx_msgs = self.session.get_context_messages()
-                            self.session_history.save_session(
-                                ctx_msgs, self.session.id, workspace=os.getcwd())
-                        except Exception:
-                            pass
+                    # 退出前保存当前会话（统一走 _autosave_session：
+                    # 同时获得审计快照上报，v5.4.0）
+                    self._autosave_session()
+                    # v5.4.0（认证系统）：会话结束事件 + 上报器同步 flush
+                    try:
+                        from cbhcli_pkg.auth import get_reporter
+                        _rep_quit = get_reporter()
+                        if self.session:
+                            _rep_quit.report_status(self.session.id, status="idle")
+                            _rep_quit.report_event(
+                                "session_end", session_id=self.session.id,
+                                reason="quit")
+                        _rep_quit.stop()
+                    except Exception:
+                        pass
                     print("\n再见!")
                     break
                 
@@ -1336,6 +1346,15 @@ class CBHCLIApp:
 
                 # 处理AI请求
                 if self.llm_client and self.session:
+                    # 认证拦截（v5.4.0）：未登录/凭据失效时不允许发起对话，
+                    # 其他本地配置类命令（/model、/tools 等）不受影响
+                    try:
+                        from cbhcli_pkg.auth import require_login
+                        if not require_login("cli", interactive=False):
+                            self._print_login_hint()
+                            continue
+                    except Exception:
+                        pass  # 认证系统故障绝不影响对话主流程
                     # v5.3.1：QQ 任务运行中时提示等待（命令仍可正常执行，
                     # 但 AI 请求必须串行——CLI 与 QQ 共享同一会话）
                     if self.session_busy:
@@ -1360,6 +1379,8 @@ class CBHCLIApp:
         同 session_id 幂等覆盖同一文件，多次保存不产生重复文件。
         覆盖场景：正常回复完成、Ctrl+C 中断（process_request 内部已捕获）、
         请求异常等--应用崩溃/kill/关终端时最多丢正在生成的当前轮。
+
+        v5.4.0：落盘成功后同步上报审计快照（管理端完整查看会话内容）。
         """
         if not self.autosave_history:
             return
@@ -1367,11 +1388,37 @@ class CBHCLIApp:
             if getattr(self, "session", None) and getattr(self, "session_history", None) \
                     and len(self.session.messages) > 1:
                 # v5.3.1+（问题7）：记录工作空间（当前目录），供 Web 按路径分类
-                self.session_history.save_session(
+                saved_path = self.session_history.save_session(
                     self.session.get_context_messages(), self.session.id,
                     workspace=os.getcwd())
+                # v5.4.0：审计快照上报（读刚落盘的文件；reporter 内部去重+异步）
+                if saved_path:
+                    try:
+                        from cbhcli_pkg.auth import report_snapshot_file
+                        report_snapshot_file(
+                            saved_path,
+                            agent=self.current_agent_name or "main",
+                            session_id=self.session.id)
+                    except Exception:
+                        pass
         except Exception:
             pass  # 保存失败不影响对话
+
+    def _print_login_hint(self):
+        """未登录/凭据失效时打印引导（CLI 发消息拦截版，v5.4.0）"""
+        try:
+            from cbhcli_pkg.auth import guide
+            from cbhcli_pkg.auth.guard import get_last_reason
+            reason = get_last_reason()
+            if reason in ("expired", "expired_offline", "invalid",
+                          "strict_offline"):
+                print("\n" + guide.expired_hint_text("cli") + "\n")
+            elif reason == "disabled":
+                print(f"\n🔐 {guide.error_guide('disabled', 'cli')}\n")
+            else:
+                print("\n" + guide.login_hint_text("cli") + "\n")
+        except Exception:
+            print("\n🔐 未登录 — 输入 /login 登录，或运行 cbhcli login\n")
 
     def _handle_ai_request(self, user_input: str):
         """处理AI请求 - 委托给AIHandler
@@ -1438,17 +1485,33 @@ class CBHCLIApp:
         _hb_stop = threading.Event()
         _agent = self.current_agent_name or "main"
         _sid = self.session.id if self.session else ""
+        _title = ""
         if _sid:
+            _title = (web_notify.session_title_of(self.session)
+                      or user_input[:50])
             web_notify.notify_web_async(
                 _agent, _sid, "running", workspace=os.getcwd(),
-                title=(web_notify.session_title_of(self.session)
-                       or user_input[:50]))
+                title=_title)
 
             def _heartbeat():
                 while not _hb_stop.wait(30):
                     web_notify.notify_web(_agent, _sid, "running",
                                           workspace=os.getcwd())
             threading.Thread(target=_heartbeat, daemon=True).start()
+
+        # v5.4.0（认证系统）：审计上报（状态 running + 轮开始事件）。
+        # 与 web_notify 职责分离，独立 try/except，静默失败。
+        try:
+            from cbhcli_pkg.auth import get_reporter
+            _rep = get_reporter()
+            if _sid:
+                _rep.report_status(_sid, agent=_agent, title=_title,
+                                   workspace=os.getcwd(), status="running",
+                                   surface=getattr(self, "surface", "cli"))
+                _rep.report_event("session_round_start", session_id=_sid,
+                                  prompt=user_input[:2000])
+        except Exception:
+            pass
 
         try:
             # 处理请求
@@ -1474,6 +1537,18 @@ class CBHCLIApp:
             if _sid:
                 web_notify.notify_web(_agent, _sid, "idle",
                                       workspace=os.getcwd())
+            # v5.4.0（认证系统）：审计状态 idle + 轮结束事件。
+            # 同样必须同步入队（reporter 队列在 stop()/atexit 时同步 flush）
+            try:
+                from cbhcli_pkg.auth import get_reporter
+                if _sid:
+                    _rep2 = get_reporter()
+                    _rep2.report_status(_sid, agent=_agent, status="idle",
+                                        surface=getattr(self, "surface", "cli"))
+                    _rep2.report_event("session_round_complete",
+                                       session_id=_sid)
+            except Exception:
+                pass
     
     def _update_memory(self, user_input: str, ai_response: str):
         """更新记忆回调 - 仅用于保存会话历史
@@ -1533,6 +1608,27 @@ class CBHCLIApp:
                  (f" {mode_meta['label']}", C_TXT)]
         info3 = [("quit 退出 · /help 帮助 · Shift+Tab 切换权限模式", C_DIM)]
 
+        # v5.4.0（认证系统）：登录状态行（已登录显示身份，未登录显示引导）。
+        # 注意：方框内不使用 emoji——部分终端（xterm.js）emoji 渲染宽度与
+        # wcwidth 模型不一致（实测 1 列），会导致该行右侧边框错位 1 格；
+        # 统一用宽度安全字符 ●（U+25CF，宽度恒为 1）。
+        info4 = []
+        try:
+            from cbhcli_pkg.auth import auth_status, guide as _auth_guide
+            st = auth_status()
+            if st.get("logged_in"):
+                _u = st.get("user") or {}
+                _name = _u.get("display_name") or _u.get("name") or "?"
+                _exp = st.get("expires_at")
+                _exp_text = "永久" if not _exp else _auth_guide.format_expiry(_exp)
+                info4 = [(f"● {_name} @ {st.get('server', '')}", C_VAL),
+                         (f"（{_exp_text}）", C_DIM)]
+            else:
+                info4 = [("● 未登录 — 输入 /login 登录，或运行 cbhcli login",
+                          "\033[93m")]
+        except Exception:
+            info4 = []
+
         # 内容宽度 = 艺术字、信息行中最宽者
         def _segs_width(segs):
             return _dw("".join(t for t, _ in segs))
@@ -1540,6 +1636,7 @@ class CBHCLIApp:
         content_w = max(
             max(_dw(line) for line in art),
             _segs_width(info1), _segs_width(info2), _segs_width(info3),
+            _segs_width(info4) if info4 else 0,
         )
         content_w = min(content_w, self._get_terminal_width() - 6)
 
@@ -1558,6 +1655,8 @@ class CBHCLIApp:
         print(_row(info1))
         print(_row(info2))
         print(_row(info3))
+        if info4:
+            print(_row(info4))
         print(f"{C_SEP}╰{border}╯{C_RESET}\n")
     
     @staticmethod

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cbhcli"
-version = "5.3.3"
+version = "5.4.0"
 authors = [
     {name = "陈丙寰", email = "13943034070@163.com"},
 ]
@@ -49,6 +49,7 @@ dev = [
 
 [project.scripts]
 cbhcli = "cbhcli_pkg.cli:main"
+cbhcli-admin = "cbhcli_pkg.admin.server:run_admin_entry"
 
 [project.urls]
 "Homepage" = "https://github.com/chenbh17/cbhcli"
@@ -60,3 +61,4 @@ include = ["cbhcli_pkg*"]
 
 [tool.setuptools.package-data]
 "cbhcli_pkg.web" = ["static/**/*"]
+"cbhcli_pkg.admin" = ["static/**/*"]

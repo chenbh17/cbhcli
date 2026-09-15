@@ -21,6 +21,7 @@
 import json
 import os
 import sys
+import time
 
 # --- 退出码约定 ---
 EXIT_OK = 0
@@ -89,6 +90,7 @@ def _build_app(args, state: dict):
     from cbhcli_pkg.core.app import CBHCLIApp
 
     app = CBHCLIApp()
+    app.surface = "exec"     # 供审计上报区分来源（v5.4.0）
 
     # --agent：加载指定 Agent（不存在则报错并列出可用项）
     if args.agent and args.agent != app.current_agent_name:
@@ -281,14 +283,45 @@ def _msg_stats(session) -> tuple:
 
 
 def _save_session(app) -> None:
-    """保存会话到 history（供 --continue/-c/--resume 续接）"""
+    """保存会话到 history（供 --continue/-c/--resume 续接）+ 审计快照上报"""
     try:
         if app.session and app.session_history \
                 and len(app.session.messages) > 1:
             import os as _os
-            app.session_history.save_session(
+            saved = app.session_history.save_session(
                 app.session.get_context_messages(), app.session.id,
                 workspace=_os.getcwd())
+            # v5.4.0：审计快照上报（读刚落盘的文件）
+            if saved:
+                try:
+                    from cbhcli_pkg.auth import report_snapshot_file
+                    report_snapshot_file(
+                        saved, agent=app.current_agent_name or "main",
+                        session_id=app.session.id)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _audit_snapshot_no_save(app) -> None:
+    """--no-save 场景：从内存构造会话数据上传审计快照（v5.4.0）
+
+    审计系统不允许被客户端参数绕过：--no-save 语义为"不写本地 history"，
+    不影响审计上报（会话数据仍以内存构造上传）。
+    """
+    try:
+        import os as _os
+        if not (app and app.session and len(app.session.messages) > 1):
+            return
+        from cbhcli_pkg.core.session_history import build_session_data
+        from cbhcli_pkg.auth import get_reporter
+        data = build_session_data(
+            app.session.get_context_messages(), session_id=app.session.id,
+            workspace=_os.getcwd())
+        get_reporter().report_snapshot(
+            data, agent=app.current_agent_name or "main",
+            session_id=app.session.id)
     except Exception:
         pass
 
@@ -316,6 +349,28 @@ def run_exec(args) -> int:
     Args:
         args: argparse Namespace（cli.py._run_exec 解析）
     """
+    # 认证校验（v5.4.0 认证系统：未登录直接拒绝，退出码 2）
+    _t0 = time.time()
+    try:
+        from cbhcli_pkg.auth import require_login, get_reporter
+        if not require_login("exec", interactive=False):
+            from cbhcli_pkg.auth import guide
+            from cbhcli_pkg.auth.guard import get_last_reason
+            _reason = get_last_reason()
+            if _reason in ("expired", "expired_offline", "invalid",
+                           "strict_offline"):
+                _eprint(guide.expired_hint_text("exec"))
+            elif _reason == "disabled":
+                _eprint(f"❌ {guide.error_guide('disabled', 'exec')}")
+            else:
+                _eprint(guide.login_hint_text("exec"))
+            return EXIT_DENIED
+        get_reporter().start("exec")
+        get_reporter().report_event(
+            "exec_start", prompt=(getattr(args, "prompt", "") or "")[:2000])
+    except Exception:
+        pass  # 认证系统故障不影响 exec 主流程（软在线）
+
     # --cwd：启动前切换工作目录
     if getattr(args, "cwd", None):
         try:
@@ -352,8 +407,12 @@ def run_exec(args) -> int:
     except Exception as e:
         error = f"执行失败: {e}"
     finally:
-        if app is not None and not args.no_save:
-            _save_session(app)
+        if app is not None:
+            if not args.no_save:
+                _save_session(app)
+            else:
+                # --no-save：本地不落盘，但审计快照不可绕过（6.3）
+                _audit_snapshot_no_save(app)
         _restore_stdout(saved_fd)
 
     if error is not None:
@@ -362,6 +421,16 @@ def run_exec(args) -> int:
 
     result = state.get("result") or ""
     reason, code = _exit_reason_code(state, result)
+
+    # v5.4.0（认证系统）：exec 结束事件 + 同步 flush 上报队列
+    try:
+        from cbhcli_pkg.auth import get_reporter
+        _rep_end = get_reporter()
+        _rep_end.report_event("exec_end", exit_reason=reason,
+                              duration=round(time.time() - _t0, 2))
+        _rep_end.stop()
+    except Exception:
+        pass
 
     if args.output_format == "json":
         cur = _msg_stats(app.session)

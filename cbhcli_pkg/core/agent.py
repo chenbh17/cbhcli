@@ -682,7 +682,21 @@ CBHCLI 是一个AI驱动的终端助手，帮助你执行各种任务。
 - /mcp [add|list|rm|refresh|tools|on|off] - MCP服务器管理
 - /chain [list|add|rm|use|off|show|config|rename] - Agent链条管理（无参数进入交互引导）
 - /qqbot [add|list|start|stop|restart|status|rm|config] - QQ Bot管理
+- /login [IP:端口] [密钥] - 用户登录（向导式，含连通性测试）
+- /logout [--local-only] - 退出登录（吊销凭据，四端失效）
+- /whoami - 查看当前登录身份与凭据状态
+- /ping [IP:端口] - 服务器连通性测试
 - quit - 退出程序
+
+## 用户认证（v5.4.0）
+本机需登录后使用（CLI / Web / Jupyter / exec 四端统一认证，登录一次即全部可用）：
+- 登录入口（任选其一）：① 终端 `cbhcli login` ② 交互界面内 `/login`（向导式）
+  ③ Web 页面登录界面 ④ Jupyter 插件提示引导
+- 登录需要【服务器地址 + 认证密钥】（向管理员获取）；凭据保存在 ~/.cbhcli/auth.json（0600）
+- 未登录时发消息会被拦截（提示 /login 与 cbhcli login 两个入口）；本地配置类命令仍可用
+- 查看状态: /whoami（或 cbhcli whoami）；退出: /logout（或 cbhcli logout）
+- 连通性测试: /ping（或 cbhcli ping）；凭据过期请联系管理员续期（续期后重试自动恢复）
+- 管理服务（服务器端）: cbhcli admin（需管理员主密码）；自检 cbhcli-admin status
 
 ## 权限模式（Harness 治理层）
 cbhcli 有四档权限模式，用户按 Shift+Tab 循环切换，或用 /mode 命令直接设置：

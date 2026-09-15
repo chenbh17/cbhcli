@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>CBHCLI ADMIN 管理服务</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231a1d23'/%3E%3Ctext x='16' y='22' font-size='17' text-anchor='middle' fill='%234a9eff' font-family='monospace' font-weight='bold'%3E%E2%9D%AF%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/admin/css/style.css?v=__V__u5" />
+</head>
+<body>
+  <!-- ===================================================================
+       登录视图（未登录 / 会话失效时显示）
+       =================================================================== -->
+  <div id="login-view" class="login-view hidden">
+    <div class="login-card">
+      <div class="login-logo"><span class="login-logo-icon">❯</span> CBHCLI <span class="login-logo-accent">ADMIN</span></div>
+      <h1 class="login-title">CBHCLI ADMIN 管理服务</h1>
+      <p class="login-sub">用户管理 · 会话审计 · 实时监控</p>
+      <form id="login-form" autocomplete="off">
+        <input id="login-password" class="input login-input" type="password"
+               placeholder="请输入管理员主密码" autocomplete="current-password" />
+        <button id="login-btn" class="btn btn-primary login-btn" type="submit">登 录</button>
+      </form>
+      <div id="login-error" class="login-error hidden"></div>
+      <div class="login-footer" id="login-footer">cbhcli admin</div>
+    </div>
+  </div>
+
+  <!-- ===================================================================
+       主界面：左侧导航 + 右侧内容区（顶栏）
+       =================================================================== -->
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <span class="brand-icon">❯</span>
+        <span class="brand-text">CBHCLI <span class="brand-accent">ADMIN</span></span>
+      </div>
+      <nav class="sidebar-nav" id="sidebar-nav">
+        <a class="nav-item" data-route="dashboard" href="#/dashboard"><span class="nav-icon">📊</span><span class="nav-text">仪表盘</span></a>
+        <a class="nav-item" data-route="users" href="#/users"><span class="nav-icon">👤</span><span class="nav-text">用户管理</span></a>
+        <a class="nav-item" data-route="sessions" href="#/sessions"><span class="nav-icon">💬</span><span class="nav-text">会话管理</span></a>
+        <a class="nav-item" data-route="monitor" href="#/monitor"><span class="nav-icon">📡</span><span class="nav-text">实时监控</span></a>
+        <a class="nav-item" data-route="audit" href="#/audit"><span class="nav-icon">📜</span><span class="nav-text">审计日志</span></a>
+        <a class="nav-item" data-route="settings" href="#/settings"><span class="nav-icon">⚙️</span><span class="nav-text">设置</span></a>
+      </nav>
+      <div class="sidebar-footer" id="sidebar-footer">cbhcli admin</div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <span id="svc-dot" class="dot gray"></span>
+          <span id="svc-text" class="svc-text">服务状态检测中…</span>
+        </div>
+        <div class="topbar-right">
+          <span id="topbar-clock" class="topbar-clock"></span>
+          <button id="btn-logout" class="btn btn-ghost btn-sm" type="button" title="退出管理会话">退出</button>
+        </div>
+      </header>
+
+      <main class="content" id="content">
+        <section class="view" id="view-dashboard"></section>
+        <section class="view" id="view-users"></section>
+        <section class="view" id="view-sessions"></section>
+        <section class="view" id="view-monitor"></section>
+        <section class="view" id="view-audit"></section>
+        <section class="view" id="view-settings"></section>
+      </main>
+    </div>
+  </div>
+
+  <!-- 会话详情抽屉 / 模态框 / Toast 挂载点 -->
+  <div id="drawer-root"></div>
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+
+  <script src="/admin/vendor/marked.umd.js?v=__V__"></script>
+  <script src="/admin/js/app.js?v=__V__u5"></script>
+</body>
+</html>

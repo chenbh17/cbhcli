@@ -5,10 +5,37 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CBHCLI Web</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <link rel="stylesheet" href="/css/style.css?v=5.3.3" />
-  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.3.3" />
+  <link rel="stylesheet" href="/css/style.css?v=5.4.0.2" />
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.4.0.2" />
 </head>
 <body>
+  <!-- ===== 登录视图（v5.4.0：未登录时全屏显示，浏览器内完成登录） ===== -->
+  <div id="login-view" class="login-view hidden">
+    <div class="login-card">
+      <div class="login-logo"><span class="logo-icon">❯</span> CBHCLI</div>
+      <h2 class="login-title">登录后即可使用</h2>
+      <p class="login-sub" id="login-sub">地址与密钥请向管理员获取；登录一次，CLI / Jupyter / exec 均可用</p>
+      <div class="login-field">
+        <label>服务器地址</label>
+        <input class="input" id="login-server" placeholder="192.168.1.100:28888" autocomplete="off" />
+      </div>
+      <div class="login-row">
+        <button class="btn btn-ghost" id="btn-login-ping" type="button">测试连接</button>
+        <span class="login-ping-result" id="login-ping-result"></span>
+      </div>
+      <div class="login-field">
+        <label>认证密钥</label>
+        <input class="input" id="login-key" type="password" placeholder="cbhk_…（输入不回显）"
+               autocomplete="off" />
+      </div>
+      <button class="btn btn-primary login-btn" id="btn-login-submit" type="button">登 录</button>
+      <div class="login-error hidden" id="login-error"></div>
+      <div class="login-hint" id="login-hint">
+        💡 也可在终端运行 <code>cbhcli login</code> 完成登录
+      </div>
+    </div>
+  </div>
+
   <div id="app">
     <!-- ===== 工作区面板（v5.2.8：新会话 + 工作区会话列表 + 设置按钮；
          与文件管理器面板可左右互换，宽度可拖拽） ===== -->
@@ -44,6 +71,9 @@
       </div>
       <div class="ws-list" id="ws-list"></div>
       <div class="sidebar-footer">
+        <button class="side-settings-btn" id="btn-account" title="账户（登录状态 / 切换登录）">
+          <span class="nav-icon">👤</span><span class="nav-label" id="btn-account-label">账户</span>
+        </button>
         <button class="side-settings-btn" id="btn-settings" title="设置（Agent/模型/技能/MCP/安全等）">
           <span class="nav-icon">⚙️</span><span class="nav-label">设置</span>
         </button>
@@ -83,6 +113,9 @@
           </div>
           <div class="chat-header-right">
             <button class="btn btn-ghost" id="btn-chain" title="Agent 链条">🔗</button>
+            <div class="conn-badge" id="conn-badge" title="连接状态（点击重新测试）">
+              <span id="conn-badge-text">🟢 在线</span>
+            </div>
             <div class="mode-badge" id="mode-badge" title="权限模式（点击切换）">
               <span id="mode-badge-text">🟢 标准</span>
             </div>
@@ -151,8 +184,8 @@
   <!-- Toast 通知 -->
   <div id="toast-root"></div>
 
-  <script src="/vendor/marked.umd.js?v=5.3.3"></script>
-  <script src="/vendor/katex/katex.min.js?v=5.3.3"></script>
-  <script src="/js/app.js?v=5.3.3"></script>
+  <script src="/vendor/marked.umd.js?v=5.4.0.2"></script>
+  <script src="/vendor/katex/katex.min.js?v=5.4.0.2"></script>
+  <script src="/js/app.js?v=5.4.0.2"></script>
 </body>
 </html>

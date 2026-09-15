@@ -3,7 +3,6 @@ import json
 import re
 import sys
 import uuid
-import threading
 from typing import Optional, Callable, TYPE_CHECKING
 
 from cbhcli_pkg.core.session import Session, Message
@@ -62,6 +61,34 @@ def _fix_unicode_escapes(obj):
         return result
     else:
         return obj
+
+
+def _audit_stream(session, kind: str, text: str) -> None:
+    """审计实时流上报（v5.4.0：管理页面"实时交互画面"数据源）。
+
+    kind: content（正文）/ reasoning（思考）。增量在 reporter 内聚合
+    （≥400 字符或 0.8s 一批），失败静默、绝不阻塞主流程。
+    """
+    try:
+        sid = getattr(session, "id", "") or ""
+        if not sid or not text:
+            return
+        from cbhcli_pkg.auth import report_stream_text
+        report_stream_text(sid, kind, text)
+    except Exception:
+        pass
+
+
+def _audit_stream_flush(session) -> None:
+    """流式结束：立即冲刷聚合缓冲（管理页面无需等下一批/轮结束）。"""
+    try:
+        sid = getattr(session, "id", "") or ""
+        if not sid:
+            return
+        from cbhcli_pkg.auth import flush_stream_text
+        flush_stream_text(sid)
+    except Exception:
+        pass
 
 
 def repair_tool_messages(messages: list) -> list:
@@ -187,9 +214,6 @@ class AIHandler:
         self.context_compressor: Optional['ContextCompressor'] = None  # 由 app.py 注入
         self.context_window: Optional['ContextWindow'] = None  # 由 app.py 注入
         self.auto_compress: bool = True  # 由 app.py 注入
-        # 中断事件（v5.3.1：QQ Bot 回调线程中运行的 AI 任务，由 CLI 主线程 Ctrl+C
-        # 通过 set() 触发中断；流式循环每 chunk 检查一次，工具循环每轮检查一次）
-        self.interrupt_event: Optional['threading.Event'] = None
         # 链条下游 Agent 事件回调（Web 端 SSE 推送用）
         # 签名: (event_type, agent_name, **data) -> None
         self._chain_event_callback: Optional[Callable] = None
@@ -254,17 +278,8 @@ class AIHandler:
         # v5.2.3：压缩失败冷却标记（每个用户请求独立）——失败后本请求内不再重试
         self._compress_failed_this_request = False
 
-        # v5.3.1：外部中断检查（QQ Bot 任务在回调线程中运行，CLI 主线程
-        # Ctrl+C 通过 interrupt_event 触发；中断后本轮任务立即结束）
-        if self.interrupt_event is not None and self.interrupt_event.is_set():
-            raise KeyboardInterrupt
-
         # --- ReAct 循环 ---
         for round_idx in range(MAX_TOOL_ROUNDS):
-            # v5.3.1：每轮循环开头检查外部中断
-            if self.interrupt_event is not None and self.interrupt_event.is_set():
-                raise KeyboardInterrupt
-
             # 检查上下文是否接近上限，自动压缩
             self._check_and_compress_in_react(round_idx)
 
@@ -396,12 +411,6 @@ class AIHandler:
 
             stream = client.chat_stream(messages, **stream_kwargs)
             for chunk_type, content in stream:
-                # v5.3.1：外部中断检查（QQ 任务在回调线程运行时，CLI 主线程
-                # Ctrl+C 触发 interrupt_event → 立即中断流式读取）
-                if self.interrupt_event is not None and self.interrupt_event.is_set():
-                    stream.close()
-                    raise KeyboardInterrupt
-
                 if chunk_type == "reasoning":
                     if not is_reasoning:
                         is_reasoning = True
@@ -410,6 +419,8 @@ class AIHandler:
                     reasoning_buffer += content
                     # 将思考内容添加到滚动显示区域
                     self.thinking_display.add_content(content)
+                    # 审计实时流（管理页面实时画面）
+                    _audit_stream(self.session, "reasoning", content)
                     # 链条事件回调（Web SSE 推送）
                     self._emit_chain_event("reasoning", content=content)
                     # 思考内容复读检测
@@ -449,6 +460,8 @@ class AIHandler:
                     # 通过 Markdown 流式渲染器处理内容
                     raw_content = md_renderer.feed(content)
                     ai_response += raw_content
+                    # 审计实时流（管理页面实时画面）
+                    _audit_stream(self.session, "content", content)
                     # 链条事件回调（Web SSE 推送）
                     self._emit_chain_event("content", content=content)
                     # 正文复读检测
@@ -462,6 +475,8 @@ class AIHandler:
 
             # 流式结束 — 完成 Markdown 渲染（清除纯文本+前缀，重新渲染）
             md_renderer.flush()
+            # 审计实时流：立即冲刷聚合缓冲（管理页面实时显示完整一段）
+            _audit_stream_flush(self.session)
 
             # v5.2.7：流结束后立即关闭思考显示（必须在打印 🔧 工具调用行
             # 之前--旧版在流末尾才 finish，reasoning->tool_calls 无 content

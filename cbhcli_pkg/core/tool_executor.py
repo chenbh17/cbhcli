@@ -269,7 +269,8 @@ class ToolExecutor:
                 permission=permission_action,
                 duration_ms=getattr(result, "duration_ms", 0),
                 success=result.success,
-                error=result.error or ""
+                error=result.error or "",
+                output=(result.output or result.error or "")[:800]
             )
 
         # 回调
