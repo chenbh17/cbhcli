@@ -98,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.3.3")
+app = FastAPI(title="CBHCLI Web", version="5.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,6 +107,125 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ===================================================================
+#  认证系统（v5.4.0）：全局中间件 + 本机登录代理端点
+# ===================================================================
+
+# 无需登录即可访问的前缀（登录端点；静态资源非 /api/ 前缀单独放行）
+_AUTH_FREE_PREFIXES = ("/api/auth/",)
+
+
+def _install_auth_middleware(app):
+    """全局认证中间件：业务 API 未登录一律 401（前端捕获后显示登录视图）。
+
+    - 放行: /api/auth/*（登录相关）与非 /api/ 路径（静态资源/页面）
+    - 凭据检查带 2s mtime 短缓存（is_logged_in_fast），几乎零开销
+    - 登录成功后中间件即时放行（下个请求即生效，无需重启）
+    """
+
+    @app.middleware("http")
+    async def _auth_middleware(request, call_next):
+        try:
+            path = request.url.path
+            if path.startswith(_AUTH_FREE_PREFIXES) or not path.startswith("/api/"):
+                return await call_next(request)
+            from cbhcli_pkg.auth import is_logged_in_fast
+            if not is_logged_in_fast():
+                return JSONResponse(
+                    {"error": "not_logged_in",
+                     "message": "本机未登录 cbhcli，请在登录界面完成登录"},
+                    status_code=401)
+        except Exception:
+            pass  # 认证系统故障绝不影响 Web 服务
+        return await call_next(request)
+
+
+# ---- 本机登录代理端点（浏览器内完成登录，无需命令行） ----
+
+@app.get("/api/auth/status")
+def auth_status_endpoint():
+    """本机登录状态（前端启动时判断显示登录视图或主界面）。"""
+    try:
+        from cbhcli_pkg.auth import auth_status
+        st = auth_status()
+    except Exception as e:
+        return {"logged_in": False, "error": str(e)}
+    # 在线状态：尽力探测（异步意义不大，短超时）
+    online = False
+    try:
+        from cbhcli_pkg.auth import AuthClient, AuthError
+        if st.get("server"):
+            AuthClient(server=st.get("server", ""), timeout=1.5).ping()
+            online = True
+    except Exception:
+        online = False
+    st["online"] = online
+    return st
+
+
+@app.post("/api/auth/ping")
+async def auth_ping_endpoint(req: Request):
+    """连通性测试：后端探测管理服务器（无跨域问题）。"""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    server = (body or {}).get("server", "") or ""
+    if not server:
+        try:
+            from cbhcli_pkg.auth import AuthStore
+            server = AuthStore().get_server()
+        except Exception:
+            server = ""
+    if not server:
+        return JSONResponse({"ok": False, "error": "unreachable",
+                             "message": "未指定服务器地址"}, status_code=400)
+    try:
+        from cbhcli_pkg.auth import AuthClient, normalize_server
+        info = AuthClient(server=normalize_server(server)).ping(
+            server=normalize_server(server))
+        return {"ok": True, **info}
+    except Exception as e:
+        code = getattr(e, "code", "unreachable")
+        message = getattr(e, "message", str(e))
+        return JSONResponse({"ok": False, "error": code, "message": message},
+                            status_code=200)
+
+
+@app.post("/api/auth/login")
+async def auth_login_endpoint(req: Request):
+    """浏览器内登录：调管理服务器 + 写本机 auth.json（设备级凭据）。"""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    server = (body or {}).get("server", "") or ""
+    key = (body or {}).get("key", "") or ""
+    try:
+        from cbhcli_pkg.auth.login_cmd import perform_login
+        result = perform_login(server, key, surface="web")
+        return {"ok": True, "user": result.get("user"),
+                "server": result.get("server"),
+                "expires_at": result.get("expires_at")}
+    except Exception as e:
+        code = getattr(e, "code", "server_error")
+        message = getattr(e, "message", str(e))
+        return JSONResponse({"ok": False, "error": code, "message": message},
+                            status_code=200)
+
+
+@app.post("/api/auth/logout")
+async def auth_logout_endpoint():
+    """退出登录：吊销服务端 token + 删除本机凭据 + 停用上报。"""
+    try:
+        from cbhcli_pkg.auth.login_cmd import perform_logout
+        result = perform_logout()
+        return {"ok": True, "message": result.get("message", "已退出登录")}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "server_error",
+                             "message": str(e)}, status_code=500)
 
 
 # ===================================================================
@@ -2874,17 +2993,132 @@ def _autosave_web_session(cs: "WebChatSession") -> None:
     达到最大轮数 / SSE 连接断开（客户端 aclose 生成器触发 finally）。
     同 session_id 幂等覆盖同一文件，Web/Jupyter 服务重启或崩溃时
     最多丢失正在生成的当前轮，已完成的对话轮均已落盘。
+
+    v5.4.0：落盘成功后同步上报审计快照（Jupyter 端经 _react_loop 复用
+    本函数，同样自动获得快照上报）。
     """
     try:
         if cs and cs.session and len(cs.session.messages) > 1:
             cfg = cs.agent_config or _get_agent_config(getattr(cs, "agent_name", ""))
             if cfg:
-                SessionHistoryManager(cfg.workspace_path).save_session(
+                _saved = SessionHistoryManager(cfg.workspace_path).save_session(
                     cs.session.get_context_messages(), cs.session.id,
                     workspace=getattr(cs, "workspace", "") or "",
                     title=getattr(cs, "custom_title", "") or "")
+                # v5.4.0：审计快照上报（读刚落盘的文件；reporter 内部去重+异步）
+                if _saved:
+                    try:
+                        from cbhcli_pkg.auth import report_snapshot_file
+                        report_snapshot_file(
+                            _saved,
+                            agent=getattr(cs, "agent_name", "") or "main",
+                            session_id=cs.session.id)
+                    except Exception:
+                        pass
     except Exception:
         pass  # 保存失败不影响对话
+
+
+# ===================================================================
+#  审计上报（v5.4.0 认证系统）
+#  —— 埋点在 _react_loop / _autosave_web_session，Web 与 Jupyter 共用
+# ===================================================================
+
+# SSE 事件白名单（低频类型才转发审计；高频 content/reasoning 零解析跳过）
+_AUDIT_TAP_TYPES = {"tool_result", "tool_rejected", "error", "fallback",
+                    "compressing", "compressed", "aborted"}
+
+
+def _audit_cs_info(cs) -> tuple:
+    """从会话提取 (session_id, agent, title, workspace)（全部容错）"""
+    try:
+        sid = getattr(getattr(cs, "session", None), "id", "") or ""
+        agent = getattr(cs, "agent_name", "") or "main"
+        title = ""
+        try:
+            title = getattr(cs, "custom_title", "") or _session_title(cs)
+        except Exception:
+            title = ""
+        ws = getattr(cs, "workspace", "") or ""
+        return sid, agent, title, ws
+    except Exception:
+        return "", "main", "", ""
+
+
+def _audit_status(cs, status: str) -> None:
+    """会话状态上报（running/idle；内部静默）"""
+    try:
+        sid, agent, title, ws = _audit_cs_info(cs)
+        if not sid:
+            return
+        from cbhcli_pkg.auth import get_reporter
+        get_reporter().report_status(sid, agent=agent, title=title,
+                                     workspace=ws, status=status,
+                                     surface="web")
+    except Exception:
+        pass
+
+
+def _audit_event(cs, type_: str, **payload) -> None:
+    """事件上报（内部静默）"""
+    try:
+        sid, _a, _t, _w = _audit_cs_info(cs)
+        from cbhcli_pkg.auth import get_reporter
+        get_reporter().report_event(type_, session_id=sid, **payload)
+    except Exception:
+        pass
+
+
+def _last_user_prompt(cs) -> str:
+    """取会话尾部最后一条 user 消息文本（多模态取 text 部分；失败空串）"""
+    try:
+        for m in reversed(getattr(getattr(cs, "session", None), "messages", []) or []):
+            if getattr(m, "role", "") == "user":
+                content = getattr(m, "content", "") or ""
+                if isinstance(content, str):
+                    return content[:2000]
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            return str(part.get("text", ""))[:2000]
+                return ""
+    except Exception:
+        pass
+    return ""
+
+
+def _audit_tap_event(cs, ev) -> None:
+    """SSE 事件转发（v5.4.0：content/reasoning 聚合转发供管理页面实时画面）
+
+    - content/reasoning：逐 token 增量交给 reporter 聚合（≥400 字符或
+      0.8s 一批）后转发为 stream_chunk 事件（此前为性能直接跳过）
+    - 其余事件按白名单转发（tool_result / tool_rejected / error / ...）
+    - 任何非流式事件到达时顺带冲刷流式缓冲（工具执行前内容及时上屏）
+    """
+    try:
+        head = ev[6:96] if isinstance(ev, str) else ""
+        is_stream = ('"type": "content"' in head
+                     or '"type": "reasoning"' in head)
+        data = _parse_sse_line(ev) if isinstance(ev, str) else None
+        sid = getattr(getattr(cs, "session", None), "id", "") or ""
+        if is_stream:
+            if sid and isinstance(data, dict):
+                kind = data.get("type", "")
+                text = data.get("content", "")
+                if kind in ("content", "reasoning") and text:
+                    from cbhcli_pkg.auth import report_stream_text
+                    report_stream_text(sid, kind, text)
+            return
+        if '"type": "tool_auto_confirmed"' in head:
+            return
+        # 非流式事件：先冲刷流式聚合缓冲（工具执行前内容及时上屏）
+        if sid:
+            from cbhcli_pkg.auth import flush_stream_text
+            flush_stream_text(sid)
+        if isinstance(data, dict) and data.get("type") in _AUDIT_TAP_TYPES:
+            _audit_event(cs, data["type"], payload=data)
+    except Exception:
+        pass
 
 
 async def _react_loop(cs: WebChatSession):
@@ -2892,12 +3126,23 @@ async def _react_loop(cs: WebChatSession):
 
     v5.2.6：wrapper 层 try/finally 保证每轮对话结束（含全部出口与
     SSE 连接断开）自动保存会话到 history，实际循环在 _react_loop_inner。
+
+    v5.4.0（认证系统）：同时上报 running/idle 状态与关键事件
+    （tool_result/tool_rejected/error/aborted 等白名单类型），
+    本函数为 Web + Jupyter 共用 -> 一次覆盖两端。
     """
     try:
+        _audit_status(cs, "running")
+        if getattr(cs, "session", None):
+            _audit_event(cs, "session_round_start",
+                         prompt=_last_user_prompt(cs))
         async for ev in _react_loop_inner(cs):
+            _audit_tap_event(cs, ev)
             yield ev
     finally:
         _autosave_web_session(cs)
+        _audit_status(cs, "idle")
+        _audit_event(cs, "session_round_complete")
 
 
 async def _react_loop_inner(cs: WebChatSession):
@@ -3552,7 +3797,8 @@ async def _react_loop_inner(cs: WebChatSession):
                 cs.tracer.log_tool_call(
                     tool_name, tool_args, permission=action,
                     duration_ms=result.duration_ms,
-                    success=result.success, error=result.error or "")
+                    success=result.success, error=result.error or "",
+                    output=(result.output or result.error or "")[:800])
 
             if result.success:
                 tool_output = (result.output or "")[:MAX_TOOL_OUTPUT_LENGTH]
@@ -3935,12 +4181,23 @@ def _load_session_core(agent_name: str, model_name: str, filename: str):
         raise HTTPException(404, f"Agent '{agent_name}' 不存在")
 
     history_mgr = SessionHistoryManager(agent_config.workspace_path)
+    # v5.4.0+：先用轻量元数据（文件头 8KB，有缓存）做作用域预检——
+    # 逐个尝试恢复会话的场景下，避免"完整解析大会话后才发现 403"的浪费
+    pre_meta = None
+    try:
+        pre_meta = history_mgr.get_meta(filename)
+    except Exception:
+        pre_meta = None
+    if pre_meta is not None:
+        _check_session_scope(pre_meta.get("workspace") or str(_SERVER_ROOT))
     data = history_mgr.load_session_full(filename)
     if data is None:
         raise HTTPException(404, "会话不存在")
 
     # v5.3.1+（问题4）：拒绝加载当前工作空间之外（本路径及子路径之外）的会话
-    _check_session_scope(data.get("workspace") or str(_SERVER_ROOT))
+    # （元数据不可用的非标准文件：此处回退为完整数据检查）
+    if pre_meta is None:
+        _check_session_scope(data.get("workspace") or str(_SERVER_ROOT))
 
     key = _get_session_key(agent_name, model_name)
 
@@ -4887,6 +5144,18 @@ def _prewarm_runtime():
 def run_server(port: int = 18888, host: str = "0.0.0.0"):
     import uvicorn
 
+    # 认证系统（v5.4.0）：启动审计上报 + 全局认证中间件。
+    # 未登录时仍启动服务（页面内登录），仅控制台提示。
+    try:
+        from cbhcli_pkg.auth import get_reporter, is_logged_in_fast
+        get_reporter().start("web")
+    except Exception:
+        pass
+    try:
+        _install_auth_middleware(app)
+    except Exception:
+        pass
+
     setup_static()
 
     # CLI 会话同步（v5.3.1+）：注册本实例供 CLI 进程发现并推送运行状态
@@ -4899,6 +5168,15 @@ def run_server(port: int = 18888, host: str = "0.0.0.0"):
 
     from cbhcli_pkg import __version__
     print(f"CBHCLI Web v{__version__}")
+
+    # 未登录提示（服务照常启动，页面内完成登录）
+    try:
+        from cbhcli_pkg.auth import is_logged_in_fast
+        if not is_logged_in_fast():
+            print("🔐 本机尚未登录 cbhcli — 请在打开的页面中完成登录，"
+                  "或运行 cbhcli login")
+    except Exception:
+        pass
 
     # 展示所有可访问地址（localhost + 内网 IP）
     if host in ("0.0.0.0", "::", ""):

@@ -119,6 +119,71 @@ def _drop_meta_cache(filepath: Path) -> None:
         _META_CACHE.pop(str(filepath), None)
 
 
+def build_session_data(messages: list, session_id: str = "",
+                       workspace: str = "", title: str = "",
+                       created_at: str = "", existing_title: str = "") -> dict:
+    """构造会话 JSON（与 save_session 落盘结构完全一致）
+
+    v5.4.0 从 save_session 中提取（纯重构，行为不变）：供审计快照上报
+    在无本地文件路径（如 exec --no-save）时直接构造上传数据。
+
+    Args:
+        messages: 会话消息列表（API 格式）
+        session_id: 会话ID（为空自动生成）
+        workspace: 所属工作空间目录
+        title: 显式标题（优先）
+        created_at: 创建时间（为空用当前时间；保存已有会话时传原值）
+        existing_title: 已有文件的标题（次优先）
+    """
+    if not session_id:
+        session_id = datetime.now().strftime("%H%M%S")
+
+    # 提取用户输入作为会话标题（处理多模态content格式）
+    first_user_msg = ""
+    for msg in messages or []:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # 多模态格式: [{"type": "text", "text": "..."}, {"type": "image_url", ...}]
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        first_user_msg = part.get("text", "")[:50]
+                        break
+            elif isinstance(content, str):
+                first_user_msg = content[:50]
+            break
+
+    # 清理消息中的base64图片数据（保存时去除，减小文件体积）
+    cleaned_messages = []
+    for msg in messages or []:
+        cleaned = dict(msg)
+        content = cleaned.get("content", "")
+        if isinstance(content, list):
+            # 多模态格式：只保留文本部分
+            text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            if text_parts:
+                cleaned["content"] = text_parts[0].get("text", "")
+            else:
+                cleaned["content"] = ""
+        cleaned_messages.append(cleaned)
+
+    # 保存会话数据（标题优先级: 显式传入 > 已有文件 > 首条用户消息提取）
+    # 标题统一压缩换行/连续空白为单空格（避免列表折行伪装成编号）
+    # v5.3.1+：updated_at 每次保存刷新（最后对话时间），created_at 保持首次创建时间
+    return {
+        "id": session_id,
+        "created_at": created_at or datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "title": " ".join((title or "").split())
+                 or " ".join((existing_title or "").split())
+                 or " ".join((first_user_msg or "").split())
+                 or "空会话",
+        "message_count": len(cleaned_messages),
+        "workspace": workspace or "",
+        "messages": cleaned_messages
+    }
+
+
 class SessionHistoryManager:
     """管理会话历史的保存和恢复
     
@@ -184,52 +249,12 @@ class SessionHistoryManager:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"{timestamp}_{session_id}.json"
             filepath = self.history_dir / filename
-        
-        # 提取用户输入作为会话标题（处理多模态content格式）
-        first_user_msg = ""
-        for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    # 多模态格式: [{"type": "text", "text": "..."}, {"type": "image_url", ...}]
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            first_user_msg = part.get("text", "")[:50]
-                            break
-                elif isinstance(content, str):
-                    first_user_msg = content[:50]
-                break
-        
-        # 清理消息中的base64图片数据（保存时去除，减小文件体积）
-        cleaned_messages = []
-        for msg in messages:
-            cleaned = dict(msg)
-            content = cleaned.get("content", "")
-            if isinstance(content, list):
-                # 多模态格式：只保留文本部分
-                text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
-                if text_parts:
-                    cleaned["content"] = text_parts[0].get("text", "")
-                else:
-                    cleaned["content"] = ""
-            cleaned_messages.append(cleaned)
-        
-        # 保存会话数据（标题优先级: 显式传入 > 已有文件 > 首条用户消息提取）
-        # 标题统一压缩换行/连续空白为单空格（避免列表折行伪装成编号）
-        # v5.3.1+：updated_at 每次保存刷新（最后对话时间），created_at 保持首次创建时间
-        session_data = {
-            "id": session_id,
-            "created_at": created_at,
-            "updated_at": datetime.now().isoformat(),
-            "title": " ".join((title or "").split())
-                     or " ".join(existing_title.split())
-                     or " ".join((first_user_msg or "").split())
-                     or "空会话",
-            "message_count": len(cleaned_messages),
-            "workspace": workspace or "",
-            "messages": cleaned_messages
-        }
-        
+
+        # 构造会话数据（v5.4.0 提取为模块级 build_session_data，行为不变）
+        session_data = build_session_data(
+            messages, session_id=session_id, workspace=workspace, title=title,
+            created_at=created_at, existing_title=existing_title)
+
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(session_data, f, ensure_ascii=False, indent=2)
         _cache_meta_after_save(filepath, _normalize_meta(session_data))
@@ -277,6 +302,17 @@ class SessionHistoryManager:
                 return json.load(f)
         except (json.JSONDecodeError, KeyError, OSError):
             return None
+
+    def get_meta(self, filename: str) -> Optional[dict]:
+        """单会话元数据（带缓存；只读文件头 8KB，不解析 messages）。
+
+        v5.4.0+：供服务端在完整加载会话前做轻量判断（如作用域预检），
+        避免"解析完大会话才发现被拒"的浪费（逐个尝试恢复会话场景下
+        每个被拒会话省 10~30ms）。非标准格式时返回 None（调用方回退）。
+        """
+        if not filename or "/" in filename or "\\" in filename:
+            return None
+        return _read_session_meta(self.history_dir / filename)
 
     def update_session_title(self, filename: str, title: str) -> bool:
         """重命名会话标题（v5.2.8 侧边栏会话管理）。"""

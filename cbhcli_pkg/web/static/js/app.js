@@ -15,12 +15,33 @@ async function request(path, options = {}) {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
+  // v5.4.0（认证系统）：未登录 / 凭据失效 -> 切回登录视图
+  if (res.status === 401) {
+    const err = await res.json().catch(() => ({}));
+    if (err.error === "not_logged_in") {
+      if (typeof showLoginView === "function") {
+        showLoginView(err.message || "本机未登录 cbhcli，请在登录界面完成登录");
+      }
+      throw new Error("未登录：请在登录界面完成登录");
+    }
+    throw new Error(err.message || err.detail || "未授权");
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || err.message || JSON.stringify(err));
   }
   return res.json();
 }
+
+// v5.4.0（认证系统）：登录相关端点（浏览器内完成登录，无需命令行）
+const authApi = {
+  status: () => request("/auth/status"),
+  ping: (server) =>
+    request("/auth/ping", { method: "POST", body: JSON.stringify({ server }) }),
+  login: (server, key) =>
+    request("/auth/login", { method: "POST", body: JSON.stringify({ server, key }) }),
+  logout: () => request("/auth/logout", { method: "POST" }),
+};
 
 const api = {
   // 系统
@@ -1202,13 +1223,16 @@ async function onAgentChange() {
   state.activeChain = null;
   updateChainIndicator();
   api.selectAgent(name).catch(() => {});
+  // v5.4.0+：侧边栏列表【立即刷新】（与会话恢复并行，不 await）——
+  // 此前 refreshWorkspaces 排在 restoreMessages/refreshStatus 之后，
+  // 切换 Agent 后要等消息区会话恢复完，列表才更新（大会话时明显延迟）
+  refreshWorkspaces();
   liveRunReset();
   wsSubscribe(null);   // 退订旧会话（restoreMessages 会订阅新 Agent 的会话）
   clearMessages();
   await restoreMessages();
   await refreshStatus();
   updateChainIndicator();
-  refreshWorkspaces();
 }
 
 async function onModelChange() {
@@ -2410,9 +2434,25 @@ async function restoreMessages() {
     }
     // 无活跃会话（如服务器重启后重新打开页面）→ 自动恢复最近会话，
     // 避免页面空白/进度条归零且上下文丢失
-    // v5.3.1+：按时间倒序最多尝试 10 个（作用域外的会话会被 403 拒绝，跳过继续）
-    const hist = await api.getHistory(a, 10);
-    for (const s of hist.sessions || []) {
+    // v5.4.0+：先用 workspace/info（毫秒级、已按作用域过滤、含最后对话时间）
+    // 挑候选——避免 blind 尝试最多 10 个被拒会话（每个都要完整解析文件）；
+    // 不可用时回退 getHistory 路径
+    let candidates = [];
+    try {
+      const info = await api.workspaceInfo(a);
+      for (const g of info.workspaces || []) {
+        for (const s of g.sessions || []) {
+          if (s.filename) candidates.push(s);
+        }
+      }
+      candidates.sort((x, y) => String(y.updated_at || y.created_at || "")
+        .localeCompare(String(x.updated_at || x.created_at || "")));
+    } catch (_) { candidates = []; }
+    if (!candidates.length) {
+      const hist = await api.getHistory(a, 10);
+      candidates = (hist.sessions || []).slice(0, 5);
+    }
+    for (const s of candidates.slice(0, 5)) {
       try {
         const r = await api.chatLoad(a, m, s.filename, s.workspace);
         setSessionId(r.session_id || s.id || null);
@@ -5243,6 +5283,37 @@ async function loadSettingsView() {
       },
     }, "保存设置")));
 
+  // v5.4.0（认证系统）：账户区块（当前登录身份 + 退出登录）
+  inner.append(el("div", { class: "section-title" }, "🔐 账户"));
+  try {
+    const authSt = await authApi.status();
+    const u = authSt.user || {};
+    const name = u.display_name || u.name || "?";
+    const expText = authSt.expires_at
+      ? fmtTime(authSt.expires_at) : "永久（无限期）";
+    inner.append(el("div", { class: "card" },
+      el("div", { class: "form-row" },
+        el("label", null, "当前登录"),
+        el("div", { style: "font-family:var(--font-mono);font-size:13px;" },
+          `${name}${u.name && u.name !== name ? " (" + u.name + ")" : ""}`)),
+      el("div", { class: "form-row" },
+        el("label", null, "服务器"),
+        el("div", { style: "font-family:var(--font-mono);font-size:13px;" },
+          authSt.server || "-")),
+      el("div", { class: "form-row" },
+        el("label", null, "凭据有效期"),
+        el("div", { style: "font-size:13px;" }, expText)),
+      el("div", { class: "form-hint" },
+        "登录一次即在本机全局生效（CLI / Web / Jupyter / exec 共用）；退出后四端均需重新登录。"),
+      el("button", {
+        class: "btn btn-ghost btn-sm",
+        onclick: () => { if (confirm("确定退出登录？退出后 CLI / Web / Jupyter / exec 四端均需重新登录。")) doWebLogout(); },
+      }, "退出登录")));
+  } catch (e) {
+    inner.append(el("div", { class: "card" },
+      el("div", { class: "form-hint" }, "无法获取登录状态: " + e.message)));
+  }
+
   // 系统信息
   inner.append(el("div", { class: "section-title" }, "ℹ️ 系统信息"));
   const infoRows = [
@@ -5264,15 +5335,257 @@ async function loadSettingsView() {
 }
 
 /* ===================================================================
+   16.5 登录视图 + 连接状态（v5.4.0 认证系统）
+   =================================================================== */
+
+let _loginSubDefault = "";   // 登录副标题默认文案（错误/过期时临时覆盖）
+
+function showLoginView(message) {
+  const lv = $("#login-view");
+  if (!lv) return;
+  lv.classList.remove("hidden");
+  if (message) setLoginError(message);
+}
+
+function hideLoginView() {
+  const lv = $("#login-view");
+  if (lv) lv.classList.add("hidden");
+}
+
+function setLoginError(msg) {
+  const box = $("#login-error");
+  if (!box) return;
+  if (msg) { box.textContent = msg; box.classList.remove("hidden"); }
+  else { box.textContent = ""; box.classList.add("hidden"); }
+}
+
+function setLoginPingResult(text, cls) {
+  const el0 = $("#login-ping-result");
+  if (!el0) return;
+  el0.textContent = text || "";
+  el0.className = "login-ping-result" + (cls ? " " + cls : "");
+}
+
+async function testLoginConnection() {
+  const server = ($("#login-server")?.value || "").trim();
+  if (!server) { setLoginPingResult("请先填写服务器地址", "error"); return; }
+  setLoginPingResult("⏳ 测试中…", "");
+  try {
+    const r = await authApi.ping(server);
+    if (r && r.ok) {
+      const compat = r.compatible ? "协议兼容" : "⚠️ 协议不兼容";
+      setLoginPingResult(`✅ 可达 (${r.latency_ms}ms) · 版本 ${r.server_version} · ${compat}`, "ok");
+    } else {
+      setLoginPingResult(`❌ ${(r && r.message) || "不可达"}`, "error");
+    }
+  } catch (e) {
+    setLoginPingResult(`❌ ${e.message}`, "error");
+  }
+}
+
+async function submitLogin() {
+  const server = ($("#login-server")?.value || "").trim();
+  const key = ($("#login-key")?.value || "").trim();
+  const btn = $("#btn-login-submit");
+  if (!server) { setLoginError("请填写服务器地址（如 192.168.1.100:28888）"); return; }
+  if (!key) { setLoginError("请填写认证密钥（向管理员获取，cbhk_ 开头）"); return; }
+  const ERR_GUIDE = {
+    invalid_key: "认证密钥无效：密钥错误或已被重置，请联系管理员重新生成",
+    disabled: "账号已被管理员禁用，请联系管理员",
+    unreachable: "无法连接服务器：请确认地址与端口，并检查网络/防火墙（可尝试 telnet IP 端口 自查）",
+    timeout: "连接超时：网络不通或防火墙拦截（可尝试 telnet IP 端口 自查）",
+    protocol_mismatch: "协议版本不匹配：客户端版本过旧/过新，请升级 cbhcli",
+    rate_limited: "请求过于频繁，请稍后再试",
+  };
+  if (btn) { btn.disabled = true; btn.textContent = "登录中…"; }
+  setLoginError("");
+  try {
+    const r = await authApi.login(server, key);
+    if (r && r.ok) {
+      const u = r.user || {};
+      const name = u.display_name || u.name || "?";
+      setLoginPingResult(`✅ 登录成功：${name}，正在进入…`, "ok");
+      setLoginError("");
+      setTimeout(() => location.reload(), 900);
+      return;
+    }
+    setLoginError((r && (ERR_GUIDE[r.error] || r.message)) || "登录失败，请重试");
+  } catch (e) {
+    setLoginError(e.message || "登录失败，请重试");
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "登 录"; }
+}
+
+function initLoginView() {
+  const sub = $("#login-sub");
+  if (sub) _loginSubDefault = sub.textContent;
+  const ping = $("#btn-login-ping");
+  if (ping) ping.addEventListener("click", testLoginConnection);
+  const submit = $("#btn-login-submit");
+  if (submit) submit.addEventListener("click", submitLogin);
+  for (const id of ["login-server", "login-key"]) {
+    const input = $("#" + id);
+    if (input) input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); submitLogin(); }
+    });
+  }
+}
+
+/* ---- 连接状态指示器（顶栏；点击重新测试） ---- */
+
+function initConnBadge(authSt) {
+  const badge = $("#conn-badge");
+  const text = $("#conn-badge-text");
+  if (!badge || !text) return;
+  const server = (authSt && authSt.server) || "";
+  const render = (state, detail) => {
+    text.textContent = state === "online" ? "🟢 在线"
+      : state === "warn" ? "🟡 连接异常" : "🔴 服务器不可达";
+    badge.title = `${detail || ""}（点击重新测试）`;
+  };
+  const user = (authSt && authSt.user) || {};
+  render("online", `已登录：${user.display_name || user.name || "?"} @ ${server}`);
+  badge.addEventListener("click", async () => {
+    render("warn", "测试中…");
+    try {
+      const r = await authApi.ping(server);
+      if (r && r.ok) {
+        render("online", `可达 ${r.latency_ms}ms · 服务版本 ${r.server_version}`);
+      } else {
+        render("down", (r && r.message) || "不可达");
+      }
+    } catch (e) { render("down", e.message); }
+  });
+  // 轻量定期刷新（60s；页面隐藏跳过）
+  setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const r = await authApi.ping(server);
+      render(r && r.ok ? "online" : "down",
+             r && r.ok ? `可达 ${r.latency_ms}ms` : ((r && r.message) || "不可达"));
+    } catch (e) { render("down", e.message); }
+  }, 60000);
+}
+
+async function doWebLogout() {
+  try { await authApi.logout(); } catch (e) { /* 尽力而为 */ }
+  location.reload();
+}
+
+/* ---- 账户入口（v5.4.0）：侧边栏「👤 账户」按钮 + 弹窗 ---- */
+
+async function refreshAccountButton() {
+  try {
+    const st = await authApi.status();
+    const u = st.user || {};
+    const name = u.display_name || u.name || "账户";
+    const label = $("#btn-account-label");
+    if (label) label.textContent = name;
+    const btn = $("#btn-account");
+    if (btn) {
+      btn.title = `账户：${name} @ ${st.server || "-"}（点击查看登录状态 / 退出登录）`;
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+async function showAccountModal() {
+  let st = {};
+  try {
+    st = await authApi.status();
+  } catch (e) {
+    toast("无法获取登录状态: " + e.message, "error");
+    return;
+  }
+  const u = st.user || {};
+  const name = u.display_name || u.name || "未登录";
+  const body = el("div", { style: "display:flex;flex-direction:column;gap:8px;" });
+  const row = (k, v) => body.append(el("div", {
+    style: "display:flex;justify-content:space-between;gap:12px;font-size:13px;",
+  },
+    el("span", { style: "color:var(--text-2);white-space:nowrap;" }, k),
+    el("span", {
+      style: "font-family:var(--font-mono);text-align:right;word-break:break-all;",
+    }, v)));
+  row("登录状态", st.logged_in ? "✅ 已登录（四端通行）" : "🔐 未登录");
+  row("用户", name + (u.name && u.name !== name ? ` (${u.name})` : ""));
+  row("服务器", st.server || "-");
+  row("凭据有效期", st.expires_at ? fmtTime(st.expires_at) : "永久（无限期）");
+  row("设备标识", st.device_id || "-");
+  row("在线状态", st.online ? "🟢 服务器可达" : "🔴 服务器不可达（软在线，本地仍可用）");
+  body.append(el("div", { class: "form-hint", style: "margin-top:4px;" },
+    "登录一次即在本机全局生效（CLI / Web / Jupyter / exec 共用）；" +
+    "局域网其他机器访问本 Web 服务时，会看到登录界面（登录结果属于本机）。"));
+
+  const btnRow = el("div", { style: "display:flex;gap:10px;margin-top:8px;flex-wrap:wrap;" });
+  btnRow.append(el("button", {
+    class: "btn btn-ghost",
+    onclick: async () => {
+      try {
+        const r = await authApi.ping(st.server || "");
+        toast(r && r.ok ? `✅ 可达 ${r.latency_ms}ms · 服务版本 ${r.server_version}`
+                        : `❌ ${(r && r.message) || "不可达"}`,
+              r && r.ok ? "success" : "error");
+      } catch (e) { toast(e.message, "error"); }
+    },
+  }, "测试连接"));
+  if (st.logged_in) {
+    btnRow.append(el("button", {
+      class: "btn btn-ghost",
+      onclick: () => {
+        if (confirm("确定退出登录？退出后 CLI / Web / Jupyter / exec 四端均需重新登录。")) {
+          doWebLogout();
+        }
+      },
+    }, "退出登录"));
+  }
+  body.append(btnRow);
+
+  openModal({ title: "👤 账户", width: "min(500px, calc(100vw - 40px))", body });
+}
+
+function initAccountEntry() {
+  const btn = $("#btn-account");
+  if (!btn) return;
+  btn.addEventListener("click", showAccountModal);
+  void refreshAccountButton();
+}
+
+/* ===================================================================
    17. 启动
    =================================================================== */
 
 async function bootstrap() {
+  // v5.4.0（认证系统）：先检查本机登录状态。
+  // 未登录 -> 只显示登录视图（不初始化主界面，避免满屏 401）
+  let authSt = null;
+  try {
+    authSt = await authApi.status();
+  } catch (e) {
+    authSt = { logged_in: false };
+  }
+  if (!authSt || !authSt.logged_in) {
+    initLoginView();
+    if (authSt && authSt.server) {
+      const srv = $("#login-server");
+      if (srv) srv.value = authSt.server;
+    }
+    if (authSt && authSt.expired) {
+      setLoginError("凭据已过期：请联系管理员续期（续期后自动恢复），或重新登录");
+      const sub = $("#login-sub");
+      if (sub) sub.textContent = "凭据已过期 — 请联系管理员续期，或使用新密钥重新登录";
+    }
+    showLoginView();
+    return;
+  }
+  hideLoginView();
+
   initChatView();
   initSidebar();
   initPanelLayout();
   initFileManager();
   wsConnect();  // v5.2.9：WebSocket 实时通道（会话事件多浏览器同步）
+  initConnBadge(authSt);  // v5.4.0：顶栏连接状态指示器
+  initAccountEntry();     // v5.4.0：侧边栏「👤 账户」入口
 
   // 先加载基础数据，再初始化路由（避免直接以 #/skills 等 URL 打开时
   // 管理视图在 state.agents 为空的情况下渲染出"暂无 Agent"）

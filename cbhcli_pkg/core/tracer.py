@@ -53,7 +53,26 @@ class Tracer:
         return text[:limit]
 
     def log(self, event: str, **data):
-        """追加一条事件（任何异常都静默吞掉）"""
+        """追加一条事件（任何异常都静默吞掉）
+
+        v5.4.0（认证系统）：同时镜像转发到管理服务器（审计上报）。
+        先镜像后写文件——tracer 文件不可用（如未配置 workspace）时
+        镜像仍然生效；reporter 未启动（未登录/单元测试）时镜像为
+        O(1) 的空操作。log() 可能在任何线程被调用，reporter 入队为
+        线程安全的 O(1) 操作，不会阻塞。
+        """
+        payload = {}
+        for k, v in data.items():
+            payload[k] = self._summarize(v) if isinstance(v, (dict, list)) else v
+
+        # 审计镜像（认证系统，v5.4.0）
+        try:
+            from cbhcli_pkg.auth import get_reporter
+            get_reporter().report_event(
+                f"tracer.{event}", session_id=self.session_id, **payload)
+        except Exception:
+            pass
+
         if not self._file:
             return
         record = {
@@ -61,8 +80,8 @@ class Tracer:
             "event": event,
             "session_id": self.session_id,
         }
-        for k, v in data.items():
-            record[k] = self._summarize(v) if isinstance(v, (dict, list)) else v
+        for k, v in payload.items():
+            record[k] = v
         try:
             with self._lock:
                 with open(self._file, "a", encoding="utf-8") as f:
@@ -76,14 +95,16 @@ class Tracer:
 
     def log_tool_call(self, tool_name: str, arguments: dict,
                       permission: str = "", duration_ms: int = 0,
-                      success: bool = True, error: str = ""):
+                      success: bool = True, error: str = "",
+                      output: str = ""):
         self.log("tool_call",
                  tool=tool_name,
                  arguments=self._summarize(arguments),
                  permission=permission,
                  duration_ms=duration_ms,
                  success=success,
-                 error=error[:300] if error else "")
+                 error=error[:300] if error else "",
+                 output=(output or "")[:800])
 
     def log_tool_blocked(self, tool_name: str, arguments: dict,
                          reason: str, source: str):

@@ -1,4 +1,4 @@
-# CBHCLI v5.3.3 - AI驱动的终端助手
+# CBHCLI v5.4.0 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -43,6 +43,8 @@
 - **每轮对话自动保存（v5.2.6）** - CLI/Web 全部出口（含中断/SSE 断开/死循环熔断）自动落盘会话，服务重启最多丢当前轮
 - **Web 侧边栏工作区会话管理（v5.2.8）** - 会话按工作空间文件夹分组可折叠，打开任意文件夹作工作空间（chdir+系统提示重建）；会话/文件夹三点菜单（重命名/复制/删除/选择/新增/清空）；文件管理器面板与工作区面板左右互换+拖拽调宽；CLI `/resume` 扩容 50 条+关键词搜索
 - **Web 实时架构升级（v5.2.9）** - ① **WebSocket 多浏览器同步**：聊天从 SSE 改为 `/ws` 事件总线，事件按单调 seq 记录、迟到订阅按 since_seq 回放，多个浏览器打开同一会话画面完全一致（含流式思考/工具确认实时同步，多浏览器确认首个应答生效）；② **会话后台运行**：新建/切换会话不中断正在执行的任务（后台 asyncio 任务继续跑），侧边栏实时显示"●运行中"徽标；会话身份以 session.id 为准，同 agent:model 可并存多会话；③ **工具运行中可中断**：terminal 等工具执行期间点中断立即杀子进程组（实测 sleep 30 中断 0.6s 结束）；④ 设置页返回导航（设置主页←返回会话、详情页←设置）；⑤ CLI/Web 共享会话文件的内存副本新鲜度校验（磁盘被外部更新自动重载）
+
+- **用户认证与审计系统（v5.4.0）** - 内网多用户认证 + 全链路审计：① **四端统一认证**（CLI / Web / JupyterLab 插件 / exec 共享 `~/.cbhcli/auth.json` 设备级凭据，**登录一次四端通行**；未登录时：CLI 允许进入但发消息拦截（可 `/login` 就地登录，登录后无需重启）、Web 显示登录界面、exec 退出码 2、Jupyter 全 API 401 + 提示横幅）；② **管理服务 cbhcli-admin**（默认端口 **28888**）：主密码启动门（内置默认 / 环境变量 / admin.json 覆盖，连错 5 次退出）+ 管理页面 7 视图（登录 / 仪表盘 / 用户管理 / 会话管理 / 实时监控 / 审计日志 / 设置）；用户创建（**密钥随时可查看/复制**：前缀 + `****` 掩码 + 👁/📋 按钮）/ 续期 / 重置密钥 / 禁用启用 / 删除；**管理页面实时化**：WebSocket 实时交互画面（思考/正文/工具调用秒级上屏）+ 运行中会话全程可见（多进程心跳按实例隔离，互不覆盖）；③ **三段式审计上报**：状态流（60s 心跳，"运行中"秒级上屏）/ 事件流（工具调用/权限拦截/模式切换等，2s 批报）/ 会话快照（每轮去重上传，**本地删除后管理端仍保留**）；断网"软在线"+ 落盘补传（eid 幂等去重）；④ **有效期策略**（7/30/90/365 天 / 自定义 / **永久**）+ 剩余 <2 天滚动续期 + 管理页面一键续期（已过期用户无感恢复）；⑤ 命令：`cbhcli login/logout/whoami/ping/admin`、`cbhcli-admin [status]`，界面内 `/login /logout /whoami /ping`（详见「用户认证与审计系统」章节）
 
 ### 17大内置工具 + Web 专属工具
 | 工具 | 功能 |
@@ -179,7 +181,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.3.3-py3-none-any.whl
+pip install dist/cbhcli-5.4.0-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -194,6 +196,9 @@ pip install tiktoken
 ## 快速开始
 
 ```bash
+# 0. 首次使用先登录（向管理员获取【服务器地址 + 认证密钥】；登录一次，四端通行）
+cbhcli login 192.168.1.100:28888 cbhk_xxxxxx
+
 # 启动应用
 cbhcli
 
@@ -203,6 +208,11 @@ cbhcli
 # 查看版本
 cbhcli --version
 ```
+
+> 服务器端（管理员）先启动管理服务并创建用户：`cbhcli admin`（输入管理员主密码）→
+> 浏览器打开 `http://<服务器IP>:28888/admin` → 用户管理 → 创建用户 → 把密钥发给用户
+> （密钥在用户列表中可随时通过 👁 眼睛查看 / 📋 复制，不会"关闭后无法再查看"）。
+> 详见「[用户认证与审计系统](#用户认证与审计系统v540)」章节。
 
 ## 使用指南
 
@@ -547,8 +557,31 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `/chain rm <名称>` | 删除链条 |
 | `/chain config <名称>` | 编辑链条配置 |
 | `/chain rename <旧名> <新名>` | 重命名链条 |
+| `/login [IP:端口] [密钥]` | 用户登录（向导式：地址 → 连通性测试 → 密钥） |
+| `/logout [--local-only]` | 退出登录（吊销凭据，四端失效） |
+| `/whoami` | 查看当前登录身份与凭据状态 |
+| `/ping [IP:端口]` | 服务器连通性测试 |
 | `/help [command]` | 显示帮助 |
 | `quit` | 退出程序 |
+
+### 认证与审计命令（v5.4.0）
+
+| 命令 | 功能 |
+|------|------|
+| `cbhcli login` | 登录（交互向导；也支持 `cbhcli login <IP:端口> <密钥>` 一次性参数） |
+| `cbhcli logout [--local-only]` | 退出登录（吊销服务端 token + 删除本地凭据） |
+| `cbhcli whoami` | 查看当前登录身份与凭据状态 |
+| `cbhcli ping [服务器] [--json]` | 连通性测试（延迟/版本/协议兼容/登录状态；未登录也可用） |
+| `cbhcli admin` | 启动管理服务（服务器端，需管理员主密码；端口默认 28888） |
+| `cbhcli admin status` / `cbhcli-admin status` | 管理服务自检（端口/版本/运行时长/最近上报） |
+| `cbhcli-admin` | 管理服务独立入口（等价 `cbhcli admin`，供 systemd/脚本调用） |
+
+> 认证说明：CLI / Web / JupyterLab 插件 / exec 四端统一认证，**登录一次即全部可用**；
+> 凭据保存在 `~/.cbhcli/auth.json`（0600，设备级）。未登录时：CLI 发消息被拦截（可 `/login` 就地登录）、
+> Web 显示登录界面、exec 退出码 2、Jupyter 插件 401 提示。凭据过期请联系管理员续期（续期后重试自动恢复）。
+>
+> 📖 **完整用法（含 cbhcli-admin 管理服务、管理页面、运维场景）见下方
+> [「用户认证与审计系统」](#用户认证与审计系统v540) 章节。**
 
 ### 快捷键
 
@@ -560,6 +593,206 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `Ctrl+R` | 切换工具显示详细/简洁模式 |
 | `Tab` | 补全菜单选择下一项 |
 | `↑` / `↓` | 补全菜单上下选择 |
+
+---
+
+## 用户认证与审计系统（v5.4.0）
+
+> 内网多用户环境下的**用户认证 + 全链路审计**：CLI / Web / JupyterLab 插件 / exec **四端统一认证**
+> （登录一次，四端通行），配套管理服务 **cbhcli-admin**（用户管理 / 会话浏览 / 实时监控 / 权限查看 / 审计日志）。
+
+### 一、管理服务端（cbhcli-admin）
+
+#### 1. 启动与主密码
+
+```bash
+cbhcli admin                  # 交互式：提示输入管理员主密码（不回显），通过后启动
+cbhcli-admin                  # 等价入口（供 systemd / 脚本调用）
+```
+
+**启动门（第一层安全）**：主密码校验源优先级
+1. 环境变量 `CBHCLI_ADMIN_MASTER_KEY`（最高优先，用于无人值守/开机自启）
+2. 数据目录 `~/.cbhcli-admin/admin.json` 的 `master_key_hash`（首次成功启动后自动写入）
+3. 代码内置默认口令 —— **仅以 hash 存储（源码/whl 中不含明文）**，口令不公开；
+   实际部署请通过 ① 或 `--set-password` 设置自己的口令
+
+连续输入错误 **5 次**直接退出（退出码 2）；非交互环境（stdin 非 TTY）启动必须提供环境变量，否则拒绝启动。
+
+```bash
+# 无交互启动（systemd / crontab / 容器）—— 用你自己的主密码
+CBHCLI_ADMIN_MASTER_KEY=<你的主密码> cbhcli-admin --port 28888
+```
+
+**全部启动参数**：
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--port, -p PORT` | 管理服务端口 | 28888 |
+| `--host HOST` | 监听地址 | 0.0.0.0 |
+| `--data-dir PATH` | 数据目录（db/快照/配置） | `~/.cbhcli-admin` |
+| `--tls-cert CERT` / `--tls-key KEY` | 启用 HTTPS（自签场景客户端需信任证书） | 关闭（内网 HTTP 基线） |
+| `--set-password` | 交互式修改管理员主密码（写入 admin.json 的 hash） | - |
+| `status` | 服务自检（不启动服务） | - |
+| `-h, --help` | 帮助 | - |
+
+#### 2. 服务自检
+
+```bash
+cbhcli-admin status          # 等价 cbhcli admin status
+```
+
+运行中输出：端口（监听状态）/ 版本（protocol）/ 启动时间（已运行时长）/ 数据目录（DB 大小 / 快照数）/ 最近上报时间；
+未运行时提示启动命令；检测到 `server.json` 残留（进程已死）会给出清理提示。
+
+#### 3. 数据目录 `~/.cbhcli-admin/`
+
+```
+~/.cbhcli-admin/
+├── admin.json         # 主密码 hash + 服务设置（strict_online / report_level / 默认有效期…），0600
+├── cbhcli-admin.db    # SQLite（users / tokens / sessions / events / logins）
+├── snapshots/         # 会话快照 <user_id>/<session_id>.json（管理端完整查看会话内容）
+├── backup/            # 数据库每日自动备份（保留 30 份）
+├── server.json        # 运行信息（pid/port/ts/version，status 自检用；退出时清除）
+└── boot.log           # 开机自启日志（配置 crontab 后产生）
+```
+
+#### 4. 管理页面（7 个视图）
+
+浏览器打开 **`http://<服务器IP>:28888/admin`** → 输入主密码登录（admin_token 存 sessionStorage，24h 过期）。
+
+| 视图 | 功能 |
+|------|------|
+| 登录页 | 主密码登录（失败限流：同 IP 5 次/分钟） |
+| 仪表盘 | 统计卡片（用户/在线/今日会话/运行中）+ 服务健康卡片（运行时长/版本/DB大小/最近上报 + 自检按钮）+ 实时活动流（3s 刷新）+ 在线用户列表 |
+| 用户管理 | **创建用户**（有效期选择：7/30/90/365 天、自定义、**永久**）；密钥列（前缀 + `****` 掩码，**👁 眼睛查看完整密钥 / 📋 一键复制**，创建后随时可取，无需重置）；**续期** / **重置密钥** / 权限快照（**禁用工具全量显示——整个列表单一横向滚动条，不截断**）/ 禁用启用 / 删除（可选含会话数据）；跳转该用户会话 |
+| 会话管理 | 全部用户会话（筛选：用户/状态/关键词；**列表实时更新**——新会话/运行中状态 WS 秒级上屏，无需手动刷新）+ 详情抽屉（消息流回放：**思考 → 文字 → 工具调用**；**运行中会话 WebSocket 实时画面**——思考/正文/工具调用流式上屏，轮结束自动并入快照）+ 删除 |
+| 实时监控 | 运行中会话卡片墙（用户/Agent/标题/工作空间/时长/最后心跳颜色）；**会话运行全程持续显示**（多进程心跳按实例隔离，互不覆盖）+ **点击卡片 → WebSocket 实时交互画面**（与 Web 端一致的实时流）；WS 推送即时刷新 + 2s 轮询兜底 |
+| 审计日志 | 事件流（时间/用户/类型徽标/会话/摘要；筛选：类型/用户/时间范围；分页）+ 登录记录（成功/失败/原因）+ **导出 CSV** |
+| 设置 | strict_online 开关 / report_level（full/summary）/ 新用户默认有效期 / 快照上限 / 服务自检 / 修改主密码 |
+
+#### 5. 管理 API 参考（请求头 `X-Admin-Token`）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/admin/api/login` | 管理员登录（主密码）→ admin_token |
+| GET | `/admin/api/overview` | 仪表盘统计 + 最近事件 |
+| GET | `/admin/api/health` | 健康自检（运行时长/DB/磁盘/最近上报） |
+| GET | `/admin/api/live` | 实时快照（在线用户 + 运行中会话） |
+| GET / POST | `/admin/api/users` | 用户列表 / 创建用户（返回密钥；列表仅含前缀 + `key_has_plain`） |
+| PUT / DELETE | `/admin/api/users/{id}` | 更新（禁用/备注/有效期策略）/ 删除（`?purge=1` 级联删除会话数据） |
+| POST | `/admin/api/users/{id}/reset_key` | 重置密钥（key_version+1，旧 token 全失效） |
+| POST | `/admin/api/users/{id}/renew` | 续期 `{"ttl_days": 7\|30\|90\|365\|"forever"}` |
+| GET | `/admin/api/users/{id}/permissions` | 该用户权限快照（模式/规则/禁用工具/活跃链条） |
+| GET | `/admin/api/users/{id}/key` | 查看用户完整密钥（管理页面「👁 眼睛」；升级前创建的用户 `available=false` 仅可看前缀） |
+| WS | `/admin/ws?token=<admin_token>` | **实时事件推送**（管理页面实时交互画面：轮开始/思考/正文 `stream_chunk`/工具调用/状态；断线自动重连） |
+| GET | `/admin/api/sessions` | 会话列表（筛选：user/status/q/时间；分页） |
+| GET / DELETE | `/admin/api/sessions/{user_id}/{session_id}` | 会话详情（快照 JSON）/ 删除 |
+| GET | `/admin/api/events` / `/admin/api/logins` | 事件流 / 登录记录（筛选 + 分页） |
+| GET | `/admin/api/export/events.csv` / `/admin/api/export/sessions.csv` | 导出 CSV |
+| GET / PUT | `/admin/api/settings` | 服务设置（strict_online / report_level / 默认有效期 / 快照上限…） |
+| POST | `/admin/api/settings/password` | 修改主密码 |
+
+#### 6. 开机自启（crontab 示例）
+
+```
+#[14] cbhcli-admin 管理服务（用户认证/审计，端口28888）
+@reboot nohup bash -c 'CBHCLI_ADMIN_MASTER_KEY=<主密码> /home/<user>/.local/bin/cbhcli-admin --port 28888 --host 0.0.0.0' > ~/.cbhcli-admin/boot.log 2>&1 &
+```
+
+> ⚠️ 用环境变量提供主密码（开机时无法交互输入）。**修改主密码后必须同步更新这一行**（`crontab -e`），
+> 否则下次开机自启会因密码不符被拒绝启动。
+
+#### 7. 备份与运维
+
+```bash
+cbhcli-admin status        # 日常自检
+# 停止:  ss -ltnp | grep 28888  → 取 pid → kill <pid>
+# 备份:  整个 ~/.cbhcli-admin/ 目录（db + snapshots + admin.json）
+```
+- 数据库启动时自动每日备份到 `~/.cbhcli-admin/backup/`（保留 30 份）
+- 快照含完整对话内容（可能含业务敏感信息）→ 注意磁盘加密与目录权限（服务端数据目录 0700）
+
+#### 8. 常见运维场景
+
+| 场景 | 操作步骤 |
+|------|----------|
+| **给新同事开账号** | 管理页面 → 用户管理 → 「＋ 创建用户」（填用户名/显示名 + 选有效期）→ 复制密钥发给对方（密钥**随时可在用户列表查看/复制**，无需重置）→ 对方在**自己的机器**上运行 `cbhcli login <服务器IP>:28888 <密钥>` |
+| **续期（临近到期）** | 用户管理 → 该用户行「续期」→ 选新有效期（预设/自定义/永久）→ 客户端下一次心跳自动生效（whoami 可见变化） |
+| **续期（已过期，用户被拦）** | 点「续期」后通知用户**直接重试**即可自动恢复（无需重新输密钥） |
+| **密钥泄露 / 定期轮换** | 用户管理 → 「重置密钥」→ 旧密钥与全部旧凭据立即失效 → 新密钥发给用户重新登录 |
+| **离职 / 临时停用** | 「禁用」（保留数据，随时恢复）或「删除」（可勾选同时删除会话数据）→ 该用户心跳与上报立即被拒 |
+| **查看某人跑了什么** | 会话管理 → 按用户筛选 → 点击行打开详情（消息流/工具调用/思考过程）；审计日志 → 按用户/类型/时间筛选，可导出 CSV |
+| **实时盯运行中任务** | 实时监控页（运行中会话卡片墙，WS 即时刷新）→ **点击卡片打开实时交互画面**（思考/正文/工具调用实时上屏，和 Web 端一致）；运行中会话**全程持续显示**不闪烁 |
+| **排查"无法登录"** | ① 客户端 `cbhcli ping <服务器>`（四类诊断）② 管理页面 → 审计日志 → 登录记录（失败原因：invalid_key / disabled / rate_limited）③ 检查管理服务自检 `cbhcli-admin status` |
+| **客户端整体离线使用** | 默认"软在线"，服务器短暂故障不阻塞已登录用户；如需高风控（离线超宽限即拦截）→ 设置页开启 `strict_online` |
+
+### 二、客户端接入（四端）
+
+#### 1. 登录（四种入口任选其一，登录一次四端通行）
+
+| 入口 | 命令 / 位置 | 说明 |
+|------|------------|------|
+| ① shell 命令 | `cbhcli login` | 交互向导；也支持 `cbhcli login <IP:端口> <密钥>` 一次性参数 |
+| ② CLI 界面内 | `/login` | 向导式（地址 → 连通性测试 → 密钥 → 成功确认），**登录后无需重启** |
+| ③ Web 页面 | `cbhcli web` → 浏览器登录界面 | 含「测试连接」按钮；登录结果属于该 Web 服务所在主机 |
+| ④ Jupyter 插件 | 401 提示引导 | 引导运行 `cbhcli login` 或打开 Web 登录界面 |
+
+```bash
+cbhcli login 192.168.1.100:28888 cbhk_xxxxxxxx     # 一次性参数（脚本/部署）
+cbhcli login --server 192.168.1.100:28888 --key cbhk_xxx --force   # --force 跳过已登录确认
+CBHCLI_AUTH_KEY=cbhk_xxx cbhcli login              # 环境变量提供密钥
+```
+
+**错误指引**（各端统一文案）：无法连接（含 telnet 排查提示）/ 密钥无效（联系管理员重置）/
+账号被禁用 / 协议版本不匹配（升级 cbhcli）。
+
+#### 2. 状态查看与退出
+
+```bash
+cbhcli whoami                # 身份 / 服务器 / 有效期（永久或剩余天数）/ 在线状态 / 设备标识
+cbhcli ping                  # 连通性测试（--json 结构化输出；失败给四类诊断）
+cbhcli ping 192.168.1.100:28888   # 未登录也可测试任意服务器
+cbhcli logout                # 退出（吊销服务端 token + 删除本地凭据；--local-only 只删本地）
+```
+
+界面内对应命令：`/whoami`、`/ping [IP:端口]`、`/logout [--local-only]`。
+
+#### 3. 未登录拦截行为
+
+| 端 | 行为 |
+|----|------|
+| CLI | **允许进入界面**（欢迎面板显示未登录提示）；发消息被拦截（提示 `/login` 与 `cbhcli login` 双入口）；本地配置类命令（/model、/tools 等）不受限 |
+| Web | 业务 API 一律 401 + 页面显示**登录视图**（浏览器内完成登录）；任意 401 自动切回登录视图；顶栏连接状态指示器（可点击重测） |
+| exec | 直接拒绝（stderr 提示），**退出码 2** |
+| Jupyter | 全部 API 返回 401 + 面板顶部「🔐 未登录」横幅 |
+
+#### 4. 凭据与有效期
+
+- 凭据文件：`~/.cbhcli/auth.json`（**0600**，只存 token 不存原始密钥；目录 0700；`CBHCLI_AUTH_FILE` 可覆盖路径）
+- `expires_at: null` = **永久（无限期）** token
+- **续期三条路径**：① 剩余 <2 天自动滚动续期（在线用户无感）② 管理页面「续期」一键延长（含已过期用户——续期后重试自动恢复，无需重新输密钥）③ 重新登录
+- 管理员**重置密钥** → key_version+1 → 该用户全部旧 token 失效（全员踢下线）
+- 管理员**禁用用户** → 心跳/上报/校验全部 401
+
+#### 5. 审计上报机制（三段式）
+
+| 段 | 内容 | 频率 | 用途 |
+|----|------|------|------|
+| 状态流 | 会话运行状态（running/idle + 心跳 + 权限快照） | 每轮 + 60s 心跳 | 管理页面"运行中"实时显示（秒级上屏） |
+| 事件流 | login/logout、会话轮次、工具调用、权限拦截、模式切换、压缩、fallback | 批量 2s | 全链路审计 |
+| 会话快照 | 整份会话 JSON（与本地 history 同构） | 每轮结束（去重） | 管理端完整查看（**本地删除后管理端仍保留**） |
+
+- 一切上报**静默失败不影响主流程**；断网时本地落盘（`~/.cbhcli/report_queue/`），恢复后自动补传（eid 幂等去重）
+- **断网策略（默认"软在线"）**：服务器故障不阻塞已登录用户；管理端可开 `strict_online` 严格模式（离线超宽限即拦截）
+- `cbhcli exec --no-save` 只影响本地 history 落盘，**不影响审计上报**（内存构造快照上传）
+
+### 三、安全说明（信任边界）
+
+- **防**：内网中未认证使用、无审计使用；管理员对"谁在何时跑了什么会话"的可见性；密钥/账号生命周期管理
+- **不防**：拥有本机代码修改能力的用户（客户端侧校验可被绕过）。审计数据可证明"正常路径行为"，
+  不能作为对抗恶意内部攻击者的唯一证据；高安全场景应配合客户端统一分发（运维推送安装）+ 服务端网络策略
+- 主密码/密钥/token 全部哈希存储（sha256+salt）；admin_token 24h 过期；
+  管理操作记入 `admin_action.*` 审计事件（含登录、创建/删除用户、重置密钥、续期、改设置）
 
 ## 项目结构
 
@@ -622,7 +855,25 @@ cbhcli_pkg/
 │   ├── skills_cmd.py   # 技能管理命令
 │   ├── tools_cmd.py    # 工具开关管理命令
 │   ├── fallback_cmd.py # 备用模型管理命令
-│   └── harness_cmd.py  # Harness命令（/mode /permissions /hooks /undo）
+│   ├── harness_cmd.py  # Harness命令（/mode /permissions /hooks /undo）
+│   └── auth_cmd.py     # 登录命令（/login /logout /whoami /ping，v5.4.0）
+├── auth/              # 客户端认证与审计上报（v5.4.0，四端共用）
+│   ├── store.py        # 凭据存储（~/.cbhcli/auth.json，0600）
+│   ├── client.py       # 管理服务器客户端（login/validate/heartbeat/report）
+│   ├── guard.py        # 四端统一登录校验（require_login）
+│   ├── reporter.py     # 审计上报（事件队列/心跳/落盘重试/快照）
+│   ├── events.py       # 事件构造 + 权限快照采集
+│   ├── guide.py        # 登录指引文案（全端统一）
+│   └── login_cmd.py    # login/logout/whoami/ping 命令实现
+├── admin/             # 管理服务端（v5.4.0，仅服务器端使用）
+│   ├── server.py       # FastAPI 应用 + run_admin 启动入口（含主密码门）
+│   ├── master.py       # 管理员主密码校验（内置默认 + env + admin.json）
+│   ├── store.py        # SQLite 存储层（users/tokens/sessions/events/logins）
+│   ├── live.py         # 内存实时注册表（在线用户/运行中会话）
+│   ├── auth_api.py     # 客户端认证 API（login/validate/heartbeat/logout）
+│   ├── report_api.py   # 审计上报接收（batch/snapshot）
+│   ├── admin_api.py    # 管理页面 API（用户/会话/事件/设置/导出）
+│   └── static/         # 管理页面 SPA（零构建，?v= 缓存参数）
 ├── web/               # Web界面
 │   ├── server.py       # FastAPI 后端（WebSocket 实时 + 会话后台运行 + 全量管理 API）
 │   └── static/         # 原生前端 SPA（index.html + css + js + vendor/marked/katex/mermaid/echarts，零构建）
@@ -644,8 +895,22 @@ docs/                 # 项目文档
 ├── 开发者指南/         # 开发文档
 ├── 快速开始.md
 └── ...
+```
 
 ## 变更记录
+
+### v5.4.0
+
+**用户认证与审计系统（内网多用户）+ cbhcli-admin 管理服务**：
+
+- **四端统一认证**：CLI / Web / JupyterLab 插件 / exec 共享 `~/.cbhcli/auth.json` 设备级凭据，**登录一次四端通行**；未登录时 CLI 允许进入但发消息拦截（`/login` 就地登录，无需重启）、Web 登录界面（任意 401 自动切回）、exec 退出码 2、Jupyter 全 API 401 + 提示横幅
+- **新包 `cbhcli_pkg/auth/`**：凭据存储（0600）/ guard 统一拦截（过期必须在线确认——管理员续期后无感恢复；软在线 + strict_online 严格模式）/ reporter 审计上报（事件队列 2s 批报 + 60s 心跳 + 落盘重试 + atexit 同步 flush）/ 登录指引文案（全端统一）
+- **新包 `cbhcli_pkg/admin/`**（管理服务端，端口 **28888**）：主密码启动门（内置默认，env / admin.json 可覆盖；连错 5 次退出码 2）+ 管理页面 7 视图（登录 / 仪表盘 / 用户管理 / 会话管理 / 实时监控 / 审计日志 / 设置）+ 用户管理（创建（**密钥随时查看/复制**）/ 续期 / 重置密钥 / 禁用 / 删除；有效期 7/30/90/365 天 / 自定义 / **永久**）+ 会话浏览（**思考 → 文字 → 工具调用**顺序 + 运行中实时画面）+ 实时监控（**全程可见** + 点击卡片进入 WebSocket 实时交互画面）+ 审计日志（含 CSV 导出）+ 服务设置；`cbhcli-admin` 独立入口 + `status` 自检
+- **管理页面实时化（v5.4.0 迭代）**：新增 `/admin/ws` WebSocket 实时推送（客户端流式内容聚合上报 `stream_chunk`；**迭代 2：≥120 字符或 0.18s 一批** + 前端增量渲染——真实链路实测中位间隔 218ms，接近连续流式）；**多进程心跳按实例隔离**（修复 Web/Jupyter 常驻进程空闲心跳覆盖 CLI 运行中会话导致的看板闪烁/消失）；运行中判定 TTL 240s；**会话列表实时更新**（WS 触发 + 轮询兜底，新会话/运行中状态秒级上屏）；密钥**眼睛两态**（浅色/深色，点击后完整显示）；**Web 界面切换 agent 提速**（列表刷新并行 + 恢复会话快速候选，实测 185ms）
+- **三段式审计上报**：状态流（60s 心跳，"运行中"秒级上屏）/ 事件流（工具调用 / 权限拦截 / 模式切换 / 压缩 / fallback，2s 批报）/ 会话快照（每轮去重，**本地删除后管理端仍保留**）；断网软在线 + 落盘补传（eid 幂等去重）
+- **新命令**：`cbhcli login / logout / whoami / ping / admin`、`cbhcli-admin [status]`；界面内 `/login /logout /whoami /ping`
+- **其余**：`core/tracer.py` 审计镜像（工具级事件全端统一）；`session_history.build_session_data()` 提取重构（`exec --no-save` 不可绕过审计快照）；`pyproject.toml` 新增 `cbhcli-admin` 入口与 admin 静态资源打包；CLI 方框类提示全部改为动态宽度对齐（字素簇感知，框内禁用 emoji）
+- **详见**：`docs/v5.4.0更新日志.md` 与 README「用户认证与审计系统」章节
 
 ### v5.3.3
 

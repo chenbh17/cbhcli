@@ -18,10 +18,26 @@ def print_help():
     print("                     cbhcli exec --agent xxx --model xxx --mode yolo \"任务...\"")
     print("                     cbhcli exec -c \"继续上次任务\"    # 续接最近会话")
     print("                     cbhcli exec --output-format json \"任务...\" | jq .result")
+    print("")
+    print("  认证与审计 (v5.4.0):")
+    print("  login            登录（向导式：地址 -> 连通性测试 -> 密钥）")
+    print("                     cbhcli login 192.168.1.100:28888 cbhk_xxx")
+    print("  logout           退出登录（吊销凭据，四端失效）")
+    print("  whoami           查看当前登录身份与凭据状态")
+    print("  ping             服务器连通性测试（未登录也可用）")
+    print("                     cbhcli ping 192.168.1.100:28888 [--json]")
+    print("  admin            启动管理服务（服务器端，需管理员主密码）")
+    print("                     cbhcli admin [--port 28888] / cbhcli admin status")
     print("\n选项:")
     print("  --version, -v    显示版本信息")
     print("  --help, -h       显示此帮助消息")
     print("\n斜杠命令 (在应用内使用):")
+    print("")
+    print("  登录管理:")
+    print("    /login                登录（向导式，含连通性测试）")
+    print("    /logout               退出登录")
+    print("    /whoami               查看当前登录身份")
+    print("    /ping                 服务器连通性测试")
     print("")
     print("  Agent 管理:")
     print("    /agent add <name>     创建新Agent")
@@ -130,13 +146,51 @@ def print_help():
     print("快捷键:")
     print("  Ctrl+R          切换工具显示详细/简洁模式")
     print("  Shift+Tab       循环切换权限模式（YOLO 需再按一次确认）")
+    print("")
+    print("💡 首次使用请先登录：cbhcli login（或进入后输入 /login）")
+
+
+def _dispatch_auth_subcommand(cmd, args):
+    """login / logout / whoami / ping / admin 子命令分发（认证系统 v5.4.0）
+
+    兼容管道提前关闭（如 `cbhcli whoami | head -4`）：BrokenPipeError 时
+    静默退出（重定向 stdout 到 devnull 防止解释器退出阶段再次 flush 报错）。
+    """
+    try:
+        if cmd == "login":
+            from cbhcli_pkg.auth.login_cmd import run_login
+            sys.exit(run_login(args))
+        if cmd == "logout":
+            from cbhcli_pkg.auth.login_cmd import run_logout
+            sys.exit(run_logout(args))
+        if cmd == "whoami":
+            from cbhcli_pkg.auth.login_cmd import run_whoami
+            sys.exit(run_whoami(args))
+        if cmd == "ping":
+            from cbhcli_pkg.auth.login_cmd import run_ping
+            sys.exit(run_ping(args))
+        if cmd == "admin":
+            from cbhcli_pkg.admin.server import run_admin
+            sys.exit(run_admin(args))
+    except BrokenPipeError:
+        import os
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+        except Exception:
+            pass
+        os._exit(0)
 
 
 def main():
     """主入口函数"""
+    argv = sys.argv[1:]
+    # 认证类子命令（基于原始 argv 直检分发，防 argparse 抢先消费，对齐 exec 模式）
+    if argv and argv[0] in ("login", "logout", "whoami", "ping", "admin"):
+        _dispatch_auth_subcommand(argv[0], argv[1:])
+        return
     # exec 子命令（一次性非交互执行）：基于原始 argv 直接分发，
     # 绕过顶层 parser 对 -h/-v 的抢先消费，保证 cbhcli exec -h 正确显示 exec 帮助
-    argv = sys.argv[1:]
     if argv and argv[0] == 'exec':
         _run_exec(argv[1:])
         return
@@ -172,6 +226,13 @@ def main():
         print_help()
         sys.exit(1)
     
+    # 认证：启动审计上报（未登录也启动；上报心跳会让服务端知道本机在线但未认证）
+    try:
+        from cbhcli_pkg.auth import get_reporter
+        get_reporter().start("cli")
+    except Exception:
+        pass
+
     # 启动主应用
     from cbhcli_pkg.core.app import CBHCLIApp
     

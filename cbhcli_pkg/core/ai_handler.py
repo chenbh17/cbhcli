@@ -63,6 +63,34 @@ def _fix_unicode_escapes(obj):
         return obj
 
 
+def _audit_stream(session, kind: str, text: str) -> None:
+    """审计实时流上报（v5.4.0：管理页面"实时交互画面"数据源）。
+
+    kind: content（正文）/ reasoning（思考）。增量在 reporter 内聚合
+    （≥400 字符或 0.8s 一批），失败静默、绝不阻塞主流程。
+    """
+    try:
+        sid = getattr(session, "id", "") or ""
+        if not sid or not text:
+            return
+        from cbhcli_pkg.auth import report_stream_text
+        report_stream_text(sid, kind, text)
+    except Exception:
+        pass
+
+
+def _audit_stream_flush(session) -> None:
+    """流式结束：立即冲刷聚合缓冲（管理页面无需等下一批/轮结束）。"""
+    try:
+        sid = getattr(session, "id", "") or ""
+        if not sid:
+            return
+        from cbhcli_pkg.auth import flush_stream_text
+        flush_stream_text(sid)
+    except Exception:
+        pass
+
+
 def repair_tool_messages(messages: list) -> list:
     """修复 tool_calls 消息序列不完整问题（DeepSeek 等 API 严格要求）。
 
@@ -391,6 +419,8 @@ class AIHandler:
                     reasoning_buffer += content
                     # 将思考内容添加到滚动显示区域
                     self.thinking_display.add_content(content)
+                    # 审计实时流（管理页面实时画面）
+                    _audit_stream(self.session, "reasoning", content)
                     # 链条事件回调（Web SSE 推送）
                     self._emit_chain_event("reasoning", content=content)
                     # 思考内容复读检测
@@ -430,6 +460,8 @@ class AIHandler:
                     # 通过 Markdown 流式渲染器处理内容
                     raw_content = md_renderer.feed(content)
                     ai_response += raw_content
+                    # 审计实时流（管理页面实时画面）
+                    _audit_stream(self.session, "content", content)
                     # 链条事件回调（Web SSE 推送）
                     self._emit_chain_event("content", content=content)
                     # 正文复读检测
@@ -443,6 +475,8 @@ class AIHandler:
 
             # 流式结束 — 完成 Markdown 渲染（清除纯文本+前缀，重新渲染）
             md_renderer.flush()
+            # 审计实时流：立即冲刷聚合缓冲（管理页面实时显示完整一段）
+            _audit_stream_flush(self.session)
 
             # v5.2.7：流结束后立即关闭思考显示（必须在打印 🔧 工具调用行
             # 之前--旧版在流末尾才 finish，reasoning->tool_calls 无 content
