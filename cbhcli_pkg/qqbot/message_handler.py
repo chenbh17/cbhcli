@@ -253,7 +253,7 @@ class QQBotMessageHandler:
         content = msg.get('content', '')
         mentions = msg.get('mentions', []) or []
 
-        # v5.3.1：事件级日志（排查 @判定/去重问题用）
+        # v5.3.1：事件级日志（排查 @判定/去重/引用解析问题用）
         logger.info(
             f"[{self.config.name}] 收到事件 {event_type} "
             f"msg_id={msg.get('msg_id', '')[:16]}... "
@@ -261,7 +261,8 @@ class QQBotMessageHandler:
             f"content={json.dumps(content, ensure_ascii=False)[:80]} "
             f"mentions={[m[:8] + '...' if len(m) > 8 else m for m in (mentions or [])]} "
             f"atts={len(msg.get('attachments', []) or [])} "
-            f"ref={len(msg.get('ref_attachments', []) or [])}"
+            f"ref_atts={len(msg.get('ref_attachments', []) or [])} "
+            f"ref_content={json.dumps((msg.get('ref_content') or '')[:40], ensure_ascii=False)}"
         )
 
         # ── 群消息：@机器人 判定 + 去重 + 提及 id 学习 ──
@@ -395,17 +396,35 @@ class QQBotMessageHandler:
         logger.info(f"[{qq_msg.message_type}] {qq_msg.author_name}: {qq_msg.content[:50]}")
 
         if self._on_user_message:
-            try:
-                reply = self._on_user_message(qq_msg)
-                if reply:
-                    self.send_reply(qq_msg, reply)
-            except Exception as e:
-                logger.error(f"消息处理失败: {e}", exc_info=True)
-                # 截断错误信息，避免过长被 QQ API 拒绝
-                err_msg = str(e)
-                if len(err_msg) > 200:
-                    err_msg = err_msg[:200] + "..."
-                self.send_reply(qq_msg, f"抱歉，处理消息时出错了：{err_msg}")
+            # v5.4.0+（问题3）：消息处理放入独立线程，不阻塞网关接收线程——
+            # AI 任务执行期间（可达数分钟），新到达的 QQ 消息必须能被实时
+            # 接收并进入调度（同人中断替换 / 异人排队）。旧实现同步调用
+            # 会阻塞网关线程，新消息全部积压在 WebSocket 缓冲区中直到
+            # 当前任务结束才被处理（表现为"agent 识别不到新消息"）。
+            threading.Thread(
+                target=self._process_message_async,
+                args=(qq_msg,),
+                daemon=True,
+                name=f"qqmsg-{self.config.name}",
+            ).start()
+
+    def _process_message_async(self, qq_msg: QQMessage):
+        """异步处理单条消息（独立线程）：AI 处理后发送回复。
+
+        异常与失败回复逻辑与原同步实现保持一致；线程为 daemon，
+        Bot 停止/进程退出时不会阻塞。
+        """
+        try:
+            reply = self._on_user_message(qq_msg)
+            if reply:
+                self.send_reply(qq_msg, reply)
+        except Exception as e:
+            logger.error(f"消息处理失败: {e}", exc_info=True)
+            # 截断错误信息，避免过长被 QQ API 拒绝
+            err_msg = str(e)
+            if len(err_msg) > 200:
+                err_msg = err_msg[:200] + "..."
+            self.send_reply(qq_msg, f"抱歉，处理消息时出错了：{err_msg}")
 
     def send_reply(self, msg: QQMessage, content: str):
         """发送回复消息

@@ -325,6 +325,20 @@ class CBHCLIApp:
         self._qq_interrupt = threading.Event()
         # 当前 QQ 任务运行的回调线程（None=无 QQ 任务）
         self._qq_active_thread: Optional[threading.Thread] = None
+        # ── v5.4.0+（QQ消息调度：同人中断替换 / 异人FIFO排队）──
+        # 当前 QQ 任务的发送者标识 (author_id, message_type)
+        self._qq_task_owner: Optional[tuple] = None
+        # 中断原因（"cli"=CLI Ctrl+C / "superseded"=同人新消息接管），
+        # QQ 回调据此决定是否给 QQ 侧回发中断提示
+        # （superseded 时静默——新消息的回复即将发出，避免刷屏误导）
+        self._qq_interrupt_reason: Optional[str] = None
+        # 等锁 FIFO 队列 [(ticket, sender_key), ...]（先到先得，防乱序）
+        self._qq_wait_queue: list = []
+        self._qq_ticket_seq: int = 0
+        # 被更新消息取代（未及处理）的同人消息内容缓冲：
+        # sender_key → [(author_name, content), ...]，并入下一次同人处理
+        self._qq_superseded_msgs: dict = {}
+        self._qq_state_lock = threading.Lock()
 
     # ── 会话互斥与 QQ 任务中断 ──
 
@@ -336,14 +350,37 @@ class CBHCLIApp:
     def _request_interrupt_qq(self) -> bool:
         """CLI 主线程 Ctrl+C 时调用：请求中断正在运行的 QQ Bot 任务
 
+        v5.4.0+ 修复：中断请求后等待任务实际停止再打印最终提示——
+        QQ 任务线程收尾时会清理终端思考显示区域（ANSI 上移擦除），
+        立即打印的提示会被那次擦除覆盖，用户看不到"停止"提示文字。
+
         Returns:
             True=已发出中断请求 / False=没有正在运行的 QQ 任务
         """
-        if self._qq_active_thread is not None and self._qq_active_thread.is_alive():
-            self._qq_interrupt.set()
-            print(f"\n{C_DIM}⏳ 已请求中断 QQ Bot 任务，等待其收尾...{C_RESET}")
+        target = self._qq_active_thread
+        if target is None or not target.is_alive():
+            return False
+        self._qq_interrupt_reason = "cli"
+        self._qq_interrupt.set()
+        print(f"\n{C_DIM}⏳ 已请求中断 QQ Bot 任务，等待其停止...{C_RESET}")
+        # 等待任务收尾（终端清理完成后再打印，提示才不会被擦除）
+        deadline = time.time() + 8.0
+        stopped = False
+        try:
+            while time.time() < deadline:
+                cur = self._qq_active_thread
+                if cur is None or cur is not target or not target.is_alive():
+                    stopped = True
+                    break
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print()  # 等待期间再次 Ctrl+C：跳过等待，直接返回
             return True
-        return False
+        if stopped:
+            print(f"{C_DIM}⏹️ QQ Bot 任务已停止{C_RESET}")
+        else:
+            print(f"{C_DIM}⏹️ 中断请求已发出，任务正在收尾...{C_RESET}")
+        return True
 
     def _acquire_session_cli(self):
         """CLI 主线程获取会话锁（阻塞等待 QQ 任务完成）
@@ -360,23 +397,73 @@ class CBHCLIApp:
                     continue  # 已请求中断 QQ，继续等待锁释放
                 raise        # 无 QQ 任务可中断 → 按常规中断处理
 
-    def _acquire_session_qq(self, timeout: float = 150.0) -> bool:
-        """QQ 回调线程获取会话锁（限时等待 CLI 任务完成）
+    def _qq_register_wait(self, sender_key: tuple) -> int:
+        """QQ 消息进入等锁 FIFO 队列，返回到达票号（先到先得）"""
+        with self._qq_state_lock:
+            self._qq_ticket_seq += 1
+            ticket = self._qq_ticket_seq
+            self._qq_wait_queue.append((ticket, sender_key))
+        return ticket
 
-        CLI 任务由终端用户驱动，QQ 消息不可插队——群聊被动回复窗口仅
-        5 分钟，超时后放弃并向 QQ 用户回复忙提示。
+    def _qq_unregister_wait(self, ticket: int):
+        """QQ 消息离开等锁队列（幂等）"""
+        with self._qq_state_lock:
+            self._qq_wait_queue = [
+                (t, k) for (t, k) in self._qq_wait_queue if t != ticket]
+
+    def _qq_has_newer_same_sender(self, sender_key: tuple, ticket: int) -> bool:
+        """是否有更晚到达的同人消息仍在排队（本条已被新消息取代）"""
+        with self._qq_state_lock:
+            return any(t > ticket and k == sender_key
+                       for (t, k) in self._qq_wait_queue)
+
+    def _qq_add_superseded(self, sender_key: tuple, author_name: str,
+                           content: str):
+        """记录被新消息取代（未及处理）的同人消息内容，供下一条同人消息合并"""
+        text = (content or "").strip()
+        if not text:
+            return
+        with self._qq_state_lock:
+            self._qq_superseded_msgs.setdefault(sender_key, []).append(
+                (author_name or "", text))
+
+    def _qq_pop_superseded(self, sender_key: tuple) -> list:
+        """取出并清空同人消息缓冲（并入本次处理）"""
+        with self._qq_state_lock:
+            return self._qq_superseded_msgs.pop(sender_key, [])
+
+    def _acquire_session_qq(self, sender_key: Optional[tuple] = None,
+                            ticket: int = 0, timeout: float = 150.0) -> bool:
+        """QQ 回调线程获取会话执行权（限时等待 + 同人中断替换 + FIFO）
+
+        调度规则（v5.4.0+）：
+        - 同一发送者（author_id+消息类型）的消息重复到达：请求中断其
+          正在执行的任务（reason=superseded），让新消息尽快接管——
+          被中断任务静默结束，新消息基于完整会话上下文继续处理；
+        - 不同发送者 / CLI 任务：按到达顺序（FIFO）排队等待；
+        - 群聊被动回复窗口仅 5 分钟，超时放弃并向 QQ 用户回复忙提示。
 
         Returns:
-            True=获得会话 / False=等待超时（CLI 任务仍在处理）
+            True=已获得执行权（会话锁已持有）/ False=等待超时
         """
         deadline = time.time() + timeout
         while True:
-            # 限时探测式获取，可感知 CLI 长任务
+            # 同人任务正在运行 → 发中断请求（被中断任务静默结束）
+            if sender_key is not None and self._qq_task_owner == sender_key:
+                self._qq_interrupt_reason = "superseded"
+                self._qq_interrupt.set()
             remain = deadline - time.time()
             if remain <= 0:
                 return False
-            if self._session_lock.acquire(timeout=min(remain, 0.5)):
-                return True
+            # FIFO：只有队首才尝试抢锁（防止后到消息抢占导致乱序，
+            # 并为"过时检测"提供稳定的等待队列快照）
+            with self._qq_state_lock:
+                head = self._qq_wait_queue[0][0] if self._qq_wait_queue else None
+            if head == ticket:
+                if self._session_lock.acquire(timeout=min(remain, 0.2)):
+                    return True
+            else:
+                time.sleep(0.05)
     
     def _init_config(self):
         """初始化配置"""
@@ -949,24 +1036,57 @@ class CBHCLIApp:
 
             v5.3.1（QQ并发修复）：与 CLI 共享同一会话，AI 请求全程持有
             会话锁串行执行；CLI 端 Ctrl+C 可通过 interrupt_event 中断本任务。
-            """
-            # ---- 会话互斥（v5.3.1）----
-            # CLI 任务运行中时限时等待（群聊被动回复窗口仅 5 分钟），
-            # 超时则直接回复忙提示，不排队堆积
-            if not app_ref._acquire_session_qq(timeout=150.0):
-                return ("⏳ 当前 CLI 端有任务正在处理，暂时无法响应。"
-                        "请稍后再发消息。")
-            # 登记本任务线程 + 清零中断标志（中断只作用于本次任务）
-            app_ref._qq_active_thread = threading.current_thread()
-            app_ref._qq_interrupt.clear()
-            try:
-                return _handle_qq_message_locked(app_ref, bot_name, qq_msg)
-            finally:
-                app_ref._qq_active_thread = None
-                app_ref._session_lock.release()
 
-        def _handle_qq_message_locked(app_ref, bot_name: str, qq_msg) -> str:
-            """QQ 消息实际处理逻辑（调用方必须已持有会话锁）"""
+            v5.4.0+（消息调度）：
+            - 消息处理运行在独立线程（message_handler 已异步化），任务
+              执行期间新消息可实时进入本函数参与调度（不再积压丢失）；
+            - 同一发送者再次发消息 → 中断其正在执行的任务，新消息接管
+              （被中断任务静默结束，新消息基于完整上下文继续处理）；
+            - 不同发送者 → FIFO 排队等待前一个任务结束再执行；
+            - 排队期间被更新消息取代的本条 → 内容并入下一条合并处理。
+            """
+            sender_key = (qq_msg.author_id or "", qq_msg.message_type or "")
+            # ---- 调度：FIFO 注册 + 等待执行权（同人中断 / 异人排队）----
+            ticket = app_ref._qq_register_wait(sender_key)
+            try:
+                if not app_ref._acquire_session_qq(sender_key=sender_key,
+                                                   ticket=ticket,
+                                                   timeout=150.0):
+                    return ("⏳ 当前有其他任务正在处理，暂时无法响应。"
+                            "请稍后再发消息。")
+                # 已获执行权。若排队期间又有更新的同人消息到达，本条已被
+                # 取代：内容记入缓冲并入下一条处理，本次静默放弃（不回复）
+                if app_ref._qq_has_newer_same_sender(sender_key, ticket):
+                    app_ref._qq_add_superseded(sender_key, qq_msg.author_name,
+                                               qq_msg.content)
+                    app_ref._session_lock.release()
+                    return ""
+                # 取出先前被取代的同人消息（连发场景），本次一并注入处理
+                pending_msgs = app_ref._qq_pop_superseded(sender_key)
+                # 登记本任务（供 CLI Ctrl+C / 后续同人消息判断归属）
+                app_ref._qq_active_thread = threading.current_thread()
+                app_ref._qq_task_owner = sender_key
+                app_ref._qq_interrupt_reason = None
+                app_ref._qq_interrupt.clear()
+                try:
+                    return _handle_qq_message_locked(app_ref, bot_name, qq_msg,
+                                                     pending_msgs=pending_msgs)
+                finally:
+                    # 先清登记（防止同人新消息误判归属），再释放锁
+                    app_ref._qq_active_thread = None
+                    app_ref._qq_task_owner = None
+                    app_ref._session_lock.release()
+            finally:
+                app_ref._qq_unregister_wait(ticket)
+
+        def _handle_qq_message_locked(app_ref, bot_name: str, qq_msg,
+                                      pending_msgs: list = None) -> str:
+            """QQ 消息实际处理逻辑（调用方必须已持有会话锁）
+
+            Args:
+                pending_msgs: 被更新的同人消息取代（未及处理）的消息内容
+                    列表 [(author_name, content), ...]，本次一并注入处理
+            """
             from cbhcli_pkg.core.model import LLMClient
             
             # ---- 斜杠命令处理 ----
@@ -1138,28 +1258,40 @@ class CBHCLIApp:
                             parts[-1] += f" → {local_path}"
                 return parts
 
-            if qq_msg.attachments or qq_msg.ref_attachments:
+            # ── 引用消息注入（v5.4.0+ 修复：无论有无附件都必须注入）──
+            # QQ 引用回复时 content 只有新文本（或空），被引用内容在
+            # ref_content/ref_attachments 中，必须显式带给 AI。
+            # 旧实现把该逻辑放在"有附件"条件块内——引用纯文本消息
+            # （双方均无附件）时引用内容被整段丢弃（表现为"识别不到引用"）。
+            ref_desc_parts = []
+            if qq_msg.ref_attachments:
+                download_dir.mkdir(parents=True, exist_ok=True)
+                ref_desc_parts.extend(
+                    _describe_attachments(qq_msg.ref_attachments,
+                                          ref_prefix="引用"))
+            if qq_msg.ref_content:
+                who = f" {qq_msg.ref_author_name}" if qq_msg.ref_author_name else ""
+                ref_desc_parts.insert(0, f"引用{who}: {qq_msg.ref_content}")
+            if ref_desc_parts:
+                context_prefix += "用户引用了一条历史消息:\n"
+                for p in ref_desc_parts:
+                    context_prefix += f"  {p}\n"
+
+            # ── 当前消息附件处理 ──
+            if qq_msg.attachments:
                 download_dir.mkdir(parents=True, exist_ok=True)
                 att_desc_parts = _describe_attachments(qq_msg.attachments)
-                ref_att_desc_parts = _describe_attachments(qq_msg.ref_attachments, ref_prefix="引用")
-
-                # v5.3.1（bug3 修复）：引用消息的原文也注入上下文——
-                # QQ 引用回复时 content 只有新文本（或空），被引用内容在
-                # ref_content/ref_attachments 中，必须显式带给 AI
-                ref_desc_parts = list(ref_att_desc_parts)
-                if qq_msg.ref_content:
-                    who = f" {qq_msg.ref_author_name}" if qq_msg.ref_author_name else ""
-                    ref_desc_parts.insert(0, f"引用{who}: {qq_msg.ref_content}")
-                if ref_desc_parts:
-                    context_prefix += "用户引用了一条历史消息:\n"
-                    for p in ref_desc_parts:
-                        context_prefix += f"  {p}\n"
-
                 if att_desc_parts:
                     context_prefix += f"附件已下载到 {download_dir}/:\n"
                     for p in att_desc_parts:
                         context_prefix += f"  {p}\n"
                     context_prefix += "你可以使用 read 工具读取文件内容。\n"
+
+            # ── 被取代的同人消息合并注入（v5.4.0+ 连发场景）──
+            if pending_msgs:
+                context_prefix += "用户在此之前还连发过以下消息（一并处理）:\n"
+                for _an, _ct in pending_msgs:
+                    context_prefix += f"  [{_an}]: {_ct}\n"
 
             context_prefix += f"\n用户消息: {qq_msg.content}"
 
@@ -1187,7 +1319,32 @@ class CBHCLIApp:
 
             old_confirm = app_ref.tool_executor.no_more_confirmations
             app_ref.tool_executor.no_more_confirmations = True
-            
+
+            # v5.4.0+（审计）：QQ 会话运行中状态即时同步到 cbhcli admin
+            # （"运行中"实时列表 + 运行中会话详情），结束时收敛 idle。
+            # 与 CLI 端 _handle_ai_request 的审计口径保持一致；流式思考/
+            # 正文内容由 AIHandler 内置审计上报（_audit_stream）。
+            _audit_sid = session.id if session else ""
+            _audit_agent = target_agent or (app_ref.current_agent_name or "main")
+            try:
+                from cbhcli_pkg.core import web_notify as _wn
+                _audit_title = (_wn.session_title_of(session)
+                                or (qq_msg.content or "")[:50])
+            except Exception:
+                _audit_title = (qq_msg.content or "")[:50]
+            try:
+                from cbhcli_pkg.auth import get_reporter
+                if _audit_sid:
+                    get_reporter().report_status(
+                        _audit_sid, agent=_audit_agent, title=_audit_title,
+                        workspace=os.getcwd(), status="running",
+                        surface="qqbot")
+                    get_reporter().report_event(
+                        "session_round_start", session_id=_audit_sid,
+                        prompt=context_prefix[:2000], surface="qqbot")
+            except Exception:
+                pass
+
             try:
                 # 清理孤儿 tool 消息（持久会话中上轮遗留，无前置 tool_calls 会导致 API 400）
                 msgs = session.messages
@@ -1245,9 +1402,13 @@ class CBHCLIApp:
                 
                 return reply
             except KeyboardInterrupt:
-                # v5.3.1（QQ并发修复）：CLI 端 Ctrl+C 中断了本 QQ 任务
-                # （interrupt_event 检测点抛出）——回复简短说明，
-                # 不打印堆栈（CLI 终端由主循环打印提示）
+                # CLI 端 Ctrl+C / 同人新消息接管 中断了本任务（interrupt_
+                # event 检测点抛出）——按中断原因决定是否回复：
+                # superseded（同人新消息接管）静默结束，避免刷屏误导
+                # （新消息的回复即将发出）
+                _reason = getattr(app_ref, "_qq_interrupt_reason", None)
+                if _reason == "superseded":
+                    return ""
                 return "⏹️ 任务已被 CLI 端中断（用户按了 Ctrl+C）。如需继续请重新发送消息。"
             except Exception as e:
                 import logging
@@ -1255,6 +1416,18 @@ class CBHCLIApp:
                 return f"抱歉，处理消息时出错了：{e}"
             finally:
                 app_ref.tool_executor.no_more_confirmations = old_confirm
+                # v5.4.0+（审计）：状态收敛 idle（正常/中断/异常出口统一）
+                try:
+                    from cbhcli_pkg.auth import get_reporter
+                    if _audit_sid:
+                        get_reporter().report_status(
+                            _audit_sid, agent=_audit_agent, status="idle",
+                            surface="qqbot")
+                        get_reporter().report_event(
+                            "session_round_complete", session_id=_audit_sid,
+                            surface="qqbot")
+                except Exception:
+                    pass
                 # 每轮 QQ 对话结束自动保存到 history（与 CLI 逻辑一致，v5.2.6）
                 # _autosave_session 内部有 autosave_history 开关 + try/except 保护，
                 # 同 session_id 幂等覆盖同一文件，正常/异常出口统一落盘

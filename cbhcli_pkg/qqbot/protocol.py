@@ -15,10 +15,41 @@ OpCode 定义:
    13 - CLIENT_STATUS (客户端状态变更)
 """
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional, Any
+
+logger = logging.getLogger(__name__)
+
+
+def _find_ref_msg_idx(data: dict) -> str:
+    """从 message_scene 中提取被引用消息序号 ref_msg_idx（格式宽容）。
+
+    兼容格式:
+    - message_scene.ext = ["ref_msg_idx=xxx", ...]（QQ 官方/test 常用）
+    - message_scene.ext = {"ref_msg_idx": "xxx"}（dict 形式）
+    - message_scene 顶层直接带 ref_msg_idx
+    返回值统一 strip。
+    """
+    try:
+        scene = data.get('message_scene')
+        if isinstance(scene, dict):
+            ext = scene.get('ext')
+            if isinstance(ext, list):
+                for e in ext:
+                    if isinstance(e, str) and e.startswith('ref_msg_idx='):
+                        return e.split('=', 1)[1].strip()
+                    if isinstance(e, dict) and e.get('ref_msg_idx'):
+                        return str(e.get('ref_msg_idx')).strip()
+            elif isinstance(ext, dict) and ext.get('ref_msg_idx'):
+                return str(ext.get('ref_msg_idx')).strip()
+            if scene.get('ref_msg_idx'):
+                return str(scene.get('ref_msg_idx')).strip()
+    except Exception:
+        pass
+    return ""
 
 
 class OpCode(IntEnum):
@@ -249,22 +280,21 @@ class QQBotProtocol:
         ref_content, ref_attachments, ref_author_name = "", [], ""
         msg_elements = data.get('msg_elements') or []
         if msg_elements:
-            ref_msg_idx = ""
-            scene = data.get('message_scene')
-            if isinstance(scene, dict):
-                for ext in (scene.get('ext') or []):
-                    if isinstance(ext, str) and ext.startswith('ref_msg_idx='):
-                        ref_msg_idx = ext[len('ref_msg_idx='):]
-                        break
+            ref_msg_idx = _find_ref_msg_idx(data)
             target = None
             if ref_msg_idx:
                 for el in msg_elements:
-                    if isinstance(el, dict) and el.get('msg_idx') == ref_msg_idx:
+                    if isinstance(el, dict) and \
+                            str(el.get('msg_idx') or '') == str(ref_msg_idx):
                         target = el
                         break
-            if target is None and isinstance(msg_elements[0], dict):
-                # 兜底：无 ref_msg_idx 时取第一个元素（QQ 客户端引用回复基本只带一个）
-                target = msg_elements[0]
+            if target is None:
+                # 兜底：无 ref_msg_idx 或匹配失败时，取第一个 dict 元素
+                # （QQ 客户端引用回复基本只带一个被引用元素）
+                for el in msg_elements:
+                    if isinstance(el, dict):
+                        target = el
+                        break
             if target is not None:
                 ref_content = (target.get('content') or '').strip()
                 ref_author = target.get('author') or {}
@@ -281,6 +311,18 @@ class QQBotProtocol:
                         'width': att.get('width'),
                         'height': att.get('height'),
                     })
+            # 引用解析诊断日志（排查"识别不到引用内容"用）
+            try:
+                logger.info(
+                    "[引用解析] elements=%d ref_idx=%r matched=%s "
+                    "ref_content=%r ref_atts=%d scene=%s"
+                    % (len(msg_elements), ref_msg_idx,
+                       'yes' if target is not None else 'no',
+                       ref_content[:60], len(ref_attachments),
+                       json.dumps(data.get('message_scene'),
+                                  ensure_ascii=False)[:200]))
+            except Exception:
+                pass
 
         if event_type == "C2C_MESSAGE_CREATE":
             author = data.get('author', {})
