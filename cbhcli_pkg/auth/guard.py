@@ -175,8 +175,12 @@ def require_login(surface: str = "cli", interactive: bool = True) -> bool:
     # ---- 4. 严格模式：离线超宽限 -> 拦截 ----
     policy = data.get("policy") or {}
     if policy.get("strict_online"):
-        grace_min = float(policy.get("strict_grace_minutes", _DEFAULT_STRICT_GRACE_MIN)
-                          or _DEFAULT_STRICT_GRACE_MIN)
+        try:
+            grace_min = float(policy.get("strict_grace_minutes",
+                                         _DEFAULT_STRICT_GRACE_MIN)
+                              or _DEFAULT_STRICT_GRACE_MIN)
+        except Exception:
+            grace_min = _DEFAULT_STRICT_GRACE_MIN
         since = _offline_since
         if since is not None and (time.time() - since) > grace_min * 60:
             _set_reason("strict_offline")

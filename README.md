@@ -1,4 +1,4 @@
-# CBHCLI v5.4.0 - AI驱动的终端助手
+# CBHCLI v5.4.2 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -181,7 +181,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.4.0-py3-none-any.whl
+pip install dist/cbhcli-5.4.2-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -611,12 +611,17 @@ cbhcli-admin                  # 等价入口（供 systemd / 脚本调用）
 ```
 
 **启动门（第一层安全）**：主密码校验源优先级
-1. 环境变量 `CBHCLI_ADMIN_MASTER_KEY`（最高优先，用于无人值守/开机自启）
-2. 数据目录 `~/.cbhcli-admin/admin.json` 的 `master_key_hash`（首次成功启动后自动写入）
-3. 代码内置默认口令 —— **仅以 hash 存储（源码/whl 中不含明文）**，口令不公开；
+1. **已修改的主密码**（`admin.json` 中 `key_source=explicit`）—— 经由管理页面
+   「修改主密码」或 `cbhcli admin --set-password` 写入，**最高优先**；
+   修改后**用新密码登录即可**（立即生效、无需重启；也无需同步启动配置）
+2. 环境变量 `CBHCLI_ADMIN_MASTER_KEY`（未显式修改过时的部署凭据，用于无人值守/开机自启）
+3. 数据目录 `~/.cbhcli-admin/admin.json` 中引导写入的 `master_key_hash`（首次成功启动后自动写入）
+4. 代码内置默认口令 —— **仅以 hash 存储（源码/whl 中不含明文）**，口令不公开；
    实际部署请通过 ① 或 `--set-password` 设置自己的口令
 
 连续输入错误 **5 次**直接退出（退出码 2）；非交互环境（stdin 非 TTY）启动必须提供环境变量，否则拒绝启动。
+（若主密码已修改过而启动配置里的环境变量还是旧值：仅打印提示并以已修改的主密码继续启动——
+管理页面用新主密码登录；`--set-password` 修改密码时必须先验证当前密码，无跳过校验的通道。）
 
 ```bash
 # 无交互启动（systemd / crontab / 容器）—— 用你自己的主密码
@@ -631,7 +636,7 @@ CBHCLI_ADMIN_MASTER_KEY=<你的主密码> cbhcli-admin --port 28888
 | `--host HOST` | 监听地址 | 0.0.0.0 |
 | `--data-dir PATH` | 数据目录（db/快照/配置） | `~/.cbhcli-admin` |
 | `--tls-cert CERT` / `--tls-key KEY` | 启用 HTTPS（自签场景客户端需信任证书） | 关闭（内网 HTTP 基线） |
-| `--set-password` | 交互式修改管理员主密码（写入 admin.json 的 hash） | - |
+| `--set-password` | 交互式修改管理员主密码（需当前密码，立即生效） | - |
 | `status` | 服务自检（不启动服务） | - |
 | `-h, --help` | 帮助 | - |
 
@@ -668,7 +673,7 @@ cbhcli-admin status          # 等价 cbhcli admin status
 | 会话管理 | 全部用户会话（筛选：用户/状态/关键词；**列表实时更新**——新会话/运行中状态 WS 秒级上屏，无需手动刷新）+ 详情抽屉（消息流回放：**思考 → 文字 → 工具调用**；**运行中会话 WebSocket 实时画面**——思考/正文/工具调用流式上屏，轮结束自动并入快照）+ 删除 |
 | 实时监控 | 运行中会话卡片墙（用户/Agent/标题/工作空间/时长/最后心跳颜色）；**会话运行全程持续显示**（多进程心跳按实例隔离，互不覆盖）+ **点击卡片 → WebSocket 实时交互画面**（与 Web 端一致的实时流）；WS 推送即时刷新 + 2s 轮询兜底 |
 | 审计日志 | 事件流（时间/用户/类型徽标/会话/摘要；筛选：类型/用户/时间范围；分页）+ 登录记录（成功/失败/原因）+ **导出 CSV** |
-| 设置 | strict_online 开关 / report_level（full/summary）/ 新用户默认有效期 / 快照上限 / 服务自检 / 修改主密码 |
+| 设置 | strict_online 开关 / auto_renew 开关 / report_level（full/summary，summary 跳过实时流式内容）/ 新用户默认有效期 / 严格模式宽限 / 快照上限 / 服务自检 / 修改主密码（立即生效，其它管理会话失效） |
 
 #### 5. 管理 API 参考（请求头 `X-Admin-Token`）
 
@@ -689,8 +694,8 @@ cbhcli-admin status          # 等价 cbhcli admin status
 | GET / DELETE | `/admin/api/sessions/{user_id}/{session_id}` | 会话详情（快照 JSON）/ 删除 |
 | GET | `/admin/api/events` / `/admin/api/logins` | 事件流 / 登录记录（筛选 + 分页） |
 | GET | `/admin/api/export/events.csv` / `/admin/api/export/sessions.csv` | 导出 CSV |
-| GET / PUT | `/admin/api/settings` | 服务设置（strict_online / report_level / 默认有效期 / 快照上限…） |
-| POST | `/admin/api/settings/password` | 修改主密码 |
+| GET / PUT | `/admin/api/settings` | 服务设置（strict_online / auto_renew / report_level / 默认有效期 / 宽限 / 快照上限；服务端校验范围，非法值 400） |
+| POST | `/admin/api/settings/password` | 修改主密码（需当前密码；立即生效；返回 `warning` 提醒同步更新环境变量） |
 
 #### 6. 开机自启（crontab 示例）
 
@@ -699,8 +704,12 @@ cbhcli-admin status          # 等价 cbhcli admin status
 @reboot nohup bash -c 'CBHCLI_ADMIN_MASTER_KEY=<主密码> /home/<user>/.local/bin/cbhcli-admin --port 28888 --host 0.0.0.0' > ~/.cbhcli-admin/boot.log 2>&1 &
 ```
 
-> ⚠️ 用环境变量提供主密码（开机时无法交互输入）。**修改主密码后必须同步更新这一行**（`crontab -e`），
-> 否则下次开机自启会因密码不符被拒绝启动。
+> 💡 用环境变量提供主密码（开机时无法交互输入）。**主密码一经修改，即以其为准**——
+> 改密码后用新主密码登录即可，**无需修改这一行**（服务自动处理：进程内环境变量自动
+> 同步；启动时若检测到旧值仅打印提示，仍以新主密码继续启动）。
+> 无命令级"重置"通道（安全设计）——忘记主密码时可用当前密码交互式启动，或由服务器管理员
+> 删除 `~/.cbhcli-admin/admin.json` 中的 `master_key_hash`/`master_key_salt`/`key_source`
+> 三个字段后重启（回落环境变量/内置默认；需服务器文件权限，即最高权限边界）。
 
 #### 7. 备份与运维
 
@@ -725,6 +734,7 @@ cbhcli-admin status        # 日常自检
 | **实时盯运行中任务** | 实时监控页（运行中会话卡片墙，WS 即时刷新）→ **点击卡片打开实时交互画面**（思考/正文/工具调用实时上屏，和 Web 端一致）；运行中会话**全程持续显示**不闪烁 |
 | **排查"无法登录"** | ① 客户端 `cbhcli ping <服务器>`（四类诊断）② 管理页面 → 审计日志 → 登录记录（失败原因：invalid_key / disabled / rate_limited）③ 检查管理服务自检 `cbhcli-admin status` |
 | **客户端整体离线使用** | 默认"软在线"，服务器短暂故障不阻塞已登录用户；如需高风控（离线超宽限即拦截）→ 设置页开启 `strict_online` |
+| **修改主密码** | 管理页面 → 设置 → 「修改主密码」（需当前密码；改后**立即生效、用新密码登录即可**，其它管理会话失效）→ **无需修改启动配置**（环境变量自动让位：进程内自动同步、旧值仅提示不阻塞）；无跳过校验的重置命令（安全设计） |
 
 ### 二、客户端接入（四端）
 
@@ -898,6 +908,19 @@ docs/                 # 项目文档
 ```
 
 ## 变更记录
+
+### v5.4.1
+
+**修复：管理页面修改主密码不生效（用户报告）+ 服务设置全项排查**：
+
+- **主密码"显式修改优先"语义**：此前只要启动配置里有 `CBHCLI_ADMIN_MASTER_KEY`（crontab/systemd），管理页面改密码**永远不生效**（新密码 401、旧密码 200，重启也一样）——现改为：**已修改的主密码（admin.json `key_source=explicit`）优先于环境变量，改后立即生效**（管理页面/新会话登录用新密码，重启后依然如此）；改密码后吊销其它管理会话；设置页/status 显示实际生效的「主密码校验源」
+- **主密码修改自动化（用户反馈）**：改密码后用新密码登录即可——运行中的服务自动同步进程内环境变量，**外部启动配置无需修改**（旧值仅打印提示、不阻塞启动，仍以新主密码为准）；`--set-password` 修改密码必须验证当前密码（无跳过校验的通道）
+- **服务设置服务端校验**：`PUT /admin/api/settings` 此前无任何校验（可写入 `grace=-5`、`snap="abc"` 等脏值导致客户端异常）→ 新增类型+范围校验（非法值 400），历史脏值读取时回落默认
+- **`auto_renew` 死设置补全**：此前下发但无法配置（不在白名单、无界面入口）→ 设置页新增开关（关闭后凭据到期需人工续期）
+- **`report_level=summary` 落地**：此前服务端下发但客户端从不消费 → 客户端 reporter 在 summary 级别跳过实时流式内容（`stream_chunk`），仅保留结构化审计事件
+- **用户续期"永久"修复**：`update_user` 通用 `None 跳过` 逻辑吞掉永久值 → 本次续期永久、下次登录又恢复旧天数；现可正确写回用户记录（含续期弹窗对永久用户默认显示"永久"）
+- **其它**：管理登录限流只计失败（成功登录清空计数，改密码后重新登录不被误伤）；同数据目录多实例退出不再互相删除 `server.json`；快照上限脏值防御；**审计日志「事件日志」时间列改为"日期 时间"格式**（与登录记录一致）
+- **详见**：`docs/v5.4.1更新日志.md`
 
 ### v5.4.0
 

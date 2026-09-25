@@ -134,6 +134,32 @@ def _expiry_iso(ttl_days) -> Optional[str]:
         timespec="seconds")
 
 
+def _normalize_user_ttl(v) -> tuple:
+    """规范化用户有效期字段（users.token_ttl_days）。
+
+    Returns: (ok: bool, value)：ok=False 表示非法值（调用方跳过）；
+             value=None 表示永久。
+    支持：None / '' / 'forever' / 'null' / 'none' -> None；
+          数字或数字字符串（<=0 视为永久）-> int。
+    """
+    if v is None:
+        return True, None
+    if isinstance(v, bool):
+        return False, None
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("", "forever", "null", "none"):
+            return True, None
+        if not s.isdigit():
+            return False, None
+        n = int(s)
+        return True, (None if n <= 0 else n)
+    if isinstance(v, (int, float)):
+        n = int(v)
+        return True, (None if n <= 0 else n)
+    return False, None
+
+
 def _is_expired(expires_at: Optional[str], now: Optional[datetime] = None) -> bool:
     if not expires_at:
         return False
@@ -296,7 +322,15 @@ class AdminStore:
         allowed = ("display_name", "note", "disabled", "token_ttl_days", "name")
         sets, params = [], []
         for k, v in fields.items():
-            if k not in allowed or v is None:
+            if k not in allowed:
+                continue
+            if k == "token_ttl_days":
+                # 允许 None（=永久）：不再被通用 "v is None 跳过" 吞掉，
+                # 否则「续期为永久」无法写回用户策略（下次登录恢复旧天数）
+                ok, v = _normalize_user_ttl(v)
+                if not ok:
+                    continue
+            elif v is None:
                 continue
             if k == "disabled":
                 v = 1 if v else 0
@@ -383,11 +417,11 @@ class AdminStore:
             "UPDATE tokens SET expires_at=? WHERE user_id=? AND revoked=0",
             (expires_at, user_id))
         updated = cur.rowcount if cur is not None else 0
-        # 同步更新用户默认有效期策略（后续新登录沿用）
+        # 同步更新用户默认有效期策略（后续新登录沿用；永久=写回 None）
         try:
-            self.update_user(user_id, token_ttl_days=(
-                None if expires_at is None else
-                (int(ttl_days) if str(ttl_days).isdigit() else user.get("token_ttl_days"))))
+            ok, tv = _normalize_user_ttl(ttl_days)
+            if ok:
+                self.update_user(user_id, token_ttl_days=tv)
         except Exception:
             pass
         return self.get_user(user_id), updated, expires_at
@@ -585,7 +619,8 @@ class AdminStore:
     def list_events(self, type_: str = "", user_id: str = "",
                     session_id: str = "", from_ts: float = 0, to_ts: float = 0,
                     limit: int = 100, offset: int = 0,
-                    order_desc: bool = True) -> tuple:
+                    order_desc: bool = True,
+                    no_session: bool = False) -> tuple:
         where, params = [], []
         if type_:
             where.append("e.type=?")
@@ -596,6 +631,9 @@ class AdminStore:
         if session_id:
             where.append("e.session_id=?")
             params.append(session_id)
+        elif no_session:
+            # v5.4.2：会话级"（无会话）"组钻取——只看 session_id 为空的事件
+            where.append("(e.session_id='' OR e.session_id IS NULL)")
         if from_ts:
             where.append("e.recv_ts>=?")
             params.append(float(from_ts))
@@ -616,6 +654,89 @@ class AdminStore:
                 r["payload_obj"] = json.loads(r.get("payload") or "{}")
             except Exception:
                 r["payload_obj"] = {}
+        return rows, int((total or {}).get("c", 0) or 0)
+
+    # ---------------------------------------------------------------
+    #  事件聚合（v5.4.2：审计日志三级分层——用户级 / 会话级）
+    # ---------------------------------------------------------------
+
+    def events_summary_by_user(self, from_ts: float = 0, to_ts: float = 0,
+                               limit: int = 500, offset: int = 0) -> tuple:
+        """用户级聚合 -> (rows, total)。
+
+        每行：user_id / user_name / event_count / session_count /
+        tool_calls / rounds / first_ts / last_ts
+        """
+        where, params = [], []
+        if from_ts:
+            where.append("e.recv_ts>=?")
+            params.append(float(from_ts))
+        if to_ts:
+            where.append("e.recv_ts<=?")
+            params.append(float(to_ts))
+        wsql = (" WHERE " + " AND ".join(where)) if where else ""
+        total = self._query_one(
+            f"SELECT COUNT(DISTINCT e.user_id) AS c FROM events e{wsql}",
+            params)
+        rows = self._query(
+            "SELECT e.user_id,"
+            " u.name AS user_name, u.display_name AS user_display,"
+            " u.disabled AS user_disabled,"
+            " COUNT(*) AS event_count,"
+            " COUNT(DISTINCT CASE WHEN e.session_id<>'' THEN e.session_id END)"
+            "   AS session_count,"
+            " SUM(CASE WHEN e.type='tracer.tool_call' THEN 1 ELSE 0 END)"
+            "   AS tool_calls,"
+            " SUM(CASE WHEN e.type='session_round_start' THEN 1 ELSE 0 END)"
+            "   AS rounds,"
+            " MIN(e.recv_ts) AS first_ts, MAX(e.recv_ts) AS last_ts"
+            f" FROM events e LEFT JOIN users u ON u.id = e.user_id{wsql}"
+            " GROUP BY e.user_id ORDER BY last_ts DESC LIMIT ? OFFSET ?",
+            params + [int(limit), int(offset)])
+        return rows, int((total or {}).get("c", 0) or 0)
+
+    def events_summary_by_session(self, user_id: str = "", from_ts: float = 0,
+                                  to_ts: float = 0, limit: int = 100,
+                                  offset: int = 0) -> tuple:
+        """会话级聚合 -> (rows, total)。
+
+        每行：user_id / session_id / title / agent / workspace / model /
+        status / message_count / event_count / tool_calls / rounds /
+        first_ts / last_ts（title 等元数据 LEFT JOIN sessions，可能为空）。
+        session_id='' 表示"无会话"事件组（登录/管理操作等）。
+        """
+        where, params = [], []
+        if user_id:
+            where.append("e.user_id=?")
+            params.append(user_id)
+        if from_ts:
+            where.append("e.recv_ts>=?")
+            params.append(float(from_ts))
+        if to_ts:
+            where.append("e.recv_ts<=?")
+            params.append(float(to_ts))
+        wsql = (" WHERE " + " AND ".join(where)) if where else ""
+        total = self._query_one(
+            f"SELECT COUNT(*) AS c FROM (SELECT 1 FROM events e{wsql}"
+            " GROUP BY e.user_id, e.session_id)", params)
+        rows = self._query(
+            "SELECT e.user_id, e.session_id,"
+            " u.name AS user_name, u.display_name AS user_display,"
+            " s.title, s.agent, s.workspace, s.model, s.status,"
+            " s.message_count,"
+            " COUNT(*) AS event_count,"
+            " SUM(CASE WHEN e.type='tracer.tool_call' THEN 1 ELSE 0 END)"
+            "   AS tool_calls,"
+            " SUM(CASE WHEN e.type='session_round_start' THEN 1 ELSE 0 END)"
+            "   AS rounds,"
+            " MIN(e.recv_ts) AS first_ts, MAX(e.recv_ts) AS last_ts"
+            " FROM events e"
+            " LEFT JOIN users u ON u.id = e.user_id"
+            " LEFT JOIN sessions s ON s.user_id = e.user_id"
+            "   AND s.session_id = e.session_id"
+            f"{wsql} GROUP BY e.user_id, e.session_id"
+            " ORDER BY last_ts DESC LIMIT ? OFFSET ?",
+            params + [int(limit), int(offset)])
         return rows, int((total or {}).get("c", 0) or 0)
 
     def events_for_export(self, **kw) -> list:

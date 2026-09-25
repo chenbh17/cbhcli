@@ -324,6 +324,38 @@ body.resizing { cursor: col-resize; user-select: none; }
 .fm-meta { color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
 .fm-item:hover .fm-menu { display: flex; }
 .fm-item:hover .fm-meta { display: none; }
+/* v5.4.2：搜索/排序工具栏 + 行内更新时间 */
+.fm-toolbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 12px 6px;
+  flex-shrink: 0;
+}
+.fm-search {
+  flex: 1; min-width: 0;
+  background: var(--bg-input, rgba(255,255,255,0.05));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  font-size: 12px;
+  padding: 4px 8px;
+  outline: none;
+}
+.fm-search:focus { border-color: var(--accent); }
+.fm-search::placeholder { color: var(--text-dim); }
+.fm-sort-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: 11px;
+  padding: 4px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fm-sort-btn:hover { background: var(--bg-hover); color: var(--text-0); }
+.fm-sort-btn.active { color: var(--accent-hover, var(--accent)); border-color: var(--accent); }
+.fm-time { font-size: 10.5px; opacity: 0.85; max-width: 86px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- 工作空间浏览器弹窗 ---- */
 .ws-browser { display: flex; flex-direction: column; gap: 10px; }

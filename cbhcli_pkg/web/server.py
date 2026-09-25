@@ -14,7 +14,7 @@ import uuid
 import base64
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi import WebSocket, WebSocketDisconnect
@@ -98,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.4.0")
+app = FastAPI(title="CBHCLI Web", version="5.4.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -4945,46 +4945,69 @@ async def chat_compress(req: Request):
 
 
 @app.post("/api/chat/upload")
-async def chat_upload(file: UploadFile = File(...),
+async def chat_upload(files: List[UploadFile] = File(..., alias="file"),
                       agent_name: str = Form(...), model_name: str = Form(...)):
-    """上传文件/图片供下一条消息使用。"""
-    if not file.filename:
-        raise HTTPException(400, "未提供文件")
+    """上传文件/图片供下一条消息使用（v5.4.2：支持一次请求批量多文件）。
 
-    content = await file.read()
-    max_size = 10 * 1024 * 1024
-    if len(content) > max_size:
-        raise HTTPException(400, "文件过大（最大 10MB）")
+    客户端把每个文件都以 "file" 字段追加进同一个 FormData 即可；
+    单文件上传（旧行为）同样兼容（列表长度为 1）。
+    返回 {"results": [...]}：逐个文件给出结果，单个文件失败不影响其它
+    文件（失败项带 "error" 字段）。
+    """
+    if not files:
+        raise HTTPException(400, "未提供文件")
 
     upload_dir = CBHCLI_DIR / "web_uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
+    max_size = 10 * 1024 * 1024
 
-    safe_name = file.filename.replace("/", "_").replace("\\", "_")
-    dest = upload_dir / safe_name
-    counter = 1
-    while dest.exists():
-        stem = Path(safe_name).stem
-        suffix = Path(safe_name).suffix
-        dest = upload_dir / f"{stem}_{counter}{suffix}"
-        counter += 1
-    dest.write_bytes(content)
+    results = []
+    for file in files:
+        fname = file.filename or ""
+        if not fname:
+            results.append({"filename": "", "error": "未提供文件名"})
+            continue
+        try:
+            content = await file.read()
+            if len(content) > max_size:
+                results.append({"filename": fname,
+                                "error": "文件过大（最大 10MB）"})
+                continue
 
-    content_type = file.content_type or ""
-    is_image = content_type.startswith("image/")
+            safe_name = fname.replace("/", "_").replace("\\", "_")
+            dest = upload_dir / safe_name
+            counter = 1
+            while dest.exists():
+                stem = Path(safe_name).stem
+                suffix = Path(safe_name).suffix
+                dest = upload_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+            dest.write_bytes(content)
 
-    result = {
-        "filename": dest.name,
-        "path": str(dest),
-        "size": len(content),
-        "content_type": content_type,
-        "is_image": is_image,
-        "url": f"/api/files/serve/{dest.name}",
-        "download_url": f"/api/files/download/{dest.name}",
-    }
-    if is_image:
-        b64 = base64.b64encode(content).decode("utf-8")
-        result["base64"] = f"data:{content_type};base64,{b64}"
-    return result
+            content_type = file.content_type or ""
+            is_image = content_type.startswith("image/")
+
+            result = {
+                "filename": dest.name,
+                "path": str(dest),
+                "size": len(content),
+                "content_type": content_type,
+                "is_image": is_image,
+                "url": f"/api/files/serve/{dest.name}",
+                "download_url": f"/api/files/download/{dest.name}",
+            }
+            if is_image:
+                b64 = base64.b64encode(content).decode("utf-8")
+                result["base64"] = f"data:{content_type};base64,{b64}"
+            results.append(result)
+        except Exception as e:
+            results.append({"filename": fname, "error": f"上传失败: {e}"})
+        finally:
+            try:
+                await file.close()
+            except Exception:
+                pass
+    return {"results": results}
 
 
 # ===================================================================

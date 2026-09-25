@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CBHCLI Web</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <link rel="stylesheet" href="/css/style.css?v=5.4.0.2" />
-  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.4.0.2" />
+  <link rel="stylesheet" href="/css/style.css?v=5.4.2" />
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.4.2" />
 </head>
 <body>
   <!-- ===== 登录视图（v5.4.0：未登录时全屏显示，浏览器内完成登录） ===== -->
@@ -97,6 +97,10 @@
         </span>
       </div>
       <div class="fm-crumb" id="fm-crumb"></div>
+      <div class="fm-toolbar">
+        <input type="text" id="fm-search" class="fm-search" placeholder="🔍 搜索文件名…" spellcheck="false" />
+        <button class="fm-sort-btn" id="btn-fm-sort" title="排序：按名称">名称</button>
+      </div>
       <div class="fm-list" id="fm-list"></div>
     </aside>
 
@@ -184,8 +188,8 @@
   <!-- Toast 通知 -->
   <div id="toast-root"></div>
 
-  <script src="/vendor/marked.umd.js?v=5.4.0.2"></script>
-  <script src="/vendor/katex/katex.min.js?v=5.4.0.2"></script>
-  <script src="/js/app.js?v=5.4.0.2"></script>
+  <script src="/vendor/marked.umd.js?v=5.4.2"></script>
+  <script src="/vendor/katex/katex.min.js?v=5.4.2"></script>
+  <script src="/js/app.js?v=5.4.2"></script>
 </body>
 </html>

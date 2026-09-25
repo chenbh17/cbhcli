@@ -26,8 +26,8 @@ from fastapi.staticfiles import StaticFiles
 
 from cbhcli_pkg.admin import data_dir, set_data_dir
 from cbhcli_pkg.admin import admin_api, auth_api, report_api
-from cbhcli_pkg.admin.master import (master_key_source, store_master_key,
-                                     verify_master_key)
+from cbhcli_pkg.admin.master import (is_explicit_key, master_key_source,
+                                     store_master_key, verify_master_key)
 from cbhcli_pkg.admin.store import get_store
 
 try:
@@ -68,8 +68,18 @@ def _write_server_json(port: int) -> None:
 def _clear_server_json() -> None:
     try:
         p = _server_json_path()
-        if p.exists():
-            p.unlink()
+        if not p.exists():
+            return
+        # 只清理自己写入的运行信息（server.json 含 pid；避免同数据目录下
+        # 多实例（不同端口）退出时互相删除对方的记录）
+        try:
+            info = json.loads(p.read_text(encoding="utf-8")) or {}
+            pid = int(info.get("pid", 0) or 0)
+        except Exception:
+            pid = 0
+        if pid not in (0, os.getpid()):
+            return
+        p.unlink()
     except Exception:
         pass
 
@@ -93,6 +103,16 @@ def build_app() -> FastAPI:
     app.include_router(report_api.router)
     app.include_router(admin_api.router_open)
     app.include_router(admin_api.router)
+
+    @app.on_event("shutdown")
+    async def _on_shutdown_cleanup():
+        """uvicorn 优雅关闭（SIGTERM / Ctrl+C）时清理运行信息（server.json）。
+
+        注意：uvicorn ≥0.30 在优雅关闭后会"重新 raise 信号"终止进程，
+        因此 run_admin 的 finally/atexit 不会执行——必须在这里兜底清理，
+        否则 kill 停止服务后会残留 server.json（status 自检误报"残留信息"）。
+        """
+        _clear_server_json()
 
     @app.get("/admin")
     async def admin_page():
@@ -197,19 +217,34 @@ def _prompt_master_password() -> str:
         return ""
 
 
+def _store_if_empty(key: str) -> None:
+    """admin.json 尚无主密码 hash 时写入（引导；不覆盖已修改的主密码）。"""
+    from cbhcli_pkg.admin.master import _stored_key, load_admin_json
+    data = load_admin_json()
+    h, _s = _stored_key(data)
+    if not h:
+        store_master_key(key)
+
+
 def _pass_gate() -> bool:
     """启动门：连续错误 5 次退出。
 
-    Returns: True=通过（并把 salt+hash 写入 admin.json）
+    Returns: True=通过（首次通过时把 salt+hash 写入 admin.json）
+
+    注意：若主密码曾"显式修改"过（admin.json key_source="explicit"），
+    则其优先于环境变量——环境变量不一致时提示但继续启动（服务以已修改的
+    主密码为准，管理页面用新主密码登录；改密码后**无需**同步启动配置）。
     """
     env_key = os.environ.get("CBHCLI_ADMIN_MASTER_KEY", "").strip()
     if env_key:
         if verify_master_key(env_key):
-            if not os.path.exists(str(data_dir() / "admin.json")):
-                store_master_key(env_key)
+            _store_if_empty(env_key)
             return True
-        print("❌ 环境变量 CBHCLI_ADMIN_MASTER_KEY 与已存储主密码不符，拒绝启动。")
-        return False
+        # 走到这里只可能是：已显式修改过主密码（admin.json 优先）
+        print("  ⚠️  环境变量 CBHCLI_ADMIN_MASTER_KEY 与已修改的主密码不一致。")
+        print("     服务将以【已修改的主密码】继续启动（管理页面登录用新主密码）；")
+        print("     该环境变量不再作为凭据，建议顺手更新启动配置。")
+        return True
 
     if not sys.stdin.isatty():
         print("❌ 非交互环境启动需要设置环境变量 CBHCLI_ADMIN_MASTER_KEY。")
@@ -224,7 +259,7 @@ def _pass_gate() -> bool:
             print("\n已取消。")
             return False
         if verify_master_key(pwd):
-            store_master_key(pwd)     # 通过后落盘 salt+hash（后续修改主密码）
+            store_master_key(pwd)     # 通过后落盘 salt+hash（不降级 explicit 标记）
             return True
         left = MAX_PASSWORD_TRIES - i - 1
         if left > 0:
@@ -281,10 +316,12 @@ def _print_help() -> int:
     print("  --data-dir PATH      数据目录 (默认: ~/.cbhcli-admin)")
     print("  --tls-cert CERT      HTTPS 证书文件（可选）")
     print("  --tls-key KEY        HTTPS 私钥文件（可选）")
-    print("  --set-password       交互式修改管理员主密码")
+    print("  --set-password       交互式修改管理员主密码（需当前密码，立即生效）")
     print("  status               服务自检（端口/版本/运行时长/最近上报）")
-    print("\n启动门: 输入管理员主密码（内置默认，可用环境变量")
+    print("\n启动门: 输入管理员主密码（内置默认；可用环境变量")
     print("        CBHCLI_ADMIN_MASTER_KEY 覆盖；连续错误 5 次退出）")
+    print("        注意：主密码一经修改（管理页面/--set-password），")
+    print("        启动时须提供修改后的密码（环境变量需同步更新）。")
     return 0
 
 
@@ -307,8 +344,15 @@ def _run_set_password() -> int:
     if not new1 or new1 != new2:
         print("❌ 两次输入不一致或为空。")
         return 1
-    if store_master_key(new1):
-        print("✅ 主密码已更新（写入 admin.json）。")
+    if store_master_key(new1, explicit=True):
+        # 进程内环境变量自动同步（启动配置无需人工修改）
+        try:
+            from cbhcli_pkg.admin.master import sync_process_env
+            sync_process_env(new1)
+        except Exception:
+            pass
+        print("✅ 主密码已更新，立即生效（管理页面/新会话登录均使用新密码）。")
+        print("   （管理服务运行中无需重启；启动配置无需修改）")
         return 0
     print("❌ 写入失败。")
     return 1
@@ -347,6 +391,7 @@ def run_admin(args: list) -> int:
     if not _pass_gate():
         return 2
     print("  ✅ 验证通过")
+    print(f"  ● 主密码校验源: {master_key_source()}")
 
     # ---- 初始化存储（建表 + 每日备份） ----
     store = get_store()
@@ -457,6 +502,7 @@ def run_admin_status() -> int:
     print("✅ CBHCLI Admin 服务运行中")
     print(f"   端口:     {port}（{'监听正常' if reachable else '探测失败'}）")
     print(f"   版本:     {info.get('version', SERVER_VERSION)}（protocol {PROTOCOL}）")
+    print(f"   主密码源: {master_key_source()}")
     if started:
         print(f"   启动时间: {time.strftime('%Y-%m-%d %H:%M', time.localtime(started))}"
               f"（已运行 {_fmt_duration(uptime)}）")
