@@ -75,6 +75,8 @@ class AuditReporter:
         self._instance_id = "i_" + uuid.uuid4().hex[:12]
         # 流式内容聚合缓冲：(session_id, kind) -> {"text", "last"}
         self._stream_buf: dict = {}
+        # 上报级别缓存（policy.report_level；summary 时跳过 stream_chunk）
+        self._level_cache: dict = {"ts": 0.0, "level": "full"}
 
     # ===============================================================
     #  生命周期
@@ -141,10 +143,33 @@ class AuditReporter:
         if not self._started or self._stopped:
             return
         try:
+            # 上报级别 summary：跳过实时流式内容（管理页面实时画面数据源），
+            # 仅保留结构化审计事件（服务端设置页「上报级别」的真实语义）
+            if type_ == "stream_chunk" and self._report_level() == "summary":
+                return
             ev = _events.make_event(type_, session_id=session_id, payload=payload)
             self._queue.put(ev)
         except Exception:
             pass
+
+    def _report_level(self) -> str:
+        """当前上报级别（policy.report_level；30s 缓存避免高频读 auth.json）。"""
+        now = time.time()
+        try:
+            with self._lock:
+                cache = self._level_cache
+                if now - float(cache.get("ts", 0.0)) < 30.0:
+                    return str(cache.get("level", "full"))
+            data = AuthStore().load() or {}
+            level = str((data.get("policy") or {}).get("report_level", "full")
+                        or "full")
+            if level not in ("full", "summary"):
+                level = "full"
+            with self._lock:
+                self._level_cache = {"ts": now, "level": level}
+            return level
+        except Exception:
+            return "full"
 
     def report_status(self, session_id: str, agent: str = "", title: str = "",
                       workspace: str = "", status: str = "running",
@@ -225,6 +250,9 @@ class AuditReporter:
         上报一条 stream_chunk 事件（管理页面实时渲染 AI 思考/正文）。
         """
         if not self._started or self._stopped or not session_id or not text:
+            return
+        # summary 级别：不聚合实时流式内容（report_event 侧还有第二道过滤）
+        if self._report_level() == "summary":
             return
         key = (session_id, kind)
         now = time.time()
@@ -358,7 +386,8 @@ class AuditReporter:
         try:
             data = AuthStore().load() or {}
             policy = data.get("policy") or {}
-            return float(policy.get("snapshot_max_mb", 10) or 10)
+            max_mb = float(policy.get("snapshot_max_mb", 10) or 10)
+            return max_mb if max_mb > 0 else 10.0
         except Exception:
             return 10.0
 

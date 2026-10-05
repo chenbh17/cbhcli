@@ -8,6 +8,8 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+import re
 import secrets
 import shutil
 import time
@@ -19,9 +21,10 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from cbhcli_pkg.admin import data_dir, live
 from cbhcli_pkg.admin.master import (get_settings, master_key_source,
-                                     set_new_master_key, update_settings,
+                                     set_new_master_key, sync_process_env,
+                                     update_settings, validate_settings_patch,
                                      verify_master_key)
-from cbhcli_pkg.admin.store import get_store, now_iso
+from cbhcli_pkg.admin.store import _normalize_user_ttl, get_store, now_iso
 
 try:
     from cbhcli_pkg import __version__ as SERVER_VERSION
@@ -120,6 +123,7 @@ def _log_admin_action(action: str, detail: dict = None) -> None:
 async def admin_login(request: Request):
     ip = _client_ip(request)
     now = time.time()
+    # 限流只统计「失败」尝试（成功登录清空计数，避免改完密码重新登录被误伤）
     bucket = [t for t in _admin_login_attempts.get(ip, [])
               if now - t < ADMIN_LOGIN_WINDOW]
     if len(bucket) >= ADMIN_LOGIN_LIMIT:
@@ -127,8 +131,6 @@ async def admin_login(request: Request):
         return JSONResponse(
             {"ok": False, "error": "rate_limited",
              "message": "登录失败次数过多，请 1 分钟后再试"}, status_code=429)
-    bucket.append(now)
-    _admin_login_attempts[ip] = bucket
 
     try:
         body = await request.json()
@@ -136,9 +138,12 @@ async def admin_login(request: Request):
         body = {}
     password = str((body or {}).get("password", ""))
     if not verify_master_key(password):
+        bucket.append(now)
+        _admin_login_attempts[ip] = bucket
         return JSONResponse(
             {"ok": False, "error": "invalid_password", "message": "主密码错误"},
             status_code=401)
+    _admin_login_attempts.pop(ip, None)
 
     tok = "adm_" + secrets.token_urlsafe(32)
     _admin_tokens[tok] = {"ts": time.time(), "ip": ip}
@@ -180,6 +185,26 @@ async def overview(request: Request):
         "online_users": snap["online_users"],
         "server_time": time.time(),
     }
+
+
+# 完整转义序列（CSI/OSC/charset 等）；json.dumps 后 ESC 会变为字面量反斜杠u001b，
+# 故两种形式都要匹配
+_ANSI_RE = re.compile(
+    r"(?:\x1b|\\u001[bB])"
+    r"(?:\[[0-9;?]*[A-Za-z]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\([0-9A-B]"
+    r"|[=>#][0-9]?)")
+_ANSI_BARE_RE = re.compile(r"\x1b|\\u001[bB]")
+
+
+def _strip_ansi(s) -> str:
+    """清除终端颜色/控制转义（v5.4.2：CSV 导出等纯文本场景去乱码）。"""
+    try:
+        s = _ANSI_RE.sub("", str(s or ""))
+        return _ANSI_BARE_RE.sub("", s)   # 兜底：不成序列的孤立 ESC
+    except Exception:
+        return str(s or "")
 
 
 def _events_brief(rows: list) -> list:
@@ -370,7 +395,12 @@ async def renew_user(user_id: str, request: Request):
         body = {}
     body = body or {}
     ttl = body.get("ttl_days", 30)
-    user, updated, expires_at = get_store().renew_user(user_id, ttl)
+    ok, ttl_norm = _normalize_user_ttl(ttl)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "bad_request",
+                             "message": "无效的有效期（天数 / forever）"},
+                            status_code=400)
+    user, updated, expires_at = get_store().renew_user(user_id, ttl_norm)
     if not user:
         return JSONResponse({"ok": False, "error": "not_found",
                              "message": "用户不存在"}, status_code=404)
@@ -478,13 +508,53 @@ async def delete_session(user_id: str, session_id: str, request: Request):
 @router.get("/events")
 async def list_events(request: Request, type: str = "", user_id: str = "",
                       session_id: str = "", from_ts: float = 0,
-                      to_ts: float = 0, limit: int = 100, offset: int = 0):
+                      to_ts: float = 0, limit: int = 100, offset: int = 0,
+                      no_session: int = 0):
     if (r := _guard(request)):
         return r
     rows, total = get_store().list_events(
         type_=type, user_id=user_id, session_id=session_id, from_ts=from_ts,
-        to_ts=to_ts, limit=limit, offset=offset)
+        to_ts=to_ts, limit=limit, offset=offset, no_session=bool(no_session))
     return {"ok": True, "events": _events_brief(rows), "total": total}
+
+
+@router.get("/events/summary_users")
+async def events_summary_users(request: Request, from_ts: float = 0,
+                               to_ts: float = 0,
+                               limit: int = 500, offset: int = 0):
+    """审计分层·用户级（v5.4.2）：按用户聚合事件统计。"""
+    if (r := _guard(request)):
+        return r
+    rows, total = get_store().events_summary_by_user(
+        from_ts=from_ts, to_ts=to_ts, limit=limit, offset=offset)
+    snap = live.live_snapshot()
+    online_ids = {u.get("user_id") for u in snap.get("online_users", [])
+                  if u.get("online")}
+    running_ids = {s.get("user_id") for s in snap.get("running_sessions", [])}
+    for r_ in rows:
+        uid = r_.get("user_id", "")
+        r_["online"] = uid in online_ids
+        r_["running"] = uid in running_ids
+    return {"ok": True, "users": rows, "total": total}
+
+
+@router.get("/events/summary_sessions")
+async def events_summary_sessions(request: Request, user_id: str = "",
+                                  from_ts: float = 0, to_ts: float = 0,
+                                  limit: int = 100, offset: int = 0):
+    """审计分层·会话级（v5.4.2）：按会话聚合事件统计（含会话元数据）。"""
+    if (r := _guard(request)):
+        return r
+    rows, total = get_store().events_summary_by_session(
+        user_id=user_id, from_ts=from_ts, to_ts=to_ts,
+        limit=limit, offset=offset)
+    snap = live.live_snapshot()
+    live_ids = {s.get("session_id") for s in snap.get("running_sessions", [])}
+    for r_ in rows:
+        sid = r_.get("session_id", "")
+        r_["status"] = "running" if sid and sid in live_ids \
+            else (r_.get("status") or "idle")
+    return {"ok": True, "sessions": rows, "total": total}
 
 
 @router.get("/event_types")
@@ -512,12 +582,12 @@ async def list_logins(request: Request, user_id: str = "",
 @router.get("/export/events.csv")
 async def export_events(request: Request, type: str = "", user_id: str = "",
                         session_id: str = "", from_ts: float = 0,
-                        to_ts: float = 0):
+                        to_ts: float = 0, no_session: int = 0):
     if (r := _guard(request)):
         return r
     rows = get_store().events_for_export(
         type_=type, user_id=user_id, session_id=session_id,
-        from_ts=from_ts, to_ts=to_ts)
+        from_ts=from_ts, to_ts=to_ts, no_session=bool(no_session))
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["时间(服务端)", "时间(客户端)", "用户", "会话", "类型", "摘要"])
@@ -526,7 +596,7 @@ async def export_events(request: Request, type: str = "", user_id: str = "",
             _iso(r_.get("recv_ts")), _iso(r_.get("ts")),
             r_.get("user_name") or r_.get("user_id", ""),
             r_.get("session_id", ""), r_.get("type", ""),
-            json.dumps(r_.get("payload_obj") or {}, ensure_ascii=False)[:500],
+            _strip_ansi(json.dumps(r_.get("payload_obj") or {}, ensure_ascii=False))[:500],
         ])
     return _csv_response(buf.getvalue(), "cbhcli_events.csv")
 
@@ -593,6 +663,10 @@ async def put_settings(request: Request):
         body = await request.json()
     except Exception:
         body = {}
+    ok, err = validate_settings_patch(body or {})
+    if not ok:
+        return JSONResponse({"ok": False, "error": "bad_request",
+                             "message": err}, status_code=400)
     settings = update_settings(body or {})
     _log_admin_action("update_settings", {"patch": body or {}})
     return {"ok": True, "settings": settings}
@@ -619,8 +693,28 @@ async def change_password(request: Request):
     if len(new) < 4:
         return JSONResponse({"ok": False, "error": "bad_request",
                              "message": "新密码过短（至少 4 位）"}, status_code=400)
+    env_active = bool(os.environ.get("CBHCLI_ADMIN_MASTER_KEY", "").strip())
     if not set_new_master_key(new):
         return JSONResponse({"ok": False, "error": "server_error",
                              "message": "写入失败"}, status_code=500)
-    _log_admin_action("change_password", {})
-    return {"ok": True, "message": "主密码已更新（下次登录生效）"}
+    # 进程内环境变量自动同步为新密码（启动配置无需人工修改）
+    sync_process_env(new)
+    # 修改主密码后：其它管理页面会话立即失效（保留当前会话）
+    cur = request.headers.get("x-admin-token", "") or ""
+    revoked = 0
+    for t in [t for t in list(_admin_tokens) if t != cur]:
+        _admin_tokens.pop(t, None)
+        revoked += 1
+    _log_admin_action("change_password", {"env_override": env_active,
+                                          "revoked_others": revoked})
+    resp = {
+        "ok": True,
+        "message": "主密码已更新，立即生效（可用新密码登录管理页面）",
+        "revoked_others": revoked,
+    }
+    if env_active:
+        resp["warning"] = (
+            "检测到启动配置中存在环境变量 CBHCLI_ADMIN_MASTER_KEY："
+            "新主密码已优先生效，环境变量不再作为登录凭据"
+            "（服务已自动同步，启动配置无需修改）。")
+    return resp

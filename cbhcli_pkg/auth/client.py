@@ -167,7 +167,7 @@ class AuthClient:
         """GET /api/ping —— 连通性测试（返回延迟/版本/兼容性）。
 
         Returns:
-            {"ok": True, "latency_ms": 3, "server_version": "5.4.0",
+            {"ok": True, "latency_ms": 3, "server_version": "5.4.1",
              "protocol": 1, "compatible": True, "service": "cbhcli-admin"}
         失败抛 AuthError（调用方转成诊断展示）。
         """

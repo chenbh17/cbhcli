@@ -36,7 +36,14 @@ const state = {
   users: [],                 // 用户列表缓存（筛选下拉）
   eventTypes: null,          // 事件类型缓存
   sess: { userId: "", status: "", q: "", page: 0, total: 0, lastSig: "" },      // 会话筛选
-  audit: { tab: "events", page: 0, type: "", userId: "", range: 0, total: 0 },
+  audit: { tab: "events", page: 0, type: "", userId: "", range: 0, total: 0,
+           // v5.4.2：三级分层（用户级 → 会话级 → 明细级）
+           level: "users",        // users | sessions | events
+           selUserName: "",       // 面包屑：当前钻取用户显示名
+           selSessionTitle: "",   // 面包屑：当前钻取会话显示名
+           sessionId: "",         // 明细级会话过滤
+           noSession: false,      // 明细级：只看"（无会话）"组事件
+           sPage: 0, sTotal: 0 }, // 会话级分页
   loginRec: { page: 0, total: 0, userId: "" },
   drawer: null,              // 当前会话详情抽屉
 };
@@ -244,8 +251,19 @@ function mdBlock(text) {
   return div;
 }
 
-/** 提取消息内容文本：str 原样；list（多模态）取 type==text 拼接 */
+/* ANSI 转义序列清除（v5.4.2：工具输出常携带终端颜色码，如
+   "\x1b[36m📤 输出:\x1b[0m"，直接渲染会显示为 [36m…[0m 乱码） */
+function stripAnsi(s) {
+  return String(s === null || s === undefined ? "" : s).replace(
+    /\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|\([0-9A-B]|[=>#][0-9]?)|\x1b/g, "");
+}
+
+/** 提取消息内容文本：str 原样；list（多模态）取 type==text 拼接（统一去 ANSI） */
 function extractText(content) {
+  return stripAnsi(_extractTextRaw(content));
+}
+
+function _extractTextRaw(content) {
   if (content === null || content === undefined) return "";
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -846,10 +864,10 @@ function eventBadgeClass(type) {
   return "gray";
 }
 
-/** 事件 payload → 单行摘要（如 tool=terminal args=ls） */
+/** 事件 payload → 单行摘要（如 tool=terminal args=ls；v5.4.2 去 ANSI 乱码） */
 function fmtPayloadValue(v) {
   if (v === null || v === undefined) return "null";
-  if (typeof v === "string") return truncate(v.replace(/\s+/g, " "), 60);
+  if (typeof v === "string") return truncate(stripAnsi(v).replace(/\s+/g, " "), 60);
   if (typeof v === "number" || typeof v === "boolean") return String(v);
   if (Array.isArray(v)) return `[${v.length} 项]`;
   if (typeof v === "object") {
@@ -1401,7 +1419,8 @@ function showKeyModal({ title, user, key, notice }) {
 /* ---- 续期 ---- */
 
 function openRenewModal(u) {
-  const ttl = buildTtlPicker({ value: u.token_ttl_days === null || u.token_ttl_days === undefined ? 30 : u.token_ttl_days });
+  // 永久用户（token_ttl_days=null）默认显示「永久」，避免误改成 30 天
+  const ttl = buildTtlPicker({ value: (u.token_ttl_days === null || u.token_ttl_days === undefined) ? null : u.token_ttl_days });
   const errLine = el("div", { class: "error-line hidden" });
   const body = el("div", null,
     el("div", { class: "form-row" },
@@ -2056,8 +2075,8 @@ function liveAppendTool(d, round, t) {
     el("span", null, label));
   head.addEventListener("click", () => card.classList.toggle("open"));
   const body = el("div", { class: "collapse-body" },
-    el("pre", { class: "tc-args" }, String(t.arguments || "{}")));
-  const out = String(t.output || t.error || "");
+    el("pre", { class: "tc-args" }, stripAnsi(String(t.arguments || "{}"))));
+  const out = stripAnsi(String(t.output || t.error || ""));
   if (out) body.append(el("div", { class: "tool-result" }, out));
   card.append(head, body);
   round._toolsWrap.append(card);
@@ -2299,7 +2318,10 @@ const TIME_RANGES = [
   ["all", "全部", 0],
 ];
 
-const auditUI = { built: false, eventsTbody: null, loginsTbody: null, typeSel: null, userSel: null, loginUserSel: null, rangeBtns: [], eventsPager: null, loginsPager: null, tabBtns: [], panels: {} };
+const auditUI = { built: false, eventsTbody: null, loginsTbody: null, typeSel: null, loginUserSel: null, rangeBtns: [], eventsPager: null, loginsPager: null, tabBtns: [], panels: {},
+  // v5.4.2：三级分层（用户级 → 会话级 → 明细级）
+  usersTbody: null, sessionsTbody: null, sessionsPager: null,
+  crumb: null, typeLabel: null, exportBtn: null, levelPanels: {} };
 
 function buildAuditView() {
   if (auditUI.built) return;
@@ -2307,18 +2329,13 @@ function buildAuditView() {
   const root = $("#view-audit");
   clear(root);
 
-  /* ---- 事件日志面板 ---- */
+  /* ---- 事件日志：三级分层钻取（v5.4.2）----
+     用户级（聚合统计，点击钻取）→ 会话级（聚合统计，点击钻取）→ 明细级（原事件表）。
+     时间范围对三级统一生效；类型过滤/CSV 导出仅明细级显示。 */
   auditUI.typeSel = el("select", { class: "select", id: "audit-type", style: "max-width:240px;" },
     el("option", { value: "" }, "全部类型"));
-  auditUI.userSel = el("select", { class: "select", id: "audit-user", style: "max-width:200px;" },
-    el("option", { value: "" }, "全部用户"));
-
   auditUI.typeSel.addEventListener("change", () => {
     state.audit.type = auditUI.typeSel.value; state.audit.page = 0;
-    refreshAuditEvents().catch(e => toast(e.message, "error"));
-  });
-  auditUI.userSel.addEventListener("change", () => {
-    state.audit.userId = auditUI.userSel.value; state.audit.page = 0;
     refreshAuditEvents().catch(e => toast(e.message, "error"));
   });
 
@@ -2327,31 +2344,61 @@ function buildAuditView() {
     const btn = el("button", { type: "button" }, label);
     btn.dataset.range = key;
     btn.addEventListener("click", () => {
-      state.audit.range = seconds; state.audit.page = 0;
+      state.audit.range = seconds; state.audit.page = 0; state.audit.sPage = 0;
       syncRangeButtons();
-      refreshAuditEvents().catch(e => toast(e.message, "error"));
+      refreshAuditLevel().catch(e => toast(e.message, "error"));
     });
     auditUI.rangeBtns.push(btn);
     seg.append(btn);
   }
   syncRangeButtons();
 
+  // 共享过滤条（类型过滤/导出按钮随层级显隐）
+  auditUI.typeLabel = el("span", { class: "filter-label" }, "事件类型");
+  auditUI.exportBtn = el("button", { class: "btn btn-sm", type: "button", onclick: () => exportEventsCsv() }, "⬇ 导出 CSV");
+  const sharedBar = el("div", { class: "filter-bar" },
+    el("span", { class: "filter-label" }, "时间范围"), seg,
+    auditUI.typeLabel, auditUI.typeSel,
+    el("span", { class: "filter-spacer" }),
+    auditUI.exportBtn,
+    el("button", { class: "btn btn-sm", type: "button", onclick: () => refreshAuditLevel(true) }, "🔄 刷新"));
+
+  // 面包屑导航：全部用户 › [用户] › [会话]
+  auditUI.crumb = el("div", { class: "audit-crumb", id: "audit-crumb" });
+
+  // 一级：用户级
+  auditUI.usersTbody = el("tbody", { id: "audit-users-tbody" });
+  const usersPanel = el("div", null,
+    el("div", { class: "table-wrap" },
+      el("table", { class: "table" },
+        el("thead", null, el("tr", null,
+          ...["用户", "状态", "会话数", "对话轮数", "工具调用", "事件数", "最后活动"].map(h => el("th", null, h)))),
+        auditUI.usersTbody)));
+
+  // 二级：会话级
+  auditUI.sessionsTbody = el("tbody", { id: "audit-sessions-tbody" });
+  auditUI.sessionsPager = el("div", { class: "pager", id: "audit-sessions-pager" });
+  const sessionsPanel = el("div", null,
+    el("div", { class: "table-wrap" },
+      el("table", { class: "table" },
+        el("thead", null, el("tr", null,
+          ...["会话", "Agent", "状态", "对话轮数", "工具调用", "事件数", "消息数", "最后活动"].map(h => el("th", null, h)))),
+        auditUI.sessionsTbody)),
+    auditUI.sessionsPager);
+
+  // 三级：明细级（原事件表）
   auditUI.eventsTbody = el("tbody", { id: "audit-events-tbody" });
   auditUI.eventsPager = el("div", { class: "pager", id: "audit-events-pager" });
   const eventsPanel = el("div", null,
-    el("div", { class: "filter-bar" },
-      el("span", { class: "filter-label" }, "事件类型"), auditUI.typeSel,
-      el("span", { class: "filter-label" }, "用户"), auditUI.userSel,
-      el("span", { class: "filter-label" }, "时间范围"), seg,
-      el("span", { class: "filter-spacer" }),
-      el("button", { class: "btn btn-sm", type: "button", onclick: () => exportEventsCsv() }, "⬇ 导出 CSV"),
-      el("button", { class: "btn btn-sm", type: "button", onclick: () => refreshAuditEvents(true) }, "🔄 刷新")),
     el("div", { class: "table-wrap" },
       el("table", { class: "table" },
         el("thead", null, el("tr", null,
           ...["时间", "用户", "类型", "会话ID", "摘要"].map(h => el("th", null, h)))),
         auditUI.eventsTbody)),
     auditUI.eventsPager);
+
+  auditUI.levelPanels = { users: usersPanel, sessions: sessionsPanel, events: eventsPanel };
+  const eventsTab = el("div", null, sharedBar, auditUI.crumb, usersPanel, sessionsPanel, eventsPanel);
 
   /* ---- 登录记录面板 ---- */
   auditUI.loginUserSel = el("select", { class: "select", id: "audit-login-user", style: "max-width:200px;" },
@@ -2374,7 +2421,7 @@ function buildAuditView() {
         auditUI.loginsTbody)),
     auditUI.loginsPager);
 
-  auditUI.panels = { events: eventsPanel, logins: loginsPanel };
+  auditUI.panels = { events: eventsTab, logins: loginsPanel };
 
   /* ---- Tabs ---- */
   const tabs = el("div", { class: "tabs" });
@@ -2394,11 +2441,12 @@ function buildAuditView() {
     el("div", { class: "page-header" },
       el("div", null,
         el("div", { class: "page-title" }, "审计日志"),
-        el("div", { class: "page-desc" }, "客户端事件上报与登录记录（服务端时间）"))),
+        el("div", { class: "page-desc" }, "事件按 用户 → 会话 → 明细 三级钻取查看（点击行进入下一级；服务端时间）"))),
     tabs,
-    eventsPanel,
+    eventsTab,
     loginsPanel);
   syncAuditTabs();
+  syncAuditLevel();
 }
 
 function syncAuditTabs() {
@@ -2419,7 +2467,6 @@ function syncRangeButtons() {
 async function loadAuditView(params, seq) {
   buildAuditView();
   try { await ensureUsers(); } catch (e) { /* ignore */ }
-  fillUserSelect(auditUI.userSel, { value: state.audit.userId });
   fillUserSelect(auditUI.loginUserSel, { value: state.loginRec.userId });
   try {
     await ensureEventTypes();
@@ -2427,7 +2474,7 @@ async function loadAuditView(params, seq) {
   } catch (e) { /* ignore */ }
   try {
     if (state.audit.tab === "logins") await refreshLogins(false);
-    else await refreshAuditEvents(false);
+    else await refreshAuditLevel(false);
   } catch (e) {
     if (e.status !== 401) toast(e.message || "审计日志加载失败", "error");
   }
@@ -2455,19 +2502,251 @@ function fillEventTypes() {
 
 function auditEventsQuery(withPage) {
   const a = state.audit;
-  const qs = new URLSearchParams();
+  const qs = auditRangeQS();
   if (a.type) qs.set("type", a.type);
   if (a.userId) qs.set("user_id", a.userId);
-  if (a.range > 0) {
-    const ts = Math.floor(nowSec());
-    qs.set("from_ts", String(ts - a.range));
-    qs.set("to_ts", String(ts));
-  }
+  if (a.sessionId) qs.set("session_id", a.sessionId);
+  else if (a.noSession) qs.set("no_session", "1");
   if (withPage) {
     qs.set("limit", String(PAGE_LIMIT));
     qs.set("offset", String(a.page * PAGE_LIMIT));
   }
   return qs;
+}
+
+/* ---- v5.4.2：三级分层（用户级 → 会话级 → 明细级） ---- */
+
+/** 时间范围参数（三级共用） */
+function auditRangeQS() {
+  const qs = new URLSearchParams();
+  const a = state.audit;
+  if (a.range > 0) {
+    const ts = Math.floor(nowSec());
+    qs.set("from_ts", String(ts - a.range));
+    qs.set("to_ts", String(ts));
+  }
+  return qs;
+}
+
+/** 切换层级并刷新（drill 入口统一走这里） */
+function auditSetLevel(level) {
+  state.audit.level = level;
+  syncAuditLevel();
+  refreshAuditLevel().catch(e => toast(e.message, "error"));
+}
+
+/** 层级面板/面包屑/过滤条同步（不触发请求） */
+function syncAuditLevel() {
+  const level = state.audit.level || "users";
+  for (const [k, panel] of Object.entries(auditUI.levelPanels || {})) {
+    panel.classList.toggle("hidden", k !== level);
+  }
+  // 类型过滤 / CSV 导出仅明细级有意义
+  const detailOnly = level === "events";
+  if (auditUI.typeLabel) auditUI.typeLabel.classList.toggle("hidden", !detailOnly);
+  if (auditUI.typeSel) auditUI.typeSel.classList.toggle("hidden", !detailOnly);
+  if (auditUI.exportBtn) auditUI.exportBtn.classList.toggle("hidden", !detailOnly);
+  renderAuditCrumb();
+}
+
+function renderAuditCrumb() {
+  const box = auditUI.crumb;
+  if (!box) return;
+  clear(box);
+  const a = state.audit;
+  const level = a.level || "users";
+
+  const mkItem = (label, clickable, onclick, title) => {
+    const cls = "audit-crumb-item" + (clickable ? " link" : " current");
+    const node = el("span", { class: cls, title: title || "" }, label);
+    if (clickable) node.addEventListener("click", onclick);
+    return node;
+  };
+  const sep = () => el("span", { class: "audit-crumb-sep" }, "›");
+
+  box.append(mkItem("👥 全部用户", level !== "users", () => auditGoUsers(),
+    "返回用户级汇总"));
+  if (level === "sessions" || level === "events") {
+    box.append(sep());
+    box.append(mkItem(`👤 ${a.selUserName || "用户"}`, level === "events",
+      () => auditGoSessions(), "返回该用户的会话级汇总"));
+  }
+  if (level === "events") {
+    box.append(sep());
+    box.append(mkItem(`💬 ${a.selSessionTitle || (a.sessionId ? truncate(a.sessionId, 24) : "全部明细")}`,
+      false, null, "当前：明细级"));
+  }
+  // 用户级提供直达全部明细的入口（保留旧的平铺视图能力）
+  box.append(el("span", { class: "filter-spacer" }));
+  if (level === "users") {
+    box.append(el("button", {
+      class: "btn btn-sm", type: "button", title: "跳过分层，直接查看全部事件明细",
+      onclick: () => auditShowAllDetails(),
+    }, "查看全部明细 →"));
+  }
+}
+
+function auditGoUsers() {
+  const a = state.audit;
+  a.userId = ""; a.selUserName = "";
+  a.sessionId = ""; a.noSession = false; a.selSessionTitle = "";
+  a.page = 0; a.sPage = 0;
+  auditSetLevel("users");
+}
+
+function auditGoSessions() {
+  const a = state.audit;
+  if (!a.userId) { auditGoUsers(); return; }
+  a.sessionId = ""; a.noSession = false; a.selSessionTitle = "";
+  a.page = 0; a.sPage = 0;
+  auditSetLevel("sessions");
+}
+
+function auditShowAllDetails() {
+  const a = state.audit;
+  a.userId = ""; a.selUserName = "";
+  a.sessionId = ""; a.noSession = false;
+  a.selSessionTitle = "";
+  a.page = 0;
+  auditSetLevel("events");
+}
+
+function auditDrillUser(row) {
+  const a = state.audit;
+  a.userId = row.user_id || "";
+  a.selUserName = row.user_display
+    ? `${row.user_name || row.user_id}（${row.user_display}）`
+    : (row.user_name || row.user_id || "—");
+  a.sessionId = ""; a.noSession = false; a.selSessionTitle = "";
+  a.page = 0; a.sPage = 0; a.type = "";
+  if (auditUI.typeSel) auditUI.typeSel.value = "";
+  auditSetLevel("sessions");
+}
+
+function auditDrillSession(row) {
+  const a = state.audit;
+  if (row.user_id) a.userId = row.user_id;
+  a.sessionId = row.session_id || "";
+  a.noSession = !row.session_id;
+  a.selSessionTitle = row.title
+    ? truncate(row.title, 30)
+    : (row.session_id ? truncate(row.session_id, 18) : "（无会话）");
+  a.page = 0;
+  auditSetLevel("events");
+}
+
+/** 按当前层级刷新 */
+async function refreshAuditLevel(showToast) {
+  const level = state.audit.level || "users";
+  if (level === "users") return refreshAuditUsers(showToast);
+  if (level === "sessions") return refreshAuditSessions(showToast);
+  return refreshAuditEvents(showToast);
+}
+
+/* ---- 一级：用户级 ---- */
+
+async function refreshAuditUsers(showToast) {
+  const qs = auditRangeQS();
+  qs.set("limit", "500");
+  const res = await api(`/events/summary_users?${qs.toString()}`);
+  renderAuditUsers(res.users || []);
+  if (showToast) toast("已刷新用户级汇总", "success");
+}
+
+function renderAuditUsers(rows) {
+  const tbody = auditUI.usersTbody;
+  if (!tbody) return;
+  clear(tbody);
+  if (!rows.length) {
+    tbody.append(el("tr", null, el("td", { colspan: "7" }, emptyState("暂无事件数据", "📭"))));
+    return;
+  }
+  for (const r of rows) {
+    const name = r.user_id === "__admin__"
+      ? "🛡️ 管理员操作"
+      : r.user_display
+        ? `${r.user_name || r.user_id}（${r.user_display}）`
+        : (r.user_name || r.user_id || "—");
+    const badges = [];
+    if (Number(r.user_disabled)) badges.push(el("span", { class: "badge red" }, "已禁用"));
+    if (r.running) badges.push(el("span", { class: "badge green" }, "● 运行中"));
+    else if (r.online) badges.push(el("span", { class: "badge green" }, "● 在线"));
+    else badges.push(el("span", { class: "badge gray" }, "离线"));
+    const tr = el("tr", { class: "clickable", title: "点击查看该用户的会话汇总" },
+      el("td", { class: "td-strong td-nowrap" }, name),
+      el("td", null, ...badges),
+      el("td", null, fmtInt(r.session_count)),
+      el("td", null, fmtInt(r.rounds)),
+      el("td", null, fmtInt(r.tool_calls)),
+      el("td", null, fmtInt(r.event_count)),
+      el("td", { class: "td-mono td-nowrap", title: fmtAbs(r.last_ts) }, fmtAbs(r.last_ts)));
+    tr.addEventListener("click", () => auditDrillUser(r));
+    tbody.append(tr);
+  }
+}
+
+/* ---- 二级：会话级 ---- */
+
+async function refreshAuditSessions(showToast) {
+  const a = state.audit;
+  const qs = auditRangeQS();
+  if (a.userId) qs.set("user_id", a.userId);
+  qs.set("limit", String(PAGE_LIMIT));
+  qs.set("offset", String(a.sPage * PAGE_LIMIT));
+  const res = await api(`/events/summary_sessions?${qs.toString()}`);
+  a.sTotal = res.total || 0;
+  renderAuditSessions(res.sessions || []);
+  renderAuditSessionsPager();
+  if (showToast) toast("已刷新会话级汇总", "success");
+}
+
+function renderAuditSessions(rows) {
+  const tbody = auditUI.sessionsTbody;
+  if (!tbody) return;
+  clear(tbody);
+  if (!rows.length) {
+    tbody.append(el("tr", null, el("td", { colspan: "8" }, emptyState("暂无事件数据", "📭"))));
+    return;
+  }
+  for (const r of rows) {
+    const sid = r.session_id || "";
+    const titleNode = sid
+      ? el("td", { class: "td-strong ellipsis", style: "max-width:280px;", title: `${r.title || ""}\n${sid}` },
+          r.title || truncate(sid, 22))
+      : el("td", null, el("span", { class: "badge gray", title: "登录 / 管理操作等不归属具体会话的事件" }, "（无会话）"));
+    const status = String(r.status || "");
+    const statusNode = !sid ? el("td", null, "—")
+      : status === "running" ? el("td", null, el("span", { class: "badge green" }, "● 运行中"))
+      : el("td", null, el("span", { class: "badge gray" }, "空闲"));
+    const tr = el("tr", { class: "clickable", title: "点击查看该会话的事件明细" },
+      titleNode,
+      el("td", { class: "td-nowrap" }, r.agent || "—"),
+      statusNode,
+      el("td", null, fmtInt(r.rounds)),
+      el("td", null, fmtInt(r.tool_calls)),
+      el("td", null, fmtInt(r.event_count)),
+      el("td", null, (r.message_count === null || r.message_count === undefined) ? "—" : fmtInt(r.message_count)),
+      el("td", { class: "td-mono td-nowrap", title: fmtAbs(r.last_ts) }, fmtAbs(r.last_ts)));
+    tr.addEventListener("click", () => auditDrillSession(r));
+    tbody.append(tr);
+  }
+}
+
+function renderAuditSessionsPager() {
+  const a = state.audit;
+  const pages = Math.max(1, Math.ceil(a.sTotal / PAGE_LIMIT));
+  const page = Math.min(a.sPage + 1, pages);
+  clear(auditUI.sessionsPager);
+  auditUI.sessionsPager.append(
+    el("button", {
+      class: "btn btn-sm", type: "button", disabled: a.sPage <= 0 ? "disabled" : null,
+      onclick: () => { if (state.audit.sPage > 0) { state.audit.sPage -= 1; refreshAuditSessions().catch(e => toast(e.message, "error")); } },
+    }, "← 上一页"),
+    el("span", { class: "pager-info" }, `第 ${page} / ${pages} 页 · 共 ${fmtInt(a.sTotal)} 个会话`),
+    el("button", {
+      class: "btn btn-sm", type: "button", disabled: (a.sPage + 1 >= pages) ? "disabled" : null,
+      onclick: () => { if (state.audit.sPage + 1 < pages) { state.audit.sPage += 1; refreshAuditSessions().catch(e => toast(e.message, "error")); } },
+    }, "下一页 →"));
 }
 
 async function refreshAuditEvents(showToast) {
@@ -2488,7 +2767,7 @@ function renderEventsTable(events) {
   }
   for (const ev of events) {
     tbody.append(el("tr", null,
-      el("td", { class: "td-mono td-nowrap", title: fmtAbs(ev.ts) }, fmtClock(ev.ts)),
+      el("td", { class: "td-mono td-nowrap", title: fmtAbs(ev.ts) }, fmtAbs(ev.ts)),
       el("td", { class: "td-nowrap" }, ev.user_name || ev.user_id || "—"),
       el("td", null, badge(ev.type || "—", eventBadgeClass(ev.type))),
       el("td", { class: "td-mono", title: ev.session_id || "" }, truncate(ev.session_id || "—", 18)),
@@ -2586,12 +2865,13 @@ function buildSettingsView() {
     el("div", { class: "kv-item" }, el("div", { class: "kv-label" }, "状态"), el("div", { class: "kv-value" }, "加载中…")));
 
   setUI.strictOnline = el("input", { type: "checkbox", id: "set-strict-online" });
+  setUI.autoRenew = el("input", { type: "checkbox", id: "set-auto-renew" });
   setUI.reportLevel = el("select", { class: "select", id: "set-report-level" },
     el("option", { value: "full" }, "full（完整上报）"),
     el("option", { value: "summary" }, "summary（摘要上报）"));
-  setUI.ttlDays = el("input", { class: "input", id: "set-ttl", type: "number", min: "0", step: "1", placeholder: "留空 = 永久", style: "width:160px;" });
-  setUI.graceMinutes = el("input", { class: "input", id: "set-grace", type: "number", min: "0", step: "1", style: "width:160px;" });
-  setUI.snapshotMaxMb = el("input", { class: "input", id: "set-snap", type: "number", min: "0", step: "1", style: "width:160px;" });
+  setUI.ttlDays = el("input", { class: "input", id: "set-ttl", type: "number", min: "1", max: "3650", step: "1", placeholder: "留空 = 永久", style: "width:160px;" });
+  setUI.graceMinutes = el("input", { class: "input", id: "set-grace", type: "number", min: "0", max: "10080", step: "1", style: "width:160px;" });
+  setUI.snapshotMaxMb = el("input", { class: "input", id: "set-snap", type: "number", min: "1", max: "1024", step: "1", style: "width:160px;" });
   setUI.settingsMsg = el("div", { class: "ok-line hidden" });
 
   const saveBtn = el("button", { class: "btn btn-primary", type: "button", onclick: () => saveSettings(saveBtn) }, "保存设置");
@@ -2599,7 +2879,7 @@ function buildSettingsView() {
   setUI.pwOld = el("input", { class: "input", id: "pw-old", type: "password", autocomplete: "current-password", placeholder: "当前主密码" });
   setUI.pwNew = el("input", { class: "input", id: "pw-new", type: "password", autocomplete: "new-password", placeholder: "新主密码（至少 4 位）" });
   setUI.pwConfirm = el("input", { class: "input", id: "pw-confirm", type: "password", autocomplete: "new-password", placeholder: "确认新主密码" });
-  setUI.pwMsg = el("div", { class: "error-line hidden" });
+  setUI.pwMsg = el("div", { class: "hidden" });
   const pwBtn = el("button", { class: "btn", type: "button", onclick: () => changeMasterPassword(pwBtn) }, "修改主密码");
 
   setUI.info = el("div", { class: "kv-grid", id: "set-info" });
@@ -2627,16 +2907,21 @@ function buildSettingsView() {
           el("label", { class: "checkbox-row" }, setUI.strictOnline, "启用后，客户端离线超过宽限时间将被拦截"),
           el("div", { class: "form-hint" }, "严格在线模式下，超过宽限时间未心跳的用户请求会被拒绝")),
         el("div", { class: "form-row" },
-          el("label", null, "上报级别（report_level）"), setUI.reportLevel),
+          el("label", null, "自动续期（auto_renew）"),
+          el("label", { class: "checkbox-row" }, setUI.autoRenew, "剩余不足 2 天时自动滚动续期"),
+          el("div", { class: "form-hint" }, "关闭后凭据到期需管理员在用户管理中手动续期")),
+        el("div", { class: "form-row" },
+          el("label", null, "上报级别（report_level）"), setUI.reportLevel,
+          el("div", { class: "form-hint" }, "summary：跳过实时流式内容（思考/正文），仅保留结构化审计事件")),
         el("div", { class: "form-row" },
           el("label", null, "新用户默认有效期（default_token_ttl_days）"), setUI.ttlDays,
-          el("div", { class: "form-hint" }, "单位：天；留空 = 永久")),
+          el("div", { class: "form-hint" }, "单位：天（1~3650）；留空 = 永久")),
         el("div", { class: "form-row" },
           el("label", null, "严格模式宽限（strict_grace_minutes）"), setUI.graceMinutes,
-          el("div", { class: "form-hint" }, "单位：分钟")),
+          el("div", { class: "form-hint" }, "单位：分钟（0~10080）")),
         el("div", { class: "form-row" },
           el("label", null, "快照上限（snapshot_max_mb）"), setUI.snapshotMaxMb,
-          el("div", { class: "form-hint" }, "单位：MB")),
+          el("div", { class: "form-hint" }, "单位：MB（1~1024）")),
         el("div", null)),
       el("div", { class: "btn-row" }, saveBtn),
       setUI.settingsMsg),
@@ -2690,6 +2975,7 @@ async function selfCheckSettings() {
 
 function fillSettingsForm(s) {
   setUI.strictOnline.checked = !!s.strict_online;
+  setUI.autoRenew.checked = s.auto_renew !== false;
   setUI.reportLevel.value = s.report_level === "summary" ? "summary" : "full";
   setUI.ttlDays.value = (s.default_token_ttl_days === null || s.default_token_ttl_days === undefined) ? "" : String(s.default_token_ttl_days);
   setUI.graceMinutes.value = (s.strict_grace_minutes === null || s.strict_grace_minutes === undefined) ? "" : String(s.strict_grace_minutes);
@@ -2716,11 +3002,11 @@ function readNumberInput(input, { allowEmpty = false, min = 0 } = {}) {
 async function saveSettings(btn) {
   const ttl = readNumberInput(setUI.ttlDays, { allowEmpty: true, min: 1 });
   const grace = readNumberInput(setUI.graceMinutes, { allowEmpty: false, min: 0 });
-  const snap = readNumberInput(setUI.snapshotMaxMb, { allowEmpty: false, min: 0 });
+  const snap = readNumberInput(setUI.snapshotMaxMb, { allowEmpty: false, min: 1 });
   setUI.settingsMsg.classList.add("hidden");
-  if (isNaN(ttl)) { showSettingsMsg("默认有效期必须为 ≥1 的整数，或留空表示永久", true); return; }
-  if (isNaN(grace) || !Number.isInteger(grace) || grace < 0) { showSettingsMsg("宽限时间必须为 ≥0 的整数分钟", true); return; }
-  if (isNaN(snap) || !Number.isInteger(snap) || snap < 0) { showSettingsMsg("快照上限必须为 ≥0 的整数 MB", true); return; }
+  if (isNaN(ttl) || (ttl !== null && ttl > 3650)) { showSettingsMsg("默认有效期必须为 1~3650 的整数，或留空表示永久", true); return; }
+  if (isNaN(grace) || !Number.isInteger(grace) || grace < 0 || grace > 10080) { showSettingsMsg("宽限时间必须为 0~10080 的整数分钟", true); return; }
+  if (isNaN(snap) || !Number.isInteger(snap) || snap < 1 || snap > 1024) { showSettingsMsg("快照上限必须为 1~1024 的整数 MB", true); return; }
 
   btn.disabled = true;
   try {
@@ -2728,6 +3014,7 @@ async function saveSettings(btn) {
       method: "PUT",
       body: {
         strict_online: !!setUI.strictOnline.checked,
+        auto_renew: !!setUI.autoRenew.checked,
         report_level: setUI.reportLevel.value,
         default_token_ttl_days: ttl,
         strict_grace_minutes: grace,
@@ -2759,9 +3046,12 @@ async function changeMasterPassword(btn) {
   const confirmPw = setUI.pwConfirm.value;
   const msg = setUI.pwMsg;
   const showMsg = (text, isError) => {
-    msg.className = isError ? "error-line" : "ok-line";
     msg.classList.remove("hidden");
-    msg.textContent = text;
+    clear(msg);
+    msg.append(el("div", { class: isError ? "error-line" : "ok-line" }, text));
+  };
+  const showWarn = (text) => {
+    msg.append(el("div", { class: "warn-box", style: "margin-top:8px;" }, "⚠️ " + text));
   };
   msg.classList.add("hidden");
 
@@ -2780,8 +3070,15 @@ async function changeMasterPassword(btn) {
     setUI.pwOld.value = "";
     setUI.pwNew.value = "";
     setUI.pwConfirm.value = "";
-    showMsg((res && res.message) || "主密码已更新（下次登录生效）", false);
-    toast("主密码已更新（下次登录生效）", "success");
+    const okText = (res && res.message) || "主密码已更新，立即生效";
+    showMsg(okText, false);
+    if (res && res.warning) showWarn(res.warning);
+    if (res && res.revoked_others) {
+      msg.append(el("div", { class: "hint-line" }, `其它管理页面会话（${res.revoked_others} 个）已失效，需重新登录`));
+    }
+    toast((res && res.message) || "主密码已更新", "success");
+    // 主密码校验源已变化 -> 刷新设置页信息区
+    loadSettingsView({}, state.navSeq).catch(() => {});
   } catch (e) {
     if (e.status === 401) showMsg(e.message || "当前主密码错误", true);
     else showMsg(e.message || "修改失败", true);

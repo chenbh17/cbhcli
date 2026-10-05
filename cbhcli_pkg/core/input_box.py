@@ -16,6 +16,8 @@ prompt_toolkit 的 get_cwidth() 对多字符字符串逐字符求和 wcwidth，
 """
 from __future__ import annotations
 
+import os
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
@@ -24,12 +26,67 @@ from prompt_toolkit.styles import Style
 from typing import TYPE_CHECKING
 
 from cbhcli_pkg.core.text_width import (
-    display_width, install_prompt_toolkit_patch
+    display_width, grapheme_clusters, install_prompt_toolkit_patch
 )
 from cbhcli_pkg.core.resize_fix import install_resize_fix
 
 if TYPE_CHECKING:
     from cbhcli_pkg.commands.parser import SlashCommandParser
+
+
+def _clip_head(text: str, max_width: int) -> str:
+    """截取头部（显示宽度 <= max_width，按字素簇）"""
+    out = ""
+    w = 0
+    for cluster in grapheme_clusters(text):
+        cw = display_width(cluster)
+        if w + cw > max_width:
+            break
+        out += cluster
+        w += cw
+    return out
+
+
+def _clip_tail(text: str, max_width: int) -> str:
+    """截取尾部（显示宽度 <= max_width，按字素簇）"""
+    out = []
+    w = 0
+    for cluster in reversed(grapheme_clusters(text)):
+        cw = display_width(cluster)
+        if w + cw > max_width:
+            break
+        out.append(cluster)
+        w += cw
+    return "".join(reversed(out))
+
+
+def _ellipsize_middle(text: str, max_width: int) -> str:
+    """中间省略（保留头尾，如 ~/a…/last），用于状态栏单块超宽截断"""
+    if max_width <= 0:
+        return ""
+    if display_width(text) <= max_width:
+        return text
+    if max_width == 1:
+        return "…"
+    avail = max_width - 1  # 省略号占 1 列
+    head_budget = avail // 2
+    tail_budget = avail - head_budget
+    return _clip_head(text, head_budget) + "…" + _clip_tail(text, tail_budget)
+
+
+def _clip_comma_list(text: str, max_width: int) -> str:
+    """逗号列表超宽截断：保留头部完整项名 + ",…"（尽量不切断项名）"""
+    if max_width <= 0:
+        return ""
+    if display_width(text) <= max_width:
+        return text
+    if max_width <= 2:
+        return "…"
+    head = _clip_head(text, max_width - 2)
+    cut = head.rfind(",")
+    if cut >= max(1, len(head) // 2):
+        head = head[:cut]
+    return head + ",…"
 
 
 def install_toolbar_display_fix():
@@ -261,7 +318,12 @@ class ChatInputBox:
             event.app.invalidate()
 
     def _build_toolbar(self):
-        """构建底部状态栏（单行，图标+亮色标识，完整路径）"""
+        """构建底部状态栏（自适应终端宽度：超宽自动分行 + 单块超宽截断）
+
+        技能等条目过多时整行超宽，而 toolbar 不换行、直接裁掉右侧，
+        导致路径等信息"没有位置显示"。修复：按信息块分行（块内不拆分，
+        行尾不截断），单块超宽时中间省略。
+        """
         app = self._app
 
         # 模型名
@@ -300,13 +362,12 @@ class ChatInputBox:
             if active_names:
                 skills_str = ','.join(active_names)
 
-        # 构建格式化文本（标签亮白加粗+值独立配色，清晰标识每项信息）
+        # 构建信息块（每块 = [(style, text), ...]，块内不拆分）
         # 注意：不能用 HTML('<style class="...">')！prompt_toolkit 的 HTML
         # 解析器会丢弃 <style> 标签的 class 属性（html.py 中 "style" 被排除
         # 在 name_stack 之外，仅解析 fg/bg/color 属性），class 永远不会生效。
         # 必须使用 (style, text) 元组列表显式指定 class。
-        sep = ("class:bottom-toolbar.sep", " │ ")
-        parts: list[tuple[str, str]] = []
+        blocks: list[list[tuple[str, str]]] = []
 
         # 权限模式（Shift+Tab 切换，按模式着色）
         # 用 ●（宽1全兼容）代替 emoji 圆点：🟢🟡🔴 等新版 emoji 在部分
@@ -314,37 +375,112 @@ class ChatInputBox:
         if getattr(app, "permission_engine", None):
             mode = app.permission_engine.mode
             meta = app.permission_engine.mode_meta()
-            parts.append((f"class:bottom-toolbar.mode-{mode}",
-                          f"● {meta['label']}"))
-            parts.append(sep)
+            blocks.append([(f"class:bottom-toolbar.mode-{mode}",
+                            f"● {meta['label']}")])
 
-        parts.append(("class:bottom-toolbar.label", "模型: "))
-        parts.append(("class:bottom-toolbar.model", model_name))
+        blocks.append([("class:bottom-toolbar.label", "模型: "),
+                       ("class:bottom-toolbar.model", model_name)])
         if ctx_info:
-            parts.append(sep)
-            parts.append(("class:bottom-toolbar.label", "上下文: "))
-            parts.append(("class:bottom-toolbar.ctx", ctx_info))
+            blocks.append([("class:bottom-toolbar.label", "上下文: "),
+                           ("class:bottom-toolbar.ctx", ctx_info)])
         if agent:
-            parts.append(sep)
             # 链条绑定时显示链条路径，否则显示普通 Agent 名
             chain = getattr(app, '_active_chain', None)
             if chain:
                 path = getattr(app, '_chain_active_path', None) or [agent]
                 chain_str = f"🔗 {chain.name} › {' › '.join(path)}"
-                parts.append(("class:bottom-toolbar.label", "链条: "))
-                parts.append(("class:bottom-toolbar.chain", chain_str))
+                blocks.append([("class:bottom-toolbar.label", "链条: "),
+                               ("class:bottom-toolbar.chain", chain_str)])
             else:
-                parts.append(("class:bottom-toolbar.label", "Agent: "))
-                parts.append(("class:bottom-toolbar.agent", agent))
+                blocks.append([("class:bottom-toolbar.label", "Agent: "),
+                               ("class:bottom-toolbar.agent", agent)])
         if skills_str:
-            parts.append(sep)
-            parts.append(("class:bottom-toolbar.label", "技能: "))
-            parts.append(("class:bottom-toolbar.skills", skills_str))
-        parts.append(sep)
-        parts.append(("class:bottom-toolbar.label", "路径: "))
-        parts.append(("class:bottom-toolbar.cwd", cwd))
+            blocks.append([("class:bottom-toolbar.label", "技能: "),
+                           ("class:bottom-toolbar.skills", skills_str)])
+        blocks.append([("class:bottom-toolbar.label", "路径: "),
+                       ("class:bottom-toolbar.cwd", cwd)])
 
-        return parts
+        return self._layout_toolbar_blocks(blocks, self._toolbar_max_width())
+
+    # ------------------------------------------------------------------
+    #  底部状态栏布局（自适应宽度）
+    # ------------------------------------------------------------------
+
+    def _toolbar_max_width(self) -> int:
+        """状态栏可用宽度（按 prompt_toolkit 实际输出宽度，回退终端宽度）"""
+        try:
+            from prompt_toolkit.application import get_app
+            size = get_app().output.get_size()
+            if size.columns >= 20:
+                return size.columns - 1
+        except Exception:
+            pass
+        try:
+            return os.get_terminal_size().columns - 1
+        except (ValueError, OSError):
+            return 79
+
+    @staticmethod
+    def _parts_width(parts) -> int:
+        """格式化文本片段的显示宽度"""
+        return sum(display_width(text) for _, text in parts)
+
+    def _layout_toolbar_blocks(self, blocks, max_width: int):
+        """把信息块按终端宽度分行（块内不拆分），超宽块中间省略截断
+
+        返回格式化文本（片段的文本中插入 "\\n" 实现多行 toolbar；
+        prompt_toolkit 的 toolbar 窗口高度自适应内容行数）。
+        """
+        sep = ("class:bottom-toolbar.sep", " │ ")
+        sep_w = display_width(sep[1])
+        # 单块超宽时（一整行也放不下）先截断其值部分
+        single_limit = max(8, max_width - sep_w)
+        fixed: list[list[tuple[str, str]]] = []
+        for block in blocks:
+            if self._parts_width(block) > single_limit:
+                block = self._clip_block(block, single_limit)
+            fixed.append(block)
+        # 逐块填充行（行首不加分隔符，放不下则换行）
+        lines: list[list[tuple[str, str]]] = []
+        cur: list[tuple[str, str]] = []
+        cur_w = 0
+        for block in fixed:
+            bw = self._parts_width(block)
+            if cur and cur_w + sep_w + bw > max_width:
+                lines.append(cur)
+                cur, cur_w = [], 0
+            if cur:
+                cur.append(sep)
+                cur_w += sep_w
+            cur.extend(block)
+            cur_w += bw
+        if cur:
+            lines.append(cur)
+        # 组装为带换行的格式化文本
+        out: list[tuple[str, str]] = []
+        for i, line in enumerate(lines):
+            if i:
+                out.append(("", "\n"))
+            out.extend(line)
+        return out
+
+    def _clip_block(self, block, limit: int):
+        """块超宽时截断其值部分（标签保留）
+
+        值形如逗号列表（技能等）时按项名对齐截断（保留完整项名 + ",…"），
+        否则做中间省略（保留头尾，如路径）。
+        """
+        if len(block) < 2:
+            return block
+        label, value = block[0], block[1]
+        budget = limit - display_width(label[1])
+        if budget < 4:
+            return [label]
+        if value[1].count(",") >= 2:
+            new_value = _clip_comma_list(value[1], budget)
+        else:
+            new_value = _ellipsize_middle(value[1], budget)
+        return [label, (value[0], new_value)]
 
     def prompt(self) -> str:
         """显示提示符并获取用户输入

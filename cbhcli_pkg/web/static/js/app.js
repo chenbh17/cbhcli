@@ -185,9 +185,10 @@ const api = {
     request(`/cli_session/poll?agent_name=${enc(a)}&session_id=${enc(session_id)}`),
   chatCompress: (agent_name, model_name, instructions, session_id) =>
     request("/chat/compress", { method: "POST", body: JSON.stringify({ agent_name, model_name, instructions: instructions || "", session_id: session_id || "" }) }),
-  chatUpload: (file, a, m) => {
+  // v5.4.2：批量上传——所有文件放进同一个请求（"file" 字段可重复）
+  chatUpload: (files, a, m) => {
     const fd = new FormData();
-    fd.append("file", file);
+    for (const f of files) fd.append("file", f);
     fd.append("agent_name", a);
     fd.append("model_name", m);
     return fetch(`${BASE}/chat/upload`, { method: "POST", body: fd }).then(handleUploadResp);
@@ -1034,6 +1035,8 @@ const state = {
   currentSessionId: null, // 当前后端会话 id（服务器重启后自动找回用，v5.2.8）
   fmPath: "",             // 文件管理器当前浏览目录（空=工作空间根，v5.2.8）
   fmWorkspace: "",        // 文件管理器对应的的工作空间（切换时重置，v5.2.8）
+  fmQuery: "",            // 文件管理器搜索词（v5.4.2，客户端过滤当前目录）
+  fmSort: "name",         // 文件管理器排序: name | mtime_desc | mtime_asc（v5.4.2）
   cliFollow: "",          // CLI 只读跟随视图的会话 id（问题6，v5.3.1+）
   cliFollowTimer: null,   // CLI 跟随轮询定时器
   stickBottom: true,      // 是否跟随滚动到底部（v5.3.2+：用户往上翻后不再强制置底）
@@ -1512,35 +1515,53 @@ function updateCtxMeter(s) {
 }
 
 /* ---- 附件 ---- */
+// v5.4.2：批量上传——一次选择/粘贴的多个文件合并为【单个请求】提交，
+// 后端逐个处理并返回 results 数组，单个失败不影响其它文件。
 async function handleFiles(e) {
   const files = [...e.target.files];
   e.target.value = "";
-  for (const f of files) await uploadAttachment(f);
+  if (files.length) await uploadAttachments(files);
 }
 
 async function handlePaste(e) {
   const items = [...(e.clipboardData?.items || [])];
+  const files = [];
   for (const item of items) {
     if (item.kind === "file") {
       e.preventDefault();
       const file = item.getAsFile();
       if (file) {
         const fname = file.name || `paste_${Date.now()}.${file.type.split("/")[1] || "bin"}`;
-        await uploadAttachment(new File([file], fname, { type: file.type }));
+        files.push(new File([file], fname, { type: file.type }));
       }
     }
   }
+  if (files.length) await uploadAttachments(files);
 }
 
-async function uploadAttachment(file) {
+/** 批量上传附件（单请求）；兼容单文件调用 */
+async function uploadAttachments(files) {
+  const list = Array.isArray(files) ? files : [files];
+  if (!list.length) return;
   const a = currentAgent(), m = currentModel();
   if (!a || !m) { toast("请先选择 Agent 和模型", "warn"); return; }
   try {
-    const info = await api.chatUpload(file, a, m);
-    state.attachments.push(info);
-    renderAttachments();
+    const resp = await api.chatUpload(list, a, m);
+    const results = (resp && resp.results) || [];
+    const errs = [];
+    let ok = 0;
+    for (const r of results) {
+      if (!r) continue;
+      if (r.error) { errs.push(`${r.filename || "文件"}: ${r.error}`); continue; }
+      if (r.filename) { state.attachments.push(r); ok++; }
+    }
+    if (ok) renderAttachments();
+    if (errs.length) toast(`部分文件上传失败 → ${errs.join("；")}`, "error");
+    else if (ok > 1) toast(`已添加 ${ok} 个附件`, "success");
   } catch (e2) { toast(`上传失败: ${e2.message}`, "error"); }
 }
+
+async function uploadAttachment(file) { return uploadAttachments([file]); }
 
 function renderAttachments() {
   chatUI.attachments.innerHTML = "";
@@ -3181,6 +3202,60 @@ function fmIcon(entry) {
   return FM_ICONS[ext] || "📄";
 }
 
+/* v5.4.2：文件管理器搜索 + 按更新时间排序 */
+const FM_SORTS = [
+  ["name", "名称", "排序：按名称"],
+  ["mtime_desc", "🕒 新→旧", "排序：按更新时间（新→旧）"],
+  ["mtime_asc", "🕒 旧→新", "排序：按更新时间（旧→新）"],
+];
+let _fmLastData = null;   // 最近一次目录数据（搜索/排序本地重渲染用，免重新请求）
+
+/** 相对更新时间：n秒前 / n分钟前 / n小时前；超过24h显示日期（v5.4.2） */
+function fmRelTime(mtime) {
+  const sec = Number(mtime);
+  if (!sec || !isFinite(sec)) return "";
+  const diff = Math.floor(Date.now() / 1000) - sec;
+  if (diff < 0) return "刚刚";
+  if (diff < 60) return `${diff}秒前`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
+  const d = new Date(sec * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 完整时间（title 提示用） */
+function fmFullTime(mtime) {
+  const sec = Number(mtime);
+  if (!sec || !isFinite(sec)) return "";
+  const d = new Date(sec * 1000);
+  if (isNaN(d.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+       + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function syncFmSortBtn() {
+  const btn = $("#btn-fm-sort");
+  if (!btn) return;
+  const def = FM_SORTS.find(s => s[0] === state.fmSort) || FM_SORTS[0];
+  btn.textContent = def[1];
+  btn.title = def[2];
+  btn.classList.toggle("active", state.fmSort !== "name");
+}
+
+function cycleFmSort() {
+  const i = FM_SORTS.findIndex(s => s[0] === state.fmSort);
+  state.fmSort = FM_SORTS[(i + 1) % FM_SORTS.length][0];
+  syncFmSortBtn();
+  rerenderFileManager();
+}
+
+/** 本地重渲染（搜索/排序变化时不重新请求目录） */
+function rerenderFileManager() {
+  if (_fmLastData) renderFileManager(_fmLastData);
+}
+
 function initFileManager() {
   $("#btn-fm-refresh").addEventListener("click", () => refreshFileManager());
   $("#btn-fm-up").addEventListener("click", () => {
@@ -3189,6 +3264,16 @@ function initFileManager() {
     state.fmPath = parent.startsWith(state.fmWorkspace) ? parent : state.fmWorkspace;
     refreshFileManager();
   });
+  const searchEl = $("#fm-search");
+  if (searchEl) {
+    searchEl.value = state.fmQuery || "";
+    searchEl.addEventListener("input", () => {
+      state.fmQuery = searchEl.value;
+      rerenderFileManager();
+    });
+  }
+  $("#btn-fm-sort").addEventListener("click", cycleFmSort);
+  syncFmSortBtn();
 }
 
 async function refreshFileManager() {
@@ -3204,6 +3289,7 @@ async function refreshFileManager() {
   }
   state.fmPath = data.path;
   state.fmWorkspace = data.workspace;
+  _fmLastData = data;
   renderFileManager(data);
 }
 
@@ -3228,11 +3314,27 @@ function renderFileManager(data) {
 
   const listEl = $("#fm-list");
   listEl.innerHTML = "";
-  if (!data.entries.length) {
-    listEl.append(el("div", { class: "ws-empty" }, "（空目录）"));
+
+  // v5.4.2：搜索过滤 + 排序（文件夹始终在前，组内按所选方式排序）
+  const q = (state.fmQuery || "").trim().toLowerCase();
+  let entries = data.entries;
+  if (q) entries = entries.filter(e => (e.name || "").toLowerCase().includes(q));
+  const sortMode = state.fmSort || "name";
+  entries = [...entries].sort((a, b) => {
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    if (sortMode === "mtime_desc")
+      return (b.mtime || 0) - (a.mtime || 0) || a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    if (sortMode === "mtime_asc")
+      return (a.mtime || 0) - (b.mtime || 0) || a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  });
+
+  if (!entries.length) {
+    listEl.append(el("div", { class: "ws-empty" },
+      q ? `（无匹配 “${state.fmQuery.trim()}” 的文件）` : "（空目录）"));
     return;
   }
-  for (const ent of data.entries) {
+  for (const ent of entries) {
     const menuBtn = el("span", { class: "ws-session-menu fm-menu", title: "更多操作" }, "⋯");
     menuBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -3242,6 +3344,7 @@ function renderFileManager(data) {
       el("span", { class: "fm-icon" }, fmIcon(ent)),
       el("span", { class: "fm-name", title: ent.path }, ent.name),
       el("span", { class: "fm-meta" }, ent.is_dir ? "" : fmtSize(ent.size)),
+      el("span", { class: "fm-meta fm-time", title: `更新于 ${fmFullTime(ent.mtime)}` }, fmRelTime(ent.mtime)),
       menuBtn);
     row.addEventListener("click", () => {
       // 文件夹点击进入；文件点击不触发下载（下载仅通过三点菜单）

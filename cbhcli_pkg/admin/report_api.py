@@ -144,7 +144,12 @@ async def report_snapshot(request: Request):
         return _err(400, "bad_request", "缺少 session_id 或 data")
 
     # 大小限制（policy.snapshot_max_mb）
-    max_mb = float(get_settings().get("snapshot_max_mb", 10) or 10)
+    try:
+        max_mb = float(get_settings().get("snapshot_max_mb", 10) or 10)
+    except Exception:
+        max_mb = 10.0
+    if not (max_mb > 0):
+        max_mb = 10.0
     try:
         size = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
     except Exception:
