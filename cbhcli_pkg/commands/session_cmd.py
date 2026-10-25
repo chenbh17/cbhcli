@@ -439,9 +439,11 @@ def register_session_commands(parser, app):
         if app.context_window is None:
             return "❌ 上下文窗口未初始化"
 
-        # 获取模型名称
+        # 获取模型名称（优先配置名称：同一模型 ID 可配置多份不同参数）
         model_name = "未配置"
-        if app.llm_client and hasattr(app.llm_client, 'model_name'):
+        if app.llm_client and hasattr(app.llm_client, 'config_name'):
+            model_name = app.llm_client.config_name
+        elif app.llm_client and hasattr(app.llm_client, 'model_name'):
             model_name = app.llm_client.model_name
         elif app.current_agent_config and app.current_agent_config.primary_model:
             model_name = app.current_agent_config.primary_model

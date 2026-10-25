@@ -203,6 +203,28 @@ class AuthClient:
                             or "登录失败")
         return data
 
+    def verify_key(self, server: str, key: str, surface: str = "web") -> dict:
+        """POST /api/auth/login（verify_only）—— 只验证密钥，不签发/不保存 token。
+
+        v5.4.4：Web 页面锁使用。服务端支持 verify_only 时不产生 token 记录；
+        旧版服务端会忽略该参数并签发 token，客户端也不落盘，因此向后兼容。
+
+        Returns:
+            {"ok": True, "user": {...}, "key_prefix": ..., "policy": {...}}
+
+        失败抛 AuthError（invalid_key/disabled/rate_limited/unreachable/...）
+        """
+        client = self._client_info(surface)
+        payload = {"key": key, "client": client, "verify_only": True}
+        data = self._request("POST", "/api/auth/login", payload=payload,
+                             server=server, timeout=max(self.timeout, 5.0))
+        if not isinstance(data, dict) or not data.get("ok"):
+            raise AuthError((data or {}).get("error", "invalid_key")
+                            if isinstance(data, dict) else "invalid_key",
+                            (data.get("message") if isinstance(data, dict) else "")
+                            or "认证密钥无效")
+        return data
+
     def validate(self, store: Optional[AuthStore] = None,
                  surface: str = "cli") -> dict:
         """POST /api/auth/validate —— 在线复核 token。

@@ -2044,3 +2044,11 @@ body.resizing { cursor: col-resize; user-select: none; }
   white-space: nowrap;
 }
 .conn-badge:hover { background: var(--bg-hover); border-color: var(--border-light); }
+
+/* ===================================================================
+   页面锁（v5.4.4：设备已登录时浏览器需输入密钥解锁）
+   复用登录视图样式，仅做少量强调
+   =================================================================== */
+#page-lock-view .login-title { color: var(--accent); }
+#page-lock-view .login-card { width: min(400px, calc(100vw - 40px)); }
+#page-lock-key { letter-spacing: 1px; }

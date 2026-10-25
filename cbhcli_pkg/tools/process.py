@@ -23,6 +23,14 @@ _MAX_OUTPUT_CHARS = 20000
 class ProcessTool(BaseTool):
     """后台任务进度查看与实时监控工具"""
 
+    def __init__(self):
+        # 全屏 TUI 的 Ctrl+C 通过 interrupt() 置位（工作线程收不到 SIGINT）
+        self._interrupt_requested = False
+
+    def interrupt(self) -> None:
+        """请求停止监控（任务继续后台运行），等价于 Ctrl+C"""
+        self._interrupt_requested = True
+
     @property
     def name(self) -> str:
         return "process"
@@ -137,6 +145,11 @@ class ProcessTool(BaseTool):
 
         try:
             while True:
+                # 0) 外部中断请求（全屏 TUI 的 Ctrl+C → interrupt()）
+                if self._interrupt_requested:
+                    self._interrupt_requested = False
+                    raise KeyboardInterrupt
+
                 # 1) 任务完成 → 打印剩余输出，返回全部内容
                 if task.done:
                     _clear_status()

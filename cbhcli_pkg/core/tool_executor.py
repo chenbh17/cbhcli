@@ -49,6 +49,22 @@ def _term_width() -> int:
         return 80
 
 
+def _render_width() -> int:
+    """rich 预览渲染的可用宽度（v5.5.0/v5.5.1：扣除全屏主区右侧预留列）
+
+    全屏 TUI 主区文字宽度 = 终端列数 − 2（最右预留 2 列，防宽字符压到
+    最后一列触发终端自动换行/滚屏）。rich 若按终端满宽（columns）画表格，
+    最右 1~2 列会被主区的折行逻辑折到**下一行最左侧**——现象就是 edit
+    差异预览"右侧绿色内容换行到左边、左右红绿错位"（用户实测），
+    write/python 的代码预览边框也会错位。
+
+    统一走 text_width.render_width()（多留 1 列余量：rich 用 cell_len、
+    主区用 display_width，对 emoji/组合字符的宽度判定可能有细微差异）。
+    """
+    from cbhcli_pkg.core.text_width import render_width
+    return render_width(1)
+
+
 def _separator_width() -> int:
     """工具调用分隔线宽度（适配终端，不超过60）"""
     return min(60, max(20, _term_width() - 1))
@@ -87,6 +103,8 @@ class ToolExecutor:
         # 自定义 ask_user 回调（Web 端链条下游 Agent 用）：
         # 签名 (question, options, allow_multiple) -> str，设置后替代 CLI 交互
         self._ask_user_callback: Optional[Callable] = None
+        # 当前正在执行的工具实例（供全屏 TUI 的 Ctrl+C 调 interrupt()）
+        self._current_tool = None
 
     def set_verbose(self, verbose: bool):
         """设置详细输出模式"""
@@ -118,7 +136,27 @@ class ToolExecutor:
         tool = self.tool_registry.get(tool_name)
         if tool is not None and hasattr(tool, "set_tracer"):
             tool.set_tracer(self.tracer)
-        return self.tool_registry.execute(tool_name, **arguments)
+        # 记录当前工具实例：全屏 TUI 的 Ctrl+C 通过 interrupt_current() 调它的
+        # interrupt() 钩子（terminal → killpg；process → 停止监控）
+        self._current_tool = tool
+        try:
+            return self.tool_registry.execute(tool_name, **arguments)
+        finally:
+            self._current_tool = None
+
+    def interrupt_current(self) -> bool:
+        """中断当前工具（若支持 interrupt 钩子）。返回是否已发出中断。"""
+        tool = self._current_tool
+        if tool is None:
+            return False
+        fn = getattr(tool, "interrupt", None)
+        if fn is None:
+            return False
+        try:
+            fn()
+            return True
+        except Exception:
+            return False
 
     # 自带显示的工具（跳过 executor 的头部和结果显示）
     _SELF_DISPLAY_TOOLS = {"Todo", "call_agent"}
@@ -460,8 +498,10 @@ class ToolExecutor:
         DEL_SEG_STYLE = "bold on #7a2626"
         ADD_SEG_STYLE = "bold on #267a26"
 
-        # 显式传入 ioctl 实时宽度（Console 默认读 COLUMNS 环境变量，可能过期）
-        term_w = _term_width()
+        # 显式传入实时宽度（Console 默认读 COLUMNS 环境变量，可能过期）；
+        # v5.5.0：用 _render_width()（全屏主区宽度）而不是终端满宽，
+        # 否则最右列会被主区折行折到下一行最左侧（红绿错位）。
+        term_w = _render_width()
         console = Console(width=term_w)
         max_lines = max(len(old_lines), len(new_lines))
         max_display = self._EDIT_MAX_DISPLAY
@@ -639,8 +679,9 @@ class ToolExecutor:
         from rich.syntax import Syntax
         from rich import box
 
-        # 显式传入 ioctl 实时宽度（Console 默认读 COLUMNS 环境变量，可能过期）
-        term_w = _term_width()
+        # 显式传入实时宽度（Console 默认读 COLUMNS 环境变量，可能过期）；
+        # v5.5.0：用 _render_width()（全屏主区宽度），避免最右列被折到下一行左侧
+        term_w = _render_width()
         console = Console(width=term_w)
         max_display = self._CODE_MAX_DISPLAY
 

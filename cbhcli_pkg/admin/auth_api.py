@@ -179,6 +179,8 @@ async def login(request: Request):
 
     key = (body.get("key") or "").strip()
     client = body.get("client") or {}
+    # v5.4.4：verify_only=True 只验证密钥（Web 页面锁用），不签发 token、不写登录记录
+    verify_only = bool(body.get("verify_only"))
     if not key:
         return _err(400, "invalid_key", "缺少认证密钥")
     proto = int(client.get("protocol", 0) or 0)
@@ -200,6 +202,18 @@ async def login(request: Request):
                         client_info=_client_info_str(client),
                         reason="disabled")
         return _err(401, "disabled", "账号已被管理员禁用")
+
+    # v5.4.4：页面锁验证——只回答"这个密钥是否属于有效用户"，不签发 token、
+    # 不写登录记录（否则每次打开 Web 页面都会多一条登录记录和一条无主 token）
+    if verify_only:
+        return {
+            "ok": True,
+            "verify_only": True,
+            "user": {"id": user.get("id", ""), "name": user.get("name", ""),
+                     "display_name": user.get("display_name", "")},
+            "key_prefix": user.get("key_prefix", ""),
+            "policy": _policy(),
+        }
 
     # 用户有效期策略：None=永久（创建用户时已应用服务端默认值；
     # 此处不能再 fallback，否则"永久"会被降级为默认天数）

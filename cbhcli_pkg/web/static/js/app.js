@@ -24,6 +24,13 @@ async function request(path, options = {}) {
       }
       throw new Error("未登录：请在登录界面完成登录");
     }
+    // v5.4.4（页面锁）：设备已登录但本浏览器未解锁 -> 显示密钥验证视图
+    if (err.error === "page_locked") {
+      if (typeof showPageLockView === "function") {
+        showPageLockView(err.message || "需要输入认证密钥解锁本页面");
+      }
+      throw new Error("需要输入认证密钥解锁页面");
+    }
     throw new Error(err.message || err.detail || "未授权");
   }
   if (!res.ok) {
@@ -41,6 +48,14 @@ const authApi = {
   login: (server, key) =>
     request("/auth/login", { method: "POST", body: JSON.stringify({ server, key }) }),
   logout: () => request("/auth/logout", { method: "POST" }),
+};
+
+// v5.4.4（页面锁）：设备已登录时，浏览器输入密钥解锁本页面
+const pageAuthApi = {
+  status: () => request("/web_auth/status"),
+  login: (key) =>
+    request("/web_auth/login", { method: "POST", body: JSON.stringify({ key }) }),
+  logout: () => request("/web_auth/logout", { method: "POST" }),
 };
 
 const api = {
@@ -1730,9 +1745,14 @@ function wsConnect() {
       handleWsNotice(msg.data);
     }
   };
-  ws.sock.onclose = () => {
+  ws.sock.onclose = (ev) => {
     ws.connected = false;
     clearInterval(ws.pingTimer);
+    // v5.4.4（页面锁）：服务重启/页面会话过期 -> 回到密钥验证视图
+    if (ev && ev.code === 4401) {
+      if (typeof showPageLockView === "function") showPageLockView();
+      return;
+    }
     wsScheduleReconnect();
   };
   ws.sock.onerror = () => { try { ws.sock.close(); } catch (_) {} };
@@ -5534,6 +5554,74 @@ function initLoginView() {
   }
 }
 
+/* ---- 页面锁（v5.4.4）：设备已登录时，浏览器需输入该账号密钥 ---- */
+
+function showPageLockView(message) {
+  const lv = $("#page-lock-view");
+  if (!lv) return;
+  lv.classList.remove("hidden");
+  const input = $("#page-lock-key");
+  if (input && !input.value) { try { input.focus(); } catch (_) {} }
+  if (message) setPageLockError(message);
+}
+
+function setPageLockError(msg) {
+  const box = $("#page-lock-error");
+  if (!box) return;
+  if (msg) { box.textContent = msg; box.classList.remove("hidden"); }
+  else { box.textContent = ""; box.classList.add("hidden"); }
+}
+
+const PAGE_LOCK_ERR_GUIDE = {
+  invalid_key: "认证密钥无效：密钥错误或已被重置，请联系管理员",
+  disabled: "账号已被管理员禁用，请联系管理员",
+  wrong_user: "该密钥不属于本机当前登录的账号（只允许本机账号的密钥）",
+  not_logged_in: "本机尚未登录 cbhcli，请刷新页面完成登录",
+  rate_limited: "验证尝试过于频繁，请稍后再试",
+  unreachable: "无法连接管理服务器：请检查网络/防火墙",
+  timeout: "连接超时：网络不通或防火墙拦截",
+  protocol_mismatch: "协议版本不匹配：请升级 cbhcli",
+};
+
+async function submitPageUnlock() {
+  const key = ($("#page-lock-key")?.value || "").trim();
+  const btn = $("#btn-page-unlock");
+  if (!key) { setPageLockError("请填写认证密钥（向管理员获取，cbhk_ 开头）"); return; }
+  if (btn) { btn.disabled = true; btn.textContent = "验证中…"; }
+  setPageLockError("");
+  try {
+    const r = await pageAuthApi.login(key);
+    if (r && r.ok) {
+      if (btn) btn.textContent = "验证成功，正在进入…";
+      setTimeout(() => location.reload(), 300);
+      return;
+    }
+    setPageLockError(PAGE_LOCK_ERR_GUIDE[r.error] || r.message || "验证失败，请重试");
+  } catch (e) {
+    setPageLockError(e.message || "验证失败，请重试");
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "解 锁"; }
+}
+
+function initPageLockView() {
+  // v5.4.4 迭代：改为真实 form submit —— 浏览器密码管理器可识别为登录表单，
+  // 从而自动填充已保存的密钥（单行 input 内 Enter 会天然触发 submit）
+  const form = $("#page-lock-form");
+  if (form) {
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      submitPageUnlock();
+    });
+  } else {
+    const btn = $("#btn-page-unlock");
+    if (btn) btn.addEventListener("click", submitPageUnlock);
+  }
+  const input = $("#page-lock-key");
+  if (input) {
+    try { input.focus(); } catch (_) {}
+  }
+}
+
 /* ---- 连接状态指示器（顶栏；点击重新测试） ---- */
 
 function initConnBadge(authSt) {
@@ -5617,7 +5705,8 @@ async function showAccountModal() {
   row("在线状态", st.online ? "🟢 服务器可达" : "🔴 服务器不可达（软在线，本地仍可用）");
   body.append(el("div", { class: "form-hint", style: "margin-top:4px;" },
     "登录一次即在本机全局生效（CLI / Web / Jupyter / exec 共用）；" +
-    "局域网其他机器访问本 Web 服务时，会看到登录界面（登录结果属于本机）。"));
+    "局域网其他机器访问本 Web 服务时，需输入本机账号的认证密钥解锁页面" +
+    "（24 小时无操作后重新验证）。"));
 
   const btnRow = el("div", { style: "display:flex;gap:10px;margin-top:8px;flex-wrap:wrap;" });
   btnRow.append(el("button", {
@@ -5632,6 +5721,14 @@ async function showAccountModal() {
     },
   }, "测试连接"));
   if (st.logged_in) {
+    btnRow.append(el("button", {
+      class: "btn btn-ghost",
+      onclick: async () => {
+        // v5.4.4（页面锁）：吊销本浏览器的页面会话，立即回到密钥验证视图
+        try { await pageAuthApi.logout(); } catch (e) { /* 尽力而为 */ }
+        location.reload();
+      },
+    }, "🔒 锁定此浏览器"));
     btnRow.append(el("button", {
       class: "btn btn-ghost",
       onclick: () => {
@@ -5658,6 +5755,20 @@ function initAccountEntry() {
    =================================================================== */
 
 async function bootstrap() {
+  // v5.4.4（页面锁）：设备已登录时，浏览器必须先输入该账号密钥解锁。
+  // 未解锁 -> 只显示密钥输入视图（不初始化主界面，避免满屏 401）
+  let pageSt = null;
+  try {
+    pageSt = await pageAuthApi.status();
+  } catch (e) {
+    pageSt = null;
+  }
+  if (pageSt && pageSt.gate_enabled && !pageSt.unlocked) {
+    initPageLockView();
+    showPageLockView();
+    return;
+  }
+
   // v5.4.0（认证系统）：先检查本机登录状态。
   // 未登录 -> 只显示登录视图（不初始化主界面，避免满屏 401）
   let authSt = null;

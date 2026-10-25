@@ -180,13 +180,16 @@ def _list_models(app):
     if not models:
         return "📭 暂无模型。使用 /model add 添加模型。"
 
+    # 当前模型按【配置名】判断：同一模型 ID 可有多份不同参数配置，
+    # 按模型 ID 判断会把多个条目同时标记为"当前使用"
     current_model = None
     if app.llm_client:
-        current_model = app.llm_client.model_name
+        current_model = getattr(app.llm_client, "config_name", None) \
+            or app.llm_client.model_name
 
     lines = ["📋 已配置的模型:\n"]
     for m in models:
-        marker = " ◀ 当前使用" if m.get("model") == current_model else ""
+        marker = " ◀ 当前使用" if m.get("name") == current_model else ""
         lines.append(f"  • {m['name']}{marker}")
         lines.append(f"    模型ID: {m['model']}")
         lines.append(f"    API: {m['url']}")
@@ -219,13 +222,16 @@ def _show_model_menu(app):
     if not models:
         return "📭 暂无模型。使用 /model add 添加模型。"
 
+    # 当前模型按【配置名】判断：同一模型 ID 可有多份不同参数配置，
+    # 按模型 ID 判断会把多个条目同时标记为"当前使用"
     current_model = None
     if app.llm_client:
-        current_model = app.llm_client.model_name
+        current_model = getattr(app.llm_client, "config_name", None) \
+            or app.llm_client.model_name
 
     lines = ["📋 选择模型 (输入编号或名称):\n"]
     for i, m in enumerate(models, 1):
-        marker = " ◀ 当前" if m.get("model") == current_model else ""
+        marker = " ◀ 当前" if m.get("name") == current_model else ""
         ctx = m.get('context_limit', 128000)
         lines.append(f"  {i}. {m['name']}{marker}")
         lines.append(f"     模型ID: {m['model']}  上下文: {ctx:,}")
@@ -326,7 +332,10 @@ def _model_info(app):
         return "⚠️  当前Agent未配置模型"
 
     lines = [f"📋 当前模型信息:\n"]
-    lines.append(f"  名称: {app.current_agent_config.primary_model if app.current_agent_config else '未知'}")
+    # 名称 = 配置名称（同一模型 ID 可有多份参数不同的配置）
+    display_name = getattr(app.llm_client, "config_name", None) \
+        or (app.current_agent_config.primary_model if app.current_agent_config else '未知')
+    lines.append(f"  名称: {display_name}")
     lines.append(f"  模型ID: {app.llm_client.model_name}")
     lines.append(f"  API Base: {app.llm_client.base_url}")
     lines.append(f"  上下文限制: {app.llm_client.context_limit:,} tokens")
@@ -535,8 +544,9 @@ def _config_model(app, param):
     else:
         lines.append(f"   reasoning_effort: 不传该参数")
     
-    # 如果当前正在使用这个模型，提示需要重新加载
-    if app.llm_client and app.llm_client.model_name == model_config.get('model'):
+    # 如果当前正在使用这个模型配置（按配置名判断，同 ID 多配置需区分），
+    # 提示需要重新加载
+    if app.llm_client and getattr(app.llm_client, "config_name", None) == model_name:
         lines.append("\n💡 提示: 当前正在使用此模型，重启 cbhcli 后配置生效")
     
     return "\n".join(lines)

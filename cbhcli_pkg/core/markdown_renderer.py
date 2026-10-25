@@ -528,6 +528,15 @@ class MarkdownStreamRenderer:
         # 预处理 LaTeX
         render_text = _preprocess_latex(text)
 
+        # v5.5.1：渲染宽度必须跟随**主区可用宽度**（终端列数 − 2）
+        # rich 默认按终端满宽出图，多出的 1~2 列会被主区折到下一行左侧 →
+        # 表格/引用块/代码框错行（用户实测）。每次渲染前刷新，兼容 resize。
+        try:
+            from cbhcli_pkg.core.text_width import render_width
+            self.console.width = render_width(1)
+        except Exception:
+            pass
+
         # 用 Rich Markdown 渲染
         self.console.print(
             Markdown(render_text, code_theme=self.code_theme)

@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CBHCLI Web</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <link rel="stylesheet" href="/css/style.css?v=5.4.2" />
-  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.4.2" />
+  <link rel="stylesheet" href="/css/style.css?v=5.5.1" />
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css?v=5.5.1" />
 </head>
 <body>
   <!-- ===== 登录视图（v5.4.0：未登录时全屏显示，浏览器内完成登录） ===== -->
@@ -25,13 +25,38 @@
       </div>
       <div class="login-field">
         <label>认证密钥</label>
-        <input class="input" id="login-key" type="password" placeholder="cbhk_…（输入不回显）"
-               autocomplete="off" />
+        <input class="input" id="login-key" name="password" type="password" placeholder="cbhk_…（输入不回显）"
+               autocomplete="current-password" autocapitalize="off" spellcheck="false" />
       </div>
       <button class="btn btn-primary login-btn" id="btn-login-submit" type="button">登 录</button>
       <div class="login-error hidden" id="login-error"></div>
       <div class="login-hint" id="login-hint">
         💡 也可在终端运行 <code>cbhcli login</code> 完成登录
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 页面锁（v5.4.4：设备已登录时，浏览器需输入该账号密钥解锁） ===== -->
+  <div id="page-lock-view" class="login-view hidden">
+    <div class="login-card">
+      <div class="login-logo"><span class="logo-icon">❯</span> CBHCLI</div>
+      <h2 class="login-title">需要验证身份</h2>
+      <p class="login-sub" id="page-lock-sub">
+        此服务器已登录 cbhcli，请输入本机当前账号的认证密钥以访问页面
+      </p>
+      <!-- v5.4.4 迭代：使用真实 <form> + current-password，让浏览器密码管理器可自动填充 -->
+      <form id="page-lock-form" autocomplete="on">
+        <div class="login-field">
+          <label for="page-lock-key">认证密钥</label>
+          <input class="input" id="page-lock-key" name="password" type="password"
+                 autocomplete="current-password" autocapitalize="off" spellcheck="false"
+                 placeholder="cbhk_…（输入不回显）" />
+        </div>
+        <button class="btn btn-primary login-btn" id="btn-page-unlock" type="submit">解 锁</button>
+      </form>
+      <div class="login-error hidden" id="page-lock-error"></div>
+      <div class="login-hint">
+        只允许本机当前登录账号的密钥；24 小时无操作后需重新验证
       </div>
     </div>
   </div>
@@ -188,8 +213,8 @@
   <!-- Toast 通知 -->
   <div id="toast-root"></div>
 
-  <script src="/vendor/marked.umd.js?v=5.4.2"></script>
-  <script src="/vendor/katex/katex.min.js?v=5.4.2"></script>
-  <script src="/js/app.js?v=5.4.2"></script>
+  <script src="/vendor/marked.umd.js?v=5.5.1"></script>
+  <script src="/vendor/katex/katex.min.js?v=5.5.1"></script>
+  <script src="/js/app.js?v=5.5.1"></script>
 </body>
 </html>

@@ -269,12 +269,13 @@ def _ask(prompt: str, default: str = "") -> str:
 
 
 def _ask_secret(prompt: str) -> str:
-    """密钥输入（不回显；非 TTY 回退普通输入）。"""
-    import sys
+    """密钥输入（不回显）
+
+    契约 D7-05（Q-02 = A）：全屏 UI 走应用内 password 模态；
+    普通终端回退 getpass；非 TTY 回退普通输入。
+    """
     try:
-        import getpass
-        if sys.stdin.isatty():
-            return getpass.getpass(prompt).strip()
+        from cbhcli_pkg.core.prompt_utils import ask_secret
+        return ask_secret(prompt)
     except Exception:
-        pass
-    return _ask(prompt, "")
+        return _ask(prompt, "")

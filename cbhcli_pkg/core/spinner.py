@@ -15,6 +15,8 @@ import sys
 import threading
 import time
 
+from cbhcli_pkg.core.ui.sink import get_sink
+
 # 纯 braille 圆点帧（U+2800 盲文区，终端字体普遍支持）。
 # 之前混入的 ⦦⦯（U+29A6/29AF 数学符号区）在部分字体中无字形，
 # 会显示为豆腐方块，导致"转圈和方框轮流出现"。
@@ -37,10 +39,9 @@ class Spinner:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._drawn = False
-        # 真实输出流：在 __enter__ 时捕获。python_tool 执行期间会把
-        # sys.stdout 全局换成 StringIO 捕获缓冲区，若 spinner 线程仍读
-        # sys.stdout，动画帧会被吞进缓冲区（表现为动画卡死、读秒不动）。
-        self._out = sys.stdout
+        # 输出目标：在 __enter__ 时捕获（见下方注释）。
+        # 通过 SINK 的语义 API 输出，P1 阶段与旧的 "\r…\033[K" 逐字节等价。
+        self._sink = None
 
     @staticmethod
     def _is_tty() -> bool:
@@ -56,20 +57,20 @@ class Spinner:
             elapsed = time.monotonic() - start
             frame = FRAMES[idx % len(FRAMES)]
             with self._lock:
-                self._out.write(
-                    f"\r  {self._color}{frame}{self._reset} "
+                self._sink.live_line(
+                    f"  {self._color}{frame}{self._reset} "
                     f"{self.message} {self._dim}{elapsed:.1f}s{self._reset}"
-                    f"\033[K"
                 )
-                self._out.flush()
+                self._sink.flush()
                 self._drawn = True
             idx += 1
             self._stop_event.wait(_INTERVAL)
 
     def __enter__(self):
         if self._enabled:
-            # 进入时捕获真实 stdout（此时 sys.stdout 尚未被 python_tool 替换）
-            self._out = sys.stdout
+            # 进入时捕获输出目标（此时 sys.stdout 尚未被 python_tool 替换）。
+            # get_sink() 在已安装时返回全局 SINK；未安装时绑定当前 stdout。
+            self._sink = get_sink()
             self._thread = threading.Thread(target=self._render, daemon=True)
             self._thread.start()
         return self
@@ -86,9 +87,9 @@ class Spinner:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
         with self._lock:
-            if self._drawn:
-                self._out.write("\r\033[K")
-                self._out.flush()
+            if self._drawn and self._sink is not None:
+                self._sink.live_line(erase=True)
+                self._sink.flush()
                 self._drawn = False
 
     def elapsed(self) -> float:

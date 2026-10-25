@@ -2,6 +2,7 @@
 import json
 import re
 import sys
+import threading
 import uuid
 from typing import Optional, Callable, TYPE_CHECKING
 
@@ -218,6 +219,11 @@ class AIHandler:
         # 签名: (event_type, agent_name, **data) -> None
         self._chain_event_callback: Optional[Callable] = None
 
+        # 协作式中止标志（全屏 TUI 的 Ctrl+C：工作线程收不到信号，见契约 K-17）
+        # 在「每个流式 chunk」「每轮 ReAct 开始」检查；置位后抛出 KeyboardInterrupt，
+        # 走与主线程 Ctrl+C **完全相同**的清理路径。
+        self.abort_event = threading.Event()
+
         # 根据是否为子agent选择颜色
         if is_subagent:
             self._c_hint = C_SUBAGENT_HINT
@@ -232,6 +238,15 @@ class AIHandler:
             
         # 思考内容滚动显示管理器
         self.thinking_display = ThinkingDisplay(max_lines=THINKING_MAX_LINES, label=self._label)
+
+    def abort(self) -> None:
+        """请求中止（线程安全）：由 UI 层的 Ctrl+C 调用"""
+        self.abort_event.set()
+
+    def _check_abort(self) -> None:
+        """协作式中止检查（在流式 chunk / ReAct 轮边界调用）"""
+        if self.abort_event.is_set():
+            raise KeyboardInterrupt
 
     def _emit_chain_event(self, event_type: str, **data):
         """发送链条事件到回调（Web 端 SSE 推送用）"""
@@ -268,8 +283,9 @@ class AIHandler:
         )
         self.session.messages.append(user_msg)
 
-        # 重置失败计数
+        # 重置失败计数 + 中止标志（上一轮的中止不污染本轮）
         self._failure_counts.clear()
+        self.abort_event.clear()
 
         # 死循环检测器（每个用户请求独立）
         self._loop_tracker = ToolCallTracker()
@@ -280,6 +296,8 @@ class AIHandler:
 
         # --- ReAct 循环 ---
         for round_idx in range(MAX_TOOL_ROUNDS):
+            # 协作式中止（全屏 TUI 工作线程收不到 SIGINT，见契约 K-17）
+            self._check_abort()
             # 检查上下文是否接近上限，自动压缩
             self._check_and_compress_in_react(round_idx)
 
@@ -411,6 +429,8 @@ class AIHandler:
 
             stream = client.chat_stream(messages, **stream_kwargs)
             for chunk_type, content in stream:
+                # 协作式中止：每个 chunk 检查一次（全屏 TUI 的 Ctrl+C）
+                self._check_abort()
                 if chunk_type == "reasoning":
                     if not is_reasoning:
                         is_reasoning = True

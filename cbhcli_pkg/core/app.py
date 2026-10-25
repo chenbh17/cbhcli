@@ -1,6 +1,8 @@
 """主应用 - CBHCLIApp"""
 import os
+import sys
 import json
+import time
 import threading
 from pathlib import Path
 from typing import Optional
@@ -290,6 +292,9 @@ class CBHCLIApp:
     
     def __init__(self):
         """初始化应用"""
+        # 全屏模式（P4）运行时状态
+        self._fs_ui = None
+        self._current_ai_handler = None
         self._init_config()
         self._init_tools()
         self._init_vector_store()
@@ -711,7 +716,16 @@ class CBHCLIApp:
             compression_ratio=self.current_agent_config.context_limit_ratio or DEFAULT_COMPRESSION_RATIO,
             tools_schema_tokens=tools_schema_tokens
         )
-    
+
+        # 全屏模式：新会话 → 另起一份 transcript（S-11）
+        try:
+            if getattr(self, "_fs_ui", None) is not None:
+                self._fs_ui.start_transcript(
+                    self._transcript_path()
+                    if getattr(self, "autosave_history", True) else None)
+        except Exception:
+            pass
+
     def _update_system_prompt(self):
         """原地更新当前会话的系统提示词（不重置会话，保留对话历史）
         
@@ -874,7 +888,33 @@ class CBHCLIApp:
                     print("压缩失败")
     
     def run(self):
-        """主运行循环"""
+        """主运行循环（P1：按 CBHCLI_UI 安装输出 SINK，见契约 §12）
+
+        - `CBHCLI_UI=sink`：安装**透传** SINK（输出字节不变，用于验证代理本身）
+        - 其它值（含默认 `legacy`）：不安装，行为与改造前完全一致
+        """
+        from cbhcli_pkg.core.ui.sink import install, ui_mode, uninstall
+
+        mode = ui_mode()
+        if mode == "fullscreen":
+            # H-07：非 TTY / TERM=dumb 自动回退内联模式
+            if self._can_use_fullscreen():
+                self._run_fullscreen()
+            else:
+                self._run_inner()
+            return
+        if mode != "sink":
+            self._run_inner()
+            return
+
+        install()
+        try:
+            self._run_inner()
+        finally:
+            uninstall()
+
+    def _run_inner(self):
+        """主运行循环（原实现，P1 未改动）"""
         self._show_welcome()
         
         while True:
@@ -936,7 +976,190 @@ class CBHCLIApp:
             except Exception as e:
                 print(f"\n错误: {str(e)}{C_RESET}")
                 continue
-    
+
+    # ------------------------------------------------------------------
+    #  全屏模式（P4：真实 app 接线）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _can_use_fullscreen() -> bool:
+        """全屏模式前置条件（契约 H-07）：真实 TTY 且 TERM 不是 dumb"""
+        try:
+            if not sys.stdout.isatty() or not sys.stdin.isatty():
+                return False
+        except Exception:
+            return False
+        if (os.environ.get("TERM") or "").strip().lower() == "dumb":
+            return False
+        return True
+
+    def _transcript_path(self) -> str:
+        """transcript 文件路径（契约 S-11）"""
+        agent = self.current_agent_name or "main"
+        sid = (getattr(self.session, "id", "") or "nosession")[:8]
+        base = Path.home() / ".cbhcli" / "agents" / agent / "history" / "transcripts"
+        return str(base / f"{time.strftime('%Y%m%d-%H%M%S')}_{sid}.log")
+
+    def _run_fullscreen(self):
+        """全屏会话入口（CBHCLI_UI=fullscreen）"""
+        import asyncio
+
+        from cbhcli_pkg.core.input_box import CHAT_INPUT_STYLE_DICT
+        from cbhcli_pkg.core.ui.shell import FullScreenUI
+
+        ui = FullScreenUI(
+            status_provider=self._chat_input._build_toolbar,
+            key_bindings=self._chat_input._bindings,
+            completer=self._chat_input._completer,
+            style_dict=CHAT_INPUT_STYLE_DICT,
+        )
+        ui.on_interrupt = lambda: self._fs_on_interrupt(ui)
+        self._fs_ui = ui
+        try:
+            asyncio.run(self._fs_main(ui))
+        finally:
+            self._fs_ui = None
+
+    def _fs_on_interrupt(self, ui):
+        """全屏模式的 Ctrl+C（契约 K-17）
+
+        - 请求进行中：协作式中止 + 中断当前工具；
+        - 空闲：清空输入并打印中断提示（与 K-09 一致）。
+        """
+        if os.environ.get("CBHCLI_FS_DEBUG"):
+            print(f"[fs] interrupt busy={ui.busy}", file=sys.stderr, flush=True)
+        if ui.busy:
+            handler = getattr(self, "_current_ai_handler", None)
+            if handler is not None:
+                try:
+                    handler.abort()
+                except Exception:
+                    pass
+            try:
+                self.tool_executor.interrupt_current()
+            except Exception:
+                pass
+        else:
+            try:
+                ui.buffer.reset()
+            except Exception:
+                pass
+            print(f"\n\n{C_DIM}操作被中断。输入 'quit' 退出。{C_RESET}")
+        ui.invalidate()
+
+    async def _fs_main(self, ui):
+        """全屏主循环：UI 在事件循环，请求/命令在工作线程"""
+        import asyncio
+
+        from cbhcli_pkg.core import prompt_utils
+        from cbhcli_pkg.core.ui.shell import set_active_ui
+
+        loop = asyncio.get_running_loop()
+        ui.install_sink()
+        set_active_ui(ui)
+        # transcript（S-11）：--no-save 时关闭
+        try:
+            if getattr(self, "autosave_history", True):
+                ui.start_transcript(self._transcript_path())
+        except Exception:
+            pass
+        # 交互式提问：优先应用内模态（P5b）；SUSPEND 保留为 getpass 等兜底
+        prompt_utils.set_modal_hook(ui.ask_text_sync)
+        prompt_utils.set_suspend_hook(ui.suspend_run_sync)
+
+        app_task = asyncio.create_task(ui.app.run_async())
+        # app 自行退出（Ctrl+D / Esc 等）时唤醒会话循环，避免它永远等输入
+        app_task.add_done_callback(lambda _t: ui.close_input())
+        try:
+            while not ui.app.is_running:
+                await asyncio.sleep(0.01)
+            try:
+                ui.after_start()
+            except Exception:
+                pass
+            self._show_welcome()
+            print(f"{C_DIM}提示: 鼠标滚轮滚动历史；选中文本请按住 Shift 拖动"
+                  f"（先松左键再松 Shift）{C_RESET}")
+            await self._fs_session_loop(ui, loop)
+        finally:
+            ui.close_input()
+            try:
+                ui.app.exit()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(app_task, timeout=5)
+            except Exception:
+                pass
+            prompt_utils.set_modal_hook(None)
+            prompt_utils.set_suspend_hook(None)
+            set_active_ui(None)
+            ui.close_transcript()
+            ui.restore_terminal_modes()
+
+            # 退出 dump（D0-09）：--no-save 时不写 transcript、也不 dump
+            autosave = bool(getattr(self, "autosave_history", True))
+            total = 0
+            if autosave:
+                try:
+                    total = ui.dump_tail(200)
+                except Exception:
+                    total = 0
+            ui.uninstall_sink()
+            try:
+                if autosave and total > 200:
+                    p = ui.transcript_display_path()
+                    if p:
+                        sys.stdout.write(
+                            f"--- 以上为最近 200 行，完整记录: {p} ---\n")
+                    else:
+                        sys.stdout.write("--- 以上为最近 200 行 ---\n")
+                sys.stdout.write("\n再见!\n")
+                sys.stdout.flush()
+            except Exception:
+                print("\n再见!")
+
+    async def _fs_session_loop(self, ui, loop):
+        """会话循环（原 `_run_inner` 的异步版）"""
+        import asyncio
+
+        while True:
+            text = await ui.wait_input()
+            if text is None:
+                return
+            if text.lower() == "quit":
+                return
+
+            ui.set_busy(True)
+            try:
+                self._print_user_input(text)
+
+                is_command, output = await loop.run_in_executor(
+                    None, self.command_parser.execute, text)
+                if is_command or output:
+                    if output:
+                        print(f"\n{output}\n")
+                    continue
+
+                if self.llm_client and self.session:
+                    try:
+                        from cbhcli_pkg.auth import require_login
+                        if not require_login("cli", interactive=False):
+                            self._print_login_hint()
+                            continue
+                    except Exception:
+                        pass
+                    await loop.run_in_executor(
+                        None, self._handle_ai_request, text)
+                else:
+                    print(f"\n{C_DIM}当前Agent未配置模型。"
+                          f"请使用 /model 命令配置模型。{C_RESET}")
+            except KeyboardInterrupt:
+                print(f"\n\n{C_DIM}操作被中断。输入 'quit' 退出。{C_RESET}")
+            except Exception as e:
+                print(f"\n错误: {str(e)}{C_RESET}")
+            finally:
+                ui.set_busy(False)
+
     def _autosave_session(self):
         """每轮对话结束自动保存会话到 history（v5.2.6）
 
@@ -1009,6 +1232,8 @@ class CBHCLIApp:
             self.tool_executor,
             self.token_counter
         )
+        # 暴露给全屏模式的 Ctrl+C（K-17：协作式中止）
+        self._current_ai_handler = handler
 
         # 注入子Agent调度器
         handler.subagent_scheduler = self.subagent_scheduler
@@ -1078,6 +1303,7 @@ class CBHCLIApp:
                 for warn in decision.warnings:
                     print(f"{C_DIM}⚠️ 钩子: {warn}{C_RESET}")
         finally:
+            self._current_ai_handler = None
             # 每轮对话结束自动保存（v5.2.6）：正常/中断/异常出口统一落盘，
             # 应用崩溃或被 kill 时最多丢失正在生成的当前轮
             self._autosave_session()
@@ -1142,7 +1368,10 @@ class CBHCLIApp:
 
         agent = self.current_agent_name or "main"
         model_name = ""
-        if self.llm_client and hasattr(self.llm_client, 'model_name'):
+        # 显示配置名称（同一模型 ID 可配置多份不同参数，需按配置名区分）
+        if self.llm_client and hasattr(self.llm_client, 'config_name'):
+            model_name = self.llm_client.config_name
+        elif self.llm_client and hasattr(self.llm_client, 'model_name'):
             model_name = self.llm_client.model_name
         elif self.current_agent_config and self.current_agent_config.primary_model:
             model_name = self.current_agent_config.primary_model
@@ -1212,7 +1441,16 @@ class CBHCLIApp:
     
     @staticmethod
     def _get_terminal_width() -> int:
-        """获取终端宽度"""
+        """获取渲染可用宽度（v5.5.1：全屏下为主区宽度 = 终端列数 − 2）
+
+        欢迎面板等方框类输出若按终端满宽计算，最右 1~2 列会被主区折到
+        下一行左侧，导致边框错位（用户反馈"文字输出渲染窗口大小不对"）。
+        """
+        try:
+            from cbhcli_pkg.core.text_width import render_width
+            return render_width(0)
+        except Exception:
+            pass
         try:
             return os.get_terminal_size().columns
         except (ValueError, OSError):

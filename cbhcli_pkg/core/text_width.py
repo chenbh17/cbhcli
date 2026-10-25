@@ -120,6 +120,33 @@ def truncate_to_width(text: str, max_width: int, ellipsis: str = "...") -> str:
     return result + ellipsis
 
 
+def render_width(margin: int = 1) -> int:
+    """CLI 输出渲染可用宽度（显示列）
+
+    v5.5.1：全屏 TUI 主区文字宽度 = 终端列数 − 2（最右 2 列预留，防止宽字符
+    压到最后一列触发终端自动换行/滚屏）。**所有 rich 渲染**（Markdown 正文、
+    代码预览、子Agent状态板、欢迎面板、思考窗）都必须按这个宽度出图，
+    否则多出的 1~2 列会被主区折行折到下一行最左侧 —— 表现为"文字输出错行"。
+
+    Args:
+        margin: 额外预留列数（rich 用 cell_len、主区用字素簇 display_width，
+            边界判定可能有细微差异，默认再留 1 列）
+    """
+    margin = max(0, int(margin))
+    try:
+        from cbhcli_pkg.core.ui.shell import get_active_ui
+        ui = get_active_ui()
+        if ui is not None:
+            return max(20, ui.text_width() - margin)
+    except Exception:
+        pass
+    try:
+        import os
+        return max(20, os.get_terminal_size().columns - margin)
+    except Exception:
+        return max(20, 79)
+
+
 def install_prompt_toolkit_patch():
     """替换 prompt_toolkit 全局字符宽度缓存为字素簇感知版本
 

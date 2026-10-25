@@ -98,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.4.2")
+app = FastAPI(title="CBHCLI Web", version="5.5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -111,31 +111,55 @@ app.add_middleware(
 
 # ===================================================================
 #  认证系统（v5.4.0）：全局中间件 + 本机登录代理端点
+#  v5.4.4：新增页面锁（设备已登录时，浏览器需输入该账号密钥才能访问）
 # ===================================================================
 
-# 无需登录即可访问的前缀（登录端点；静态资源非 /api/ 前缀单独放行）
+# 设备未登录时可访问的前缀（登录端点；静态资源非 /api/ 前缀单独放行）
 _AUTH_FREE_PREFIXES = ("/api/auth/",)
+# 页面锁自身端点（设备已登录/未登录均放行）
+_PAGE_FREE_PREFIXES = ("/api/web_auth/",)
+# 设备已登录但页面未解锁时仍放行的端点（只读、无敏感数据；status 内部脱敏）
+_PAGE_PUBLIC_PATHS = ("/api/auth/status", "/api/auth/ping")
 
 
 def _install_auth_middleware(app):
-    """全局认证中间件：业务 API 未登录一律 401（前端捕获后显示登录视图）。
+    """全局认证中间件：设备级凭据 + 页面级凭据（页面锁，v5.4.4）。
 
-    - 放行: /api/auth/*（登录相关）与非 /api/ 路径（静态资源/页面）
-    - 凭据检查带 2s mtime 短缓存（is_logged_in_fast），几乎零开销
-    - 登录成功后中间件即时放行（下个请求即生效，无需重启）
+    两层：
+    1. 设备未登录 -> 业务 API 401 not_logged_in（前端显示登录视图，行为不变）
+    2. 设备已登录 -> 业务 API 需要页面 cookie，未解锁 401 page_locked
+       - /api/web_auth/* 放行（解锁端点）
+       - /api/auth/status、/api/auth/ping 放行（status 锁定时脱敏）
+       - 其余（含 /api/auth/login、/api/auth/logout）必须已解锁，
+         防止未解锁的浏览器覆盖设备身份或把设备踢下线
     """
 
     @app.middleware("http")
     async def _auth_middleware(request, call_next):
         try:
             path = request.url.path
-            if path.startswith(_AUTH_FREE_PREFIXES) or not path.startswith("/api/"):
-                return await call_next(request)
+            if not path.startswith("/api/"):
+                return await call_next(request)   # 静态资源 / 页面
             from cbhcli_pkg.auth import is_logged_in_fast
             if not is_logged_in_fast():
+                # 设备未登录：维持 v5.4.0 行为
+                if (path.startswith(_AUTH_FREE_PREFIXES)
+                        or path.startswith(_PAGE_FREE_PREFIXES)):
+                    return await call_next(request)
                 return JSONResponse(
                     {"error": "not_logged_in",
                      "message": "本机未登录 cbhcli，请在登录界面完成登录"},
+                    status_code=401)
+
+            # 设备已登录：页面锁
+            if (path.startswith(_PAGE_FREE_PREFIXES)
+                    or path in _PAGE_PUBLIC_PATHS):
+                return await call_next(request)
+            from cbhcli_pkg.web import page_auth
+            if not page_auth.is_unlocked(request.cookies):
+                return JSONResponse(
+                    {"error": "page_locked",
+                     "message": "需要输入认证密钥解锁本页面"},
                     status_code=401)
         except Exception:
             pass  # 认证系统故障绝不影响 Web 服务
@@ -145,13 +169,25 @@ def _install_auth_middleware(app):
 # ---- 本机登录代理端点（浏览器内完成登录，无需命令行） ----
 
 @app.get("/api/auth/status")
-def auth_status_endpoint():
-    """本机登录状态（前端启动时判断显示登录视图或主界面）。"""
+def auth_status_endpoint(request: Request):
+    """本机登录状态（前端启动时判断显示登录视图或主界面）。
+
+    v5.4.4：页面锁未解锁时只返回最小信息（不暴露身份/策略信息）。
+    """
     try:
         from cbhcli_pkg.auth import auth_status
         st = auth_status()
     except Exception as e:
         return {"logged_in": False, "error": str(e)}
+    # v5.4.4：页面锁未解锁 -> 脱敏
+    try:
+        from cbhcli_pkg.web import page_auth
+        if page_auth.gate_enabled() and not page_auth.is_unlocked(request.cookies):
+            return {"logged_in": bool(st.get("logged_in")),
+                    "expired": bool(st.get("expired")),
+                    "page_locked": True}
+    except Exception:
+        pass
     # 在线状态：尽力探测（异步意义不大，短超时）
     online = False
     try:
@@ -222,10 +258,94 @@ async def auth_logout_endpoint():
     try:
         from cbhcli_pkg.auth.login_cmd import perform_logout
         result = perform_logout()
+        # v5.4.4：设备登出 -> 全部页面会话一并失效
+        try:
+            from cbhcli_pkg.web import page_auth
+            page_auth.revoke_all()
+        except Exception:
+            pass
         return {"ok": True, "message": result.get("message", "已退出登录")}
     except Exception as e:
         return JSONResponse({"ok": False, "error": "server_error",
                              "message": str(e)}, status_code=500)
+
+
+# ---- 页面锁端点（v5.4.4）：浏览器输入密钥解锁 Web 页面 ----
+
+def _page_client_ip(request: Request) -> str:
+    """页面解锁限流用客户端 IP（X-Forwarded-For 优先）。"""
+    try:
+        fwd = request.headers.get("x-forwarded-for", "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        return request.client.host if request.client else ""
+    except Exception:
+        return ""
+
+
+@app.get("/api/web_auth/status")
+def web_auth_status_endpoint(request: Request):
+    """页面锁状态：gate_enabled / unlocked（未解锁不返回身份信息）。"""
+    try:
+        from cbhcli_pkg.web import page_auth
+        return page_auth.status(request.cookies)
+    except Exception as e:
+        return {"gate_enabled": False, "unlocked": True, "error": str(e)}
+
+
+@app.post("/api/web_auth/login")
+async def web_auth_login_endpoint(req: Request):
+    """页面解锁：验证【本机当前登录账号】的认证密钥，成功后写 HttpOnly cookie。
+
+    - 设备未登录 -> ok=False, error=not_logged_in（前端应显示设备登录视图）
+    - 密钥属于其他账号 -> ok=False, error=wrong_user
+    - 成功 -> Set-Cookie（session cookie，关闭浏览器失效；服务端 24h 滑动过期）
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    key = (body or {}).get("key", "") or ""
+    try:
+        from cbhcli_pkg.web import page_auth
+        result = page_auth.unlock(key, ip=_page_client_ip(req))
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "server_error",
+                             "message": str(e)}, status_code=200)
+    if not result.get("ok"):
+        return JSONResponse({"ok": False,
+                             "error": result.get("error", "invalid_key"),
+                             "message": result.get("message", "")},
+                            status_code=200)
+    token = result.pop("token", "")
+    resp = JSONResponse({"ok": True, "user": result.get("user") or {},
+                         "ttl_seconds": result.get("ttl_seconds", 0)})
+    resp.set_cookie(
+        key=page_auth.COOKIE_NAME, value=token,
+        max_age=None,                       # session cookie：关闭浏览器失效
+        httponly=True,
+        samesite="lax",
+        path="/",
+        secure=(req.url.scheme == "https"),
+    )
+    return resp
+
+
+@app.post("/api/web_auth/logout")
+def web_auth_logout_endpoint(request: Request):
+    """锁定此浏览器：吊销页面会话 + 清 cookie。"""
+    try:
+        from cbhcli_pkg.web import page_auth
+        page_auth.revoke_session(page_auth.token_from_cookie(request.cookies))
+    except Exception:
+        pass
+    resp = JSONResponse({"ok": True})
+    try:
+        from cbhcli_pkg.web import page_auth
+        resp.delete_cookie(key=page_auth.COOKIE_NAME, path="/")
+    except Exception:
+        pass
+    return resp
 
 
 # ===================================================================
@@ -2716,6 +2836,15 @@ async def ws_endpoint(websocket: WebSocket):
       {"type": "notice", data: {...}}                   全局通知（会话状态等）
       {"type": "pong"}
     """
+    # v5.4.4：页面锁（HTTP 中间件不覆盖 WebSocket，必须单独校验）
+    try:
+        from cbhcli_pkg.web import page_auth
+        if page_auth.gate_enabled() and not page_auth.is_unlocked(websocket.cookies):
+            await websocket.accept()
+            await websocket.close(code=4401, reason="page_locked")
+            return
+    except Exception:
+        pass
     await websocket.accept()
     client = _WsClient(websocket)
     _ws_clients.add(client)
@@ -5192,12 +5321,15 @@ def run_server(port: int = 18888, host: str = "0.0.0.0"):
     from cbhcli_pkg import __version__
     print(f"CBHCLI Web v{__version__}")
 
-    # 未登录提示（服务照常启动，页面内完成登录）
+    # 未登录提示（服务照常启动，页面内完成登录）；已登录则提示页面锁
     try:
         from cbhcli_pkg.auth import is_logged_in_fast
         if not is_logged_in_fast():
-            print("🔐 本机尚未登录 cbhcli — 请在打开的页面中完成登录，"
+            print("● 本机尚未登录 cbhcli — 请在打开的页面中完成登录，"
                   "或运行 cbhcli login")
+        else:
+            print("● Web 页面已启用访问密钥验证 — 浏览器首次访问需输入"
+                  "本机登录账号的认证密钥解锁（24 小时无操作后重新验证）")
     except Exception:
         pass
 

@@ -131,11 +131,22 @@ def install_toolbar_display_fix():
 
 
 # 模块导入时立即安装字素簇宽度补丁（必须在任何 prompt_toolkit 渲染之前）
+# 全屏/内联都需要（emoji/CJK 宽度是渲染层的通用问题）
 install_prompt_toolkit_patch()
-# 安装 resize 防抖补丁（修复窗口大小连续变化时输入框重复显示）
-install_resize_fix()
-# 安装底部工具栏即时显示补丁（修复状态栏偶尔不显示）
-install_toolbar_display_fix()
+
+# 以下两个补丁只针对"内联 PromptSession + 相对擦除"：
+#   - resize_fix：估算区域位置修复 resize 残留 ❯
+#   - toolbar fix：CPR 未返回时状态栏整轮不显示
+# 全屏模式（CBHCLI_UI=fullscreen）不使用 PromptSession，故跳过（P7 清理）
+try:
+    from cbhcli_pkg.core.ui.sink import ui_mode as _ui_mode
+    _INLINE_PATCHES = _ui_mode() != "fullscreen"
+except Exception:
+    _INLINE_PATCHES = True
+
+if _INLINE_PATCHES:
+    install_resize_fix()
+    install_toolbar_display_fix()
 
 
 class SlashCommandCompleter(Completer):
@@ -181,6 +192,36 @@ class SlashCommandCompleter(Completer):
             )
 
 
+# 聊天输入框配色（唯一来源，H-11：全屏输入区/状态栏必须复用同一份）
+CHAT_INPUT_STYLE_DICT = {
+    'prompt': 'bold #00d7ff',
+    'bottom-toolbar': 'noinherit bg:#1c1e24 #999999',
+    'bottom-toolbar.label': 'bold #ffffff bg:#1c1e24',
+    'bottom-toolbar.model': 'bold #00d7ff bg:#1c1e24',
+    'bottom-toolbar.ctx': '#ffd75f bg:#1c1e24',
+    'bottom-toolbar.agent': '#ff87d7 bg:#1c1e24',
+    'bottom-toolbar.chain': 'bold #ffaf00 bg:#1c1e24',
+    'bottom-toolbar.skills': '#87ff87 bg:#1c1e24',
+    'bottom-toolbar.cwd': '#87afff bg:#1c1e24',
+    'bottom-toolbar.sep': '#444444 bg:#1c1e24',
+    # 权限模式指示（Shift+Tab 切换）
+    'bottom-toolbar.mode-readonly': 'bold #87afff bg:#1c1e24',
+    'bottom-toolbar.mode-standard': 'bold #87ff87 bg:#1c1e24',
+    'bottom-toolbar.mode-auto': 'bold #ffd75f bg:#1c1e24',
+    'bottom-toolbar.mode-yolo': 'bold #ff5f5f bg:#1c1e24',
+    # 上下文占用条（D6-14）
+    'bottom-toolbar.bar-ok': '#87ff87 bg:#1c1e24',
+    'bottom-toolbar.bar-warn': '#ffd75f bg:#1c1e24',
+    'bottom-toolbar.bar-hot': '#ff5f5f bg:#1c1e24',
+    'bottom-toolbar.bar-empty': '#444444 bg:#1c1e24',
+    'completion-menu': 'bg:#333333',
+    'completion-menu.completion': 'bg:#333333 #cccccc',
+    'completion-menu.completion.current': 'bold bg:#00bcd4 #000000',
+    'completion-menu.meta.completion': 'bg:#333333 #888888',
+    'completion-menu.meta.completion.current': 'bg:#00bcd4 #444444',
+}
+
+
 class ChatInputBox:
     """聊天输入框 — 无边框设计，基于 prompt_toolkit 原生补全
 
@@ -207,28 +248,8 @@ class ChatInputBox:
         self._completer = SlashCommandCompleter(cmd_helper)
 
         # 样式（高对比配色，每项信息有独立图标+颜色标识）
-        self._style = Style.from_dict({
-            'prompt': 'bold #00d7ff',
-            'bottom-toolbar': 'noinherit bg:#1c1e24 #999999',
-            'bottom-toolbar.label': 'bold #ffffff bg:#1c1e24',
-            'bottom-toolbar.model': 'bold #00d7ff bg:#1c1e24',
-            'bottom-toolbar.ctx': '#ffd75f bg:#1c1e24',
-            'bottom-toolbar.agent': '#ff87d7 bg:#1c1e24',
-            'bottom-toolbar.chain': 'bold #ffaf00 bg:#1c1e24',
-            'bottom-toolbar.skills': '#87ff87 bg:#1c1e24',
-            'bottom-toolbar.cwd': '#87afff bg:#1c1e24',
-            'bottom-toolbar.sep': '#444444 bg:#1c1e24',
-            # 权限模式指示（Shift+Tab 切换）
-            'bottom-toolbar.mode-readonly': 'bold #87afff bg:#1c1e24',
-            'bottom-toolbar.mode-standard': 'bold #87ff87 bg:#1c1e24',
-            'bottom-toolbar.mode-auto': 'bold #ffd75f bg:#1c1e24',
-            'bottom-toolbar.mode-yolo': 'bold #ff5f5f bg:#1c1e24',
-            'completion-menu': 'bg:#333333',
-            'completion-menu.completion': 'bg:#333333 #cccccc',
-            'completion-menu.completion.current': 'bold bg:#00bcd4 #000000',
-            'completion-menu.meta.completion': 'bg:#333333 #888888',
-            'completion-menu.meta.completion.current': 'bg:#00bcd4 #444444',
-        })
+        # 注意：字典已提取为模块级 CHAT_INPUT_STYLE_DICT（H-11 单一来源）
+        self._style = Style.from_dict(CHAT_INPUT_STYLE_DICT)
 
         # 快捷键
         self._bindings = KeyBindings()
@@ -239,7 +260,7 @@ class ChatInputBox:
             style=self._style,
             key_bindings=self._bindings,
             completer=self._completer,
-            complete_style='multi_column',  # 多列补全菜单
+            complete_style='column',  # 单列补全菜单（命令行按一列显示）
             multiline=True,
             complete_while_typing=True,
             erase_when_done=True,  # 提交后自动清除输入行，避免与白底回显重复
@@ -301,7 +322,13 @@ class ChatInputBox:
                               f"（含 rm/git push），deny 红线降级为警告。 \033[0m")
                         print(f"\033[2m   3 秒内再按一次 Shift+Tab 确认进入 YOLO，"
                               f"否则保持在 {old_mode} 模式\033[0m")
-                    run_in_terminal(_warn)
+
+                    # 全屏 TUI：写主区（X-01）；旧内联模式：run_in_terminal
+                    from cbhcli_pkg.core.ui.shell import get_active_ui
+                    if get_active_ui() is not None:
+                        _warn()
+                    else:
+                        run_in_terminal(_warn)
                     event.app.invalidate()
                     return
                 self._yolo_pending_at = 0  # 确认，清除暂存
@@ -314,7 +341,12 @@ class ChatInputBox:
             def _notice():
                 print(f"\n{meta['icon']} 权限模式: {old_mode} → {new_mode}"
                       f" — {meta['desc']}")
-            run_in_terminal(_notice)
+
+            from cbhcli_pkg.core.ui.shell import get_active_ui
+            if get_active_ui() is not None:
+                _notice()
+            else:
+                run_in_terminal(_notice)
             event.app.invalidate()
 
     def _build_toolbar(self):
@@ -326,21 +358,32 @@ class ChatInputBox:
         """
         app = self._app
 
-        # 模型名
+        # 模型名（显示配置名称：同一模型 ID 可有多份不同参数的配置）
         model_name = "未配置模型"
-        if app.llm_client and hasattr(app.llm_client, 'model_name'):
+        if app.llm_client and hasattr(app.llm_client, 'config_name'):
+            model_name = app.llm_client.config_name
+        elif app.llm_client and hasattr(app.llm_client, 'model_name'):
             model_name = app.llm_client.model_name
         elif app.current_agent_config and app.current_agent_config.primary_model:
             model_name = app.current_agent_config.primary_model
 
-        # 上下文信息
+        # 上下文信息（D6-14：条 + 数值文本；500ms 节流，禁止每帧全量分词）
+        import time as _time
         ctx_info = ""
+        ctx_pct = 0.0
         if app.session and app.context_window:
-            total_tokens = app.session.get_total_tokens(app.token_counter)
-            app.context_window.update(total_tokens)
-            pct = app.context_window.usage_percentage() * 100
-            limit = app.context_window.model_limit
+            now = _time.monotonic()
+            ts, c_tokens, c_limit, c_pct = getattr(
+                self, "_ctx_cache", (0.0, 0, 0, 0.0))
+            if now - ts >= 0.5 or c_limit <= 0:
+                c_tokens = app.session.get_total_tokens(app.token_counter)
+                app.context_window.update(c_tokens)
+                c_pct = app.context_window.usage_percentage() * 100
+                c_limit = app.context_window.model_limit
+                self._ctx_cache = (now, c_tokens, c_limit, c_pct)
+            total_tokens, limit, pct = c_tokens, c_limit, c_pct
             ctx_info = f"{total_tokens:,}/{limit:,} ({pct:.1f}%)"
+            ctx_pct = pct
 
         # 当前路径（完整显示，仅将家目录缩写为 ~，不做省略截断）
         import os
@@ -381,8 +424,25 @@ class ChatInputBox:
         blocks.append([("class:bottom-toolbar.label", "模型: "),
                        ("class:bottom-toolbar.model", model_name)])
         if ctx_info:
-            blocks.append([("class:bottom-toolbar.label", "上下文: "),
-                           ("class:bottom-toolbar.ctx", ctx_info)])
+            # D6-14：10 格占用条（█/░），阈值 60%/80%；数值文本保持原色
+            filled = int(round(ctx_pct / 10))
+            if ctx_pct > 0 and filled < 1:
+                filled = 1
+            filled = max(0, min(10, filled))
+            if ctx_pct >= 80:
+                bar_cls = "bottom-toolbar.bar-hot"
+            elif ctx_pct >= 60:
+                bar_cls = "bottom-toolbar.bar-warn"
+            else:
+                bar_cls = "bottom-toolbar.bar-ok"
+            block = [("class:bottom-toolbar.label", "上下文: ")]
+            if filled:
+                block.append((f"class:{bar_cls}", "█" * filled))
+            if filled < 10:
+                block.append(("class:bottom-toolbar.bar-empty",
+                              "░" * (10 - filled)))
+            block.append(("class:bottom-toolbar.ctx", " " + ctx_info))
+            blocks.append(block)
         if agent:
             # 链条绑定时显示链条路径，否则显示普通 Agent 名
             chain = getattr(app, '_active_chain', None)
@@ -472,6 +532,16 @@ class ChatInputBox:
         """
         if len(block) < 2:
             return block
+        if len(block) > 2:
+            # 多片段块（如上下文条：标签+填充+空白+数值）：超宽时退化为
+            # "标签 + 截断纯文本"，避免只截到条形图而丢失数值
+            label = block[0]
+            value_text = "".join(t for _, t in block[1:]).lstrip()
+            budget = limit - display_width(label[1])
+            if budget < 4:
+                return [label]
+            return [label, ("class:bottom-toolbar.ctx",
+                            _ellipsize_middle(value_text, budget))]
         label, value = block[0], block[1]
         budget = limit - display_width(label[1])
         if budget < 4:

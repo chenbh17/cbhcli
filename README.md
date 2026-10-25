@@ -1,10 +1,18 @@
-# CBHCLI v5.4.2 - AI驱动的终端助手
+# CBHCLI v5.5.1 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
 ## 特性
 
 ### 核心功能
+- **全屏 TUI（v5.5.0，默认界面）** - 主区滚动历史 + 固定输入区 + 底部状态栏（含上下文占用条 `█░`）：思考窗口/工具输出/spinner 全部在主区内按新宽度重排，终端 resize 不再依赖"估算行数 + 相对擦除"；命令向导、工具确认、`ask_user`、`/login` 密钥均为应用内模态（菜单可见、密码不回显）；`Ctrl+C` 五级状态机（模态 > 工具 > AI 请求 > 命令 > 空闲）；退出时回填最近 200 行 + 完整 transcript 落盘（`~/.cbhcli/agents/<agent>/history/transcripts/`）；`CBHCLI_UI=legacy` 可切回旧内联界面
+- **v5.5.1 修复与体验（2026-10-25）**：
+  - **上下文压缩重写**：按 user 消息边界切分"轮"（不再按"轮数×2 条消息"估算）→ 保留**最近 N 轮用户请求**及其完整工具链，预算不足时**优先牺牲最早轮**；压缩目标自适应（不小于系统提示+摘要下限+最小保留，且 ≤ 窗口 70%）；压缩后消息顺序固定为「主系统提示 → 摘要 system → 保留轮」，符合严格 API 的 `system must be at the beginning`；
+  - **修复压缩后 API 400 `Invalid \uXXXX escape`**：旧实现按字符截断工具参数会把 JSON 切断 → 现改为**结构化截断**（保证合法 JSON），并在发送前对 `tool_calls.arguments` 做合法性自愈；
+  - **修复 `/comp` 误报"上下文较短"**：轮数不多但上下文很长时也能压缩（自动让出最早轮），失败时给出具体原因；
+  - **所有 rich 渲染按主区宽度出图**（Markdown 正文/代码预览/子Agent状态板/欢迎面板/思考窗）：统一 `text_width.render_width()`，杜绝"最右 1~2 列被折到下一行左侧"的错行；
+  - **选区保护**：鼠标操作后 0.6s 内不重绘（终端收到输出会清掉原生选区）；关闭 `?1015` 只保留滚轮+点击；
+  - **滚动跟随**：发送消息自动回到底部；手动上翻保持阅读位置（新内容到达时同步补偿）；25s 无操作自动回到底部。
 - **多Agent管理** - 创建和管理多个AI助手Agent，每个Agent有独立的工作空间和人格配置
 - **工具调用系统** - 基于 OpenAI Function Calling 协议，AI自动调用工具执行任务
 - **MCP协议支持** - 连接外部工具服务器，扩展AI的工具能力
@@ -161,6 +169,25 @@ cbhcli exec --output-format json "..." | jq .result         # 结构化输出供
 - **多模型支持** - 配置多个OpenAI兼容的AI模型，随时切换
 - **备用模型自动切换** - 主模型断网/异常时自动切换到备用模型继续任务，视觉模型同理
 
+## 界面模式（v5.5.0）
+
+| 档位 | 启用方式 | 说明 |
+|---|---|---|
+| **fullscreen（默认）** | 直接运行 `cbhcli` | 全屏 TUI：主区滚动 + 固定输入区 + 状态栏；思考/工具/spinner 统一在主区重排；应用内模态处理向导与确认；退出回填最近 200 行 + transcript |
+| legacy | `CBHCLI_UI=legacy cbhcli` | 旧内联界面（PromptSession + 相对擦除），保留全部旧行为，用于对照/降级 |
+| sink | `CBHCLI_UI=sink cbhcli` | 诊断用：仅安装输出代理（字节级透传），界面与 legacy 相同 |
+
+- **非 TTY / `TERM=dumb` 自动回退 legacy**（管道、CI、`exec` 不受影响）。
+- transcript 路径：`~/.cbhcli/agents/<agent>/history/transcripts/<日期>_<会话ID>.log`（0600，思考/spinner 不写入）。
+- 主区滚动：**鼠标滚轮**（每次 3 行）、`PgUp/PgDn`、`Ctrl+Home/End`，`Ctrl+L` 清空主区。
+- 选中文本：鼠标捕获期间按住 **Shift 再拖动**（终端原生选中）——**先松开鼠标左键，再松开 Shift**（反过来终端会取消选区）。
+- **不再提供 F2 开关/无鼠标模式**：滚轮始终开启；`CBHCLI_MOUSE` 与 `~/.cbhcli/ui.json` 已不再使用。
+- 命令补全菜单为**单列显示**（一行一个命令，不再多列平铺）。
+- 每轮对话结束会自动整屏重绘一次（清除渲染残格）；若当时正在拖选（左键按下/刚有鼠标动作）会自动顺延，避免清掉你的选区。
+- 状态栏：会话正在执行（AI 请求 / 命令）时，最左侧显示**动态 spinner + `运行中`**（`⠋⠙⠹⠸…`，约 1 秒转一圈），空闲后自动消失；**交互式提问（/resume、/model、/login 等）等待输入时不显示**。
+- 交互提问：提示与输入在同一行（`模型名称: 输入内容`），与旧 PromptSession 一致。
+- 退出时显式复位鼠标协议（`1000/1002/1003/1006/1015/1007`），恢复原终端滚轮与拖选。
+
 ## 安装
 
 ### 前置要求
@@ -181,7 +208,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.4.2-py3-none-any.whl
+pip install dist/cbhcli-5.5.1-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -224,6 +251,16 @@ cbhcli --version
 /model list    # 查看已配置的模型
 /model use     # 交互式选择模型
 ```
+
+> **同一模型 ID 可配置多份不同参数**（例如一个开启思考、一个关闭思考，
+> 或不同 temperature / max_tokens）：`/model add` 时**名称填不同**（如
+> `deepseek-flash-有思考` / `deepseek-flash-无思考`），**模型 ID 填同一个**即可。
+>
+> - 「模型名称」是模型配置的唯一标识：`/model use`、`/fallback`、`/agent` 选模型
+>   以及 Web/Jupyter 的模型选择器都按名称区分
+> - `/model list` 的「◀ 当前使用」标记、底部状态栏的「模型:」、欢迎面板与 `/ctx`
+>   显示的都是**当前使用的配置名称**（`/model info` 中另行列示真实的模型 ID）
+> - 注意：`thinking=off` 时不能配置 `reasoning_effort`（DeepSeek 等 API 会返回 400）
 
 ### 2. 创建Agent
 ```

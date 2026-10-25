@@ -40,6 +40,39 @@ _session = PromptSession(
 )
 
 
+# 全屏 UI 的 SUSPEND 钩子（P4）：由 CBHCLIApp 在进入全屏模式时注入。
+# 作用：全屏 TUI 运行时，交互式提问需要临时让出 alt screen 才能用旧 PromptSession。
+# 签名: (fn) -> fn 的返回值；fn 无参，内部执行真正的提问。
+_suspend_hook = None
+
+# 全屏 UI 的应用内模态钩子（P5b）：签名 (prompt, password: bool) -> str | None
+# 返回 None = 用户取消；钩子只在 UI 运行期间注入。
+_modal_hook = None
+
+
+def set_suspend_hook(hook) -> None:
+    """注入/清除全屏 SUSPEND 钩子（None 表示普通模式）"""
+    global _suspend_hook
+    _suspend_hook = hook
+
+
+def set_modal_hook(hook) -> None:
+    """注入/清除应用内模态钩子（None 表示普通模式）"""
+    global _modal_hook
+    _modal_hook = hook
+
+
+def _prompt_raw(prompt: str):
+    return _session.prompt(_to_formatted(prompt))
+
+
+def _prompt_via_hook(prompt: str):
+    """全屏模式下经 SUSPEND 执行旧 PromptSession；否则直接提问"""
+    if _suspend_hook is not None:
+        return _suspend_hook(lambda: _prompt_raw(prompt))
+    return _prompt_raw(prompt)
+
+
 def _to_formatted(prompt: str):
     """将提示文本转换为 prompt_toolkit formatted text
 
@@ -67,11 +100,37 @@ def ask_text(prompt: str = "", default: str = "") -> str:
         用户输入（已 strip）；空输入返回 default
     """
     try:
-        result = _session.prompt(_to_formatted(prompt))
+        if _modal_hook is not None:
+            raw = _modal_hook(prompt, False)
+            if raw is None:
+                return default
+            result = raw.strip()
+            return result if result else default
+        result = _prompt_via_hook(prompt)
         result = result.strip()
         return result if result else default
     except (EOFError, KeyboardInterrupt):
         return default
+
+
+def ask_secret(prompt: str = "") -> str:
+    """密钥输入（不回显，契约 D7-05）
+
+    - 全屏 UI：应用内 password 模态（Q-02 = A）
+    - 普通终端：getpass（读 /dev/tty）
+    - 非 TTY：回退普通输入
+    """
+    if _modal_hook is not None:
+        raw = _modal_hook(prompt, True)
+        return "" if raw is None else raw.strip()
+    try:
+        import sys
+        import getpass
+        if sys.stdin.isatty():
+            return getpass.getpass(prompt).strip()
+    except Exception:
+        pass
+    return _prompt_via_hook(prompt).strip()
 
 
 def ask_text_or_none(prompt: str = "") -> "str | None":
@@ -84,6 +143,11 @@ def ask_text_or_none(prompt: str = "") -> "str | None":
         用户输入（已 strip，可能为空字符串）；EOF/Ctrl+C 取消时返回 None
     """
     try:
-        return _session.prompt(_to_formatted(prompt)).strip()
+        if _modal_hook is not None:
+            raw = _modal_hook(prompt, False)
+            if raw is None:
+                return None
+            return raw.strip()
+        return _prompt_via_hook(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         return None

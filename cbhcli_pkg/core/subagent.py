@@ -533,9 +533,11 @@ class _SubAgentLiveBoard:
     def __init__(self, statuses: list[dict], lock: threading.Lock):
         from rich.console import Console
         from rich.live import Live
+        from cbhcli_pkg.core.text_width import render_width
         self._statuses = statuses
         self._lock = lock
-        self._console = Console()
+        # v5.5.1：按主区可用宽度渲染（终端满宽会超出 2 列 → 错行）
+        self._console = Console(width=render_width(1))
         self._live = Live(
             self, console=self._console,
             refresh_per_second=4, transient=True,
@@ -556,6 +558,13 @@ class _SubAgentLiveBoard:
     def __rich_console__(self, console, options):
         from rich.table import Table
         from rich.text import Text
+
+        # v5.5.1：每次渲染刷新宽度（resize 后仍贴合主区）
+        try:
+            from cbhcli_pkg.core.text_width import render_width
+            console.width = render_width(1)
+        except Exception:
+            pass
 
         with self._lock:
             snapshot = [dict(s) for s in self._statuses]
