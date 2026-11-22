@@ -536,7 +536,8 @@ class AdminStore:
 
     def list_sessions(self, user_id: str = "", status: str = "", q: str = "",
                       from_ts: float = 0, to_ts: float = 0,
-                      limit: int = 100, offset: int = 0) -> tuple:
+                      limit: int = 100, offset: int = 0,
+                      uname: str = "", disp: str = "", agent: str = "") -> tuple:
         """会话列表（筛选/分页）-> (items, total)"""
         where, params = [], []
         if user_id:
@@ -550,6 +551,15 @@ class AdminStore:
                          " OR s.agent LIKE ? OR s.workspace LIKE ?)")
             like = f"%{q}%"
             params += [like, like, like, like]
+        if uname:
+            where.append("u.name LIKE ?")
+            params.append(f"%{uname}%")
+        if disp:
+            where.append("u.display_name LIKE ?")
+            params.append(f"%{disp}%")
+        if agent:
+            where.append("s.agent LIKE ?")
+            params.append(f"%{agent}%")
         if from_ts:
             where.append("s.last_heartbeat>=?")
             params.append(float(from_ts))
@@ -557,12 +567,12 @@ class AdminStore:
             where.append("s.last_heartbeat<=?")
             params.append(float(to_ts))
         wsql = (" WHERE " + " AND ".join(where)) if where else ""
+        base = " FROM sessions s LEFT JOIN users u ON u.id = s.user_id"
         total = self._query_one(
-            f"SELECT COUNT(*) AS c FROM sessions s{wsql}", params)
+            f"SELECT COUNT(*) AS c{base}{wsql}", params)
         rows = self._query(
             f"SELECT s.*, u.name AS user_name, u.display_name AS user_display"
-            f" FROM sessions s LEFT JOIN users u ON u.id = s.user_id"
-            f"{wsql} ORDER BY s.updated_at DESC, s.last_heartbeat DESC"
+            f"{base}{wsql} ORDER BY s.updated_at DESC, s.last_heartbeat DESC"
             f" LIMIT ? OFFSET ?", params + [int(limit), int(offset)])
         return rows, int((total or {}).get("c", 0) or 0)
 

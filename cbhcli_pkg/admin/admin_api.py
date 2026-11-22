@@ -456,12 +456,13 @@ async def user_key(user_id: str, request: Request):
 @router.get("/sessions")
 async def list_sessions(request: Request, user_id: str = "", status: str = "",
                         q: str = "", from_ts: float = 0, to_ts: float = 0,
-                        limit: int = 100, offset: int = 0):
+                        limit: int = 100, offset: int = 0,
+                        uname: str = "", disp: str = "", agent: str = ""):
     if (r := _guard(request)):
         return r
     rows, total = get_store().list_sessions(
         user_id=user_id, status=status, q=q, from_ts=from_ts, to_ts=to_ts,
-        limit=limit, offset=offset)
+        limit=limit, offset=offset, uname=uname, disp=disp, agent=agent)
     # 运行中以内存注册表为准（数据库保留最近状态）
     snap = live.live_snapshot()
     live_ids = {s["session_id"] for s in snap["running_sessions"]}
@@ -603,11 +604,13 @@ async def export_events(request: Request, type: str = "", user_id: str = "",
 
 @router.get("/export/sessions.csv")
 async def export_sessions(request: Request, user_id: str = "", status: str = "",
-                          q: str = ""):
+                          q: str = "", uname: str = "", disp: str = "",
+                          agent: str = ""):
     if (r := _guard(request)):
         return r
     rows, _ = get_store().list_sessions(
-        user_id=user_id, status=status, q=q, limit=100000, offset=0)
+        user_id=user_id, status=status, q=q, limit=100000, offset=0,
+        uname=uname, disp=disp, agent=agent)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["用户", "会话ID", "Agent", "标题", "模型", "工作空间",

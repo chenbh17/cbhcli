@@ -35,7 +35,7 @@ const state = {
   navSeq: 0,                 // 导航代数（异步竞态保护）
   users: [],                 // 用户列表缓存（筛选下拉）
   eventTypes: null,          // 事件类型缓存
-  sess: { userId: "", status: "", q: "", page: 0, total: 0, lastSig: "" },      // 会话筛选
+  sess: { userId: "", status: "", q: "", uname: "", disp: "", agent: "", page: 0, total: 0, lastSig: "" },      // 会话筛选
   audit: { tab: "events", page: 0, type: "", userId: "", range: 0, total: 0,
            // v5.4.2：三级分层（用户级 → 会话级 → 明细级）
            level: "users",        // users | sessions | events
@@ -1157,7 +1157,7 @@ function loadDashboard(seq) {
    9. 用户管理（#/users）
    =================================================================== */
 
-const usersUI = { built: false, tbody: null };
+const usersUI = { built: false, tbody: null, qName: null, qDisplay: null };
 
 function buildUsersView() {
   if (usersUI.built) return;
@@ -1165,6 +1165,8 @@ function buildUsersView() {
   const root = $("#view-users");
   clear(root);
   usersUI.tbody = el("tbody", { id: "users-tbody" });
+  usersUI.qName = el("input", { class: "input", placeholder: "用户名 / 用户ID…", style: "width:180px;", oninput: () => renderUsersTable() });
+  usersUI.qDisplay = el("input", { class: "input", placeholder: "显示名…", style: "width:180px;", oninput: () => renderUsersTable() });
 
   const headers = ["用户名", "显示名", "状态", "最后登录", "最后活跃", "密钥", "有效期", "操作"];
   root.append(
@@ -1175,6 +1177,10 @@ function buildUsersView() {
       el("div", { class: "page-actions" },
         el("button", { class: "btn btn-sm", type: "button", onclick: () => refreshUsers(true) }, "🔄 刷新"),
         el("button", { class: "btn btn-primary btn-sm", type: "button", onclick: openCreateUserModal }, "＋ 创建用户"))),
+    el("div", { class: "filter-bar" },
+      el("span", { class: "filter-label" }, "用户"), usersUI.qName,
+      el("span", { class: "filter-label" }, "显示名"), usersUI.qDisplay,
+      el("button", { class: "btn btn-sm", type: "button", onclick: () => { usersUI.qName.value = ""; usersUI.qDisplay.value = ""; renderUsersTable(); } }, "清空")),
     el("div", { class: "table-wrap" },
       el("table", { class: "table" },
         el("thead", null, el("tr", null, ...headers.map(h => el("th", null, h)))),
@@ -1209,9 +1215,13 @@ function renderUsersTable() {
   const tbody = usersUI.tbody;
   if (!tbody) return;
   clear(tbody);
-  const users = state.users;
+  const qn = (usersUI.qName ? usersUI.qName.value : "").trim().toLowerCase();
+  const qd = (usersUI.qDisplay ? usersUI.qDisplay.value : "").trim().toLowerCase();
+  let users = state.users;
+  if (qn) users = users.filter(u => (u.name || "").toLowerCase().includes(qn) || String(u.id || "").toLowerCase().includes(qn));
+  if (qd) users = users.filter(u => (u.display_name || "").toLowerCase().includes(qd));
   if (!users.length) {
-    tbody.append(el("tr", null, el("td", { colspan: "8" }, emptyState("暂无用户，点击右上角「＋ 创建用户」", "👤"))));
+    tbody.append(el("tr", null, el("td", { colspan: "8" }, emptyState(state.users.length ? "未找到匹配的用户" : "暂无用户，点击右上角「＋ 创建用户」", state.users.length ? "🔍" : "👤"))));
     return;
   }
   for (const u of users) {
@@ -1624,7 +1634,7 @@ function openDeleteUserModal(u) {
    10. 会话管理（#/sessions）
    =================================================================== */
 
-const sessUI = { built: false, tbody: null, userSel: null, statusSel: null, qInput: null, pager: null, wsTimer: null };
+const sessUI = { built: false, tbody: null, userSel: null, statusSel: null, qInput: null, dispInput: null, unameInput: null, agentInput: null, pager: null, wsTimer: null };
 
 function buildSessionsView() {
   if (sessUI.built) return;
@@ -1638,12 +1648,17 @@ function buildSessionsView() {
     el("option", { value: "running" }, "running"),
     el("option", { value: "idle" }, "idle"));
   sessUI.qInput = el("input", { class: "input", id: "sess-q", placeholder: "标题 / 工作空间 / 会话ID…", style: "width:220px;" });
+  sessUI.dispInput = el("input", { class: "input", id: "sess-disp-q", placeholder: "显示名…", style: "width:130px;" });
+  sessUI.unameInput = el("input", { class: "input", id: "sess-uname-q", placeholder: "用户名…", style: "width:150px;" });
+  sessUI.agentInput = el("input", { class: "input", id: "sess-agent-q", placeholder: "Agent…", style: "width:120px;" });
   sessUI.tbody = el("tbody", { id: "sessions-tbody" });
   sessUI.pager = el("div", { class: "pager", id: "sessions-pager" });
 
   sessUI.userSel.addEventListener("change", () => { state.sess.userId = sessUI.userSel.value; state.sess.page = 0; refreshSessions().catch(e => toast(e.message, "error")); });
   sessUI.statusSel.addEventListener("change", () => { state.sess.status = sessUI.statusSel.value; state.sess.page = 0; refreshSessions().catch(e => toast(e.message, "error")); });
-  sessUI.qInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { state.sess.q = sessUI.qInput.value.trim(); state.sess.page = 0; refreshSessions().catch(err => toast(err.message, "error")); } });
+  sessUI.qInput.addEventListener("keydown", (e) => { if (e.key === "Enter") applySessSearch(); });
+  for (const inp of [sessUI.dispInput, sessUI.unameInput, sessUI.agentInput])
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") applySessSearch(); });
 
   const headers = ["用户", "Agent", "标题", "模型", "工作空间", "消息数", "状态", "创建时间", "最后活跃"];
   root.append(
@@ -1659,14 +1674,35 @@ function buildSessionsView() {
       el("span", { class: "filter-label" }, "用户"), sessUI.userSel,
       el("span", { class: "filter-label" }, "状态"), sessUI.statusSel,
       sessUI.qInput,
-      el("button", { class: "btn btn-sm btn-primary", type: "button", onclick: () => { state.sess.q = sessUI.qInput.value.trim(); state.sess.page = 0; refreshSessions().catch(e => toast(e.message, "error")); } }, "🔍 搜索"),
-      el("button", { class: "btn btn-sm", type: "button", onclick: () => { sessUI.qInput.value = ""; state.sess.q = ""; state.sess.page = 0; refreshSessions().catch(e => toast(e.message, "error")); } }, "清空")),
+      el("span", { class: "filter-label" }, "显示名"), sessUI.dispInput,
+      el("span", { class: "filter-label" }, "用户名"), sessUI.unameInput,
+      el("span", { class: "filter-label" }, "Agent"), sessUI.agentInput,
+      el("button", { class: "btn btn-sm btn-primary", type: "button", onclick: applySessSearch }, "🔍 搜索"),
+      el("button", { class: "btn btn-sm", type: "button", onclick: clearSessSearch }, "清空")),
 
     el("div", { class: "table-wrap" },
       el("table", { class: "table" },
         el("thead", null, el("tr", null, ...headers.map(h => el("th", null, h)))),
         sessUI.tbody)),
     sessUI.pager);
+}
+
+/** 搜索按钮 / Enter：把手动搜索框写入 state 并刷新（服务端模糊匹配） */
+function applySessSearch() {
+  state.sess.q = sessUI.qInput.value.trim();
+  state.sess.disp = sessUI.dispInput.value.trim();
+  state.sess.uname = sessUI.unameInput.value.trim();
+  state.sess.agent = sessUI.agentInput.value.trim();
+  state.sess.page = 0;
+  refreshSessions().catch(e => toast(e.message, "error"));
+}
+
+/** 清空全部手动搜索框（保留用户/状态下拉选择） */
+function clearSessSearch() {
+  for (const inp of [sessUI.qInput, sessUI.dispInput, sessUI.unameInput, sessUI.agentInput]) inp.value = "";
+  state.sess.q = ""; state.sess.disp = ""; state.sess.uname = ""; state.sess.agent = "";
+  state.sess.page = 0;
+  refreshSessions().catch(e => toast(e.message, "error"));
 }
 
 async function loadSessionsView(params, seq) {
@@ -1676,6 +1712,9 @@ async function loadSessionsView(params, seq) {
   fillUserSelect(sessUI.userSel, { value: state.sess.userId });
   sessUI.statusSel.value = state.sess.status;
   sessUI.qInput.value = state.sess.q;
+  sessUI.dispInput.value = state.sess.disp;
+  sessUI.unameInput.value = state.sess.uname;
+  sessUI.agentInput.value = state.sess.agent;
   try {
     await refreshSessions(false);
   } catch (e) {
@@ -1691,6 +1730,9 @@ function sessionsQuery() {
   if (s.userId) qs.set("user_id", s.userId);
   if (s.status) qs.set("status", s.status);
   if (s.q) qs.set("q", s.q);
+  if (s.disp) qs.set("disp", s.disp);
+  if (s.uname) qs.set("uname", s.uname);
+  if (s.agent) qs.set("agent", s.agent);
   return qs;
 }
 
