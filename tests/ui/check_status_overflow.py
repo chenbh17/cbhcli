@@ -7,9 +7,10 @@
 背景（用户实测）：状态栏出现长提示（原先是 F2 鼠标开关提示）后，最底部一行被宽字符
 写满最后一列 → 终端自动换行 → 整屏上滚 → 输入行错位/残格（`❯ nnihao`）。
 
-修复：布局最右预留 2 列 + 状态栏按显示宽度截断到 `cols-4`（宽字符安全）。
+修复：布局最右预留列 + 状态栏按显示宽度截断到 `cols-4`（宽字符安全）。
 断言（pyte 列精确重放，多种宽度）：
-  1. 每一行的**最后 2 列**都是空格（任何内容都没写进预留列）；
+  1. 每一行的**最后一列**都是空格；倒数第二列只允许空白或滚动条字符
+     （v5.5.1 迭代：预留 2 列改为 预留 1 列 + 滚动条 1 列，恒宽 1 字符安全）；
   2. 状态栏变长 + 输入 `nihao` 后，输入行是 `❯ nihao`、行号稳定。
 
 注：v5.5.0 取消 F2 后 `_set_notice` 已移除，这里改用**可变 status_provider**
@@ -152,14 +153,20 @@ def run_case(rows: int, cols: int) -> bool:
         print(("  ✅ " if cond else "  ❌ ") + name)
         ok = ok and cond
 
-    # 最后 2 列必须全空
-    bad = []
+    # v5.5.1 迭代：最右预留改为 1 列 + 滚动条占 1 列（cols-2）。
+    # 不变式：最后一列（cols-1）永远空白；倒数第二列（cols-2）只允许
+    # 空白或滚动条字符（│/█，恒宽 1，不会触发终端自动换行）。
+    bad_last = []
+    bad_sb = []
     for y, r in enumerate(rows1):
-        if r[-2:].strip():
-            bad.append((y, r[-4:]))
+        if r[-1:].strip():
+            bad_last.append((y, r[-4:]))
+        if r[-2:-1].strip() and r[-2:-1] not in "│█":
+            bad_sb.append((y, r[-4:]))
     print(f"  {cols}x{rows}: 输入行 y={y_in}→{input_rows1[0] if input_rows1 else -1} {line1!r}；"
-          f"末两列非空行={bad[:3]}")
-    check(f"{cols}x{rows} 最后 2 列保持空白", not bad)
+          f"末列非空行={bad_last[:3]} 滚动条列异常={bad_sb[:3]}")
+    check(f"{cols}x{rows} 最后一列保持空白", not bad_last)
+    check(f"{cols}x{rows} 倒数第二列仅滚动条字符", not bad_sb)
     check(f"{cols}x{rows} 输入行正确（❯ nihao）", line1.endswith("❯ nihao"))
     check(f"{cols}x{rows} 输入行行号不变", y_in >= 0 and input_rows1 and y_in == input_rows1[0])
     return ok

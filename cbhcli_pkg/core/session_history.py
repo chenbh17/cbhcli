@@ -121,7 +121,8 @@ def _drop_meta_cache(filepath: Path) -> None:
 
 def build_session_data(messages: list, session_id: str = "",
                        workspace: str = "", title: str = "",
-                       created_at: str = "", existing_title: str = "") -> dict:
+                       created_at: str = "", existing_title: str = "",
+                       display_messages: list = None) -> dict:
     """构造会话 JSON（与 save_session 落盘结构完全一致）
 
     v5.4.0 从 save_session 中提取（纯重构，行为不变）：供审计快照上报
@@ -134,6 +135,8 @@ def build_session_data(messages: list, session_id: str = "",
         title: 显式标题（优先）
         created_at: 创建时间（为空用当前时间；保存已有会话时传原值）
         existing_title: 已有文件的标题（次优先）
+        display_messages: 显示层消息（v5.5.1 迭代，可选）——压缩后仍保留
+            压缩前完整对话，供界面/回显恢复；None 时不写该字段（旧格式兼容）
     """
     if not session_id:
         session_id = datetime.now().strftime("%H%M%S")
@@ -154,23 +157,27 @@ def build_session_data(messages: list, session_id: str = "",
             break
 
     # 清理消息中的base64图片数据（保存时去除，减小文件体积）
-    cleaned_messages = []
-    for msg in messages or []:
-        cleaned = dict(msg)
-        content = cleaned.get("content", "")
-        if isinstance(content, list):
-            # 多模态格式：只保留文本部分
-            text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            if text_parts:
-                cleaned["content"] = text_parts[0].get("text", "")
-            else:
-                cleaned["content"] = ""
-        cleaned_messages.append(cleaned)
+    def _clean(msgs):
+        out = []
+        for msg in msgs or []:
+            cleaned = dict(msg)
+            content = cleaned.get("content", "")
+            if isinstance(content, list):
+                # 多模态格式：只保留文本部分
+                text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                if text_parts:
+                    cleaned["content"] = text_parts[0].get("text", "")
+                else:
+                    cleaned["content"] = ""
+            out.append(cleaned)
+        return out
+
+    cleaned_messages = _clean(messages)
 
     # 保存会话数据（标题优先级: 显式传入 > 已有文件 > 首条用户消息提取）
     # 标题统一压缩换行/连续空白为单空格（避免列表折行伪装成编号）
     # v5.3.1+：updated_at 每次保存刷新（最后对话时间），created_at 保持首次创建时间
-    return {
+    data = {
         "id": session_id,
         "created_at": created_at or datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
@@ -182,6 +189,11 @@ def build_session_data(messages: list, session_id: str = "",
         "workspace": workspace or "",
         "messages": cleaned_messages
     }
+    # 显示层历史（v5.5.1 迭代）：压缩后界面仍显示完整对话。
+    # 仅在调用方提供时写入（审计快照等场景不带，保持旧格式）。
+    if display_messages is not None:
+        data["display_messages"] = _clean(display_messages)
+    return data
 
 
 class SessionHistoryManager:
@@ -202,7 +214,8 @@ class SessionHistoryManager:
         self.history_dir.mkdir(parents=True, exist_ok=True)
     
     def save_session(self, messages: list[dict], session_id: str = "",
-                     workspace: str = "", title: str = "") -> str:
+                     workspace: str = "", title: str = "",
+                     display_messages: list = None) -> str:
         """保存会话到 history 文件夹（同 session_id 幂等覆盖）
 
         v5.2.6 起支持每轮对话自动保存：同一 session_id 再次保存时直接
@@ -215,6 +228,8 @@ class SessionHistoryManager:
             session_id: 会话ID，如果为空则自动生成
             workspace: 会话所属工作空间目录（v5.2.8，Web 端按工作空间
                 分组展示会话；为空表示默认工作空间）
+            display_messages: 显示层消息（v5.5.1 迭代，可选）——压缩后
+                仍保留压缩前完整对话，供界面/回显恢复
 
         Returns:
             保存的文件路径
@@ -228,6 +243,7 @@ class SessionHistoryManager:
         # 幂等定位：查找同 session_id 的已有文件（文件名格式 时间戳_会话ID.json）
         created_at = datetime.now().isoformat()
         existing_title = ""
+        existing_display = None
         filepath = None
         if not any(c in session_id for c in "*?[]"):
             existing = sorted(
@@ -241,6 +257,8 @@ class SessionHistoryManager:
                     created_at = old_data.get("created_at", created_at)
                     # 保留已有标题（重命名后的标题不被自动提取标题覆盖）
                     existing_title = old_data.get("title", "") or ""
+                    # 保留已有显示层历史（调用方未传时不丢失，v5.5.1 迭代）
+                    existing_display = old_data.get("display_messages")
                 except (json.JSONDecodeError, OSError):
                     pass
 
@@ -253,7 +271,9 @@ class SessionHistoryManager:
         # 构造会话数据（v5.4.0 提取为模块级 build_session_data，行为不变）
         session_data = build_session_data(
             messages, session_id=session_id, workspace=workspace, title=title,
-            created_at=created_at, existing_title=existing_title)
+            created_at=created_at, existing_title=existing_title,
+            display_messages=(display_messages if display_messages is not None
+                              else existing_display))
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(session_data, f, ensure_ascii=False, indent=2)

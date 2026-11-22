@@ -263,6 +263,16 @@ def _restore_history(app, args) -> None:
     if target.get("id"):
         app.session.id = target["id"]
 
+    # 显示层历史（v5.5.1 迭代）：优先用落盘的 display_messages（压缩前
+    # 完整对话），后续保存不丢显示历史；旧文件无该字段时保持镜像结果
+    try:
+        _full = app.session_history.load_session_full(target["filename"])
+        _disp = (_full or {}).get("display_messages")
+        if _disp:
+            app.session.set_display_messages(_disp)
+    except Exception:
+        pass
+
 
 # ======================================================================
 #  统计与输出
@@ -290,7 +300,8 @@ def _save_session(app) -> None:
             import os as _os
             saved = app.session_history.save_session(
                 app.session.get_context_messages(), app.session.id,
-                workspace=_os.getcwd())
+                workspace=_os.getcwd(),
+                display_messages=app.session.get_display_messages())
             # v5.4.0：审计快照上报（读刚落盘的文件）
             if saved:
                 try:

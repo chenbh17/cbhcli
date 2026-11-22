@@ -14,6 +14,59 @@ from __future__ import annotations
 
 from wcwidth import wcwidth
 
+#: emoji 类字素簇的显示宽度（**终端自适应**，v5.5.2 修复）。
+#: 默认 2（多数终端：VTE/kitty/WezTerm/Windows Terminal/iTerm2）。
+#: 启动时 `probe_emoji_width()` 用 CPR 实测终端对 🔧 的实际渲染列数：
+#: xterm.js（JupyterLab/VS Code 终端）渲染 emoji 为 **1 列** → 置 1。
+#: 为什么必须自适应：prompt_toolkit 差分重绘按"模型宽度"推进光标，
+#: 若模型=2 而终端实际=1，行内光标跟踪逐步失配 → 该行后续所有单元格
+#: （含右侧滚动条）写到错误列 → 滚动条多重残影/双轨道/文字尾巴错乱。
+_EMOJI_WIDTH = 2
+
+
+def _is_emoji_cp(cp: int) -> bool:
+    """emoji 呈现类码点（这些簇的宽度随终端而变，需自适应）"""
+    return (
+        0x1F000 <= cp <= 0x1FAFF      # 表情/符号/补充（🔧✅📦💭👍…）
+        or 0x2600 <= cp <= 0x27BF     # 杂项符号/装饰符号（☀✅➡…）
+        or 0x2B00 <= cp <= 0x2BFF     # 杂项符号与箭头（⭐…）
+        or 0x2300 <= cp <= 0x23FF     # 杂项技术（⌚⏰⏺…）
+        or 0xFE00 <= cp <= 0xFE0F     # 变体选择符
+    )
+
+
+def set_emoji_width(width: int) -> None:
+    """设置 emoji 类宽度并清空 prompt_toolkit 宽度缓存（使其立即生效）"""
+    global _EMOJI_WIDTH
+    width = 1 if int(width) <= 1 else 2
+    if width == _EMOJI_WIDTH:
+        return
+    _EMOJI_WIDTH = width
+    try:
+        import prompt_toolkit.utils as _ptu
+        cache = getattr(_ptu, "_CHAR_SIZES_CACHE", None)
+        if cache is not None:
+            cache.clear()
+    except Exception:
+        pass
+
+
+def _cluster_width(cluster: str) -> int:
+    """单个字素簇的显示宽度（emoji 类按 _EMOJI_WIDTH 自适应）"""
+    if len(cluster) == 1:
+        w = max(0, wcwidth(cluster))
+        if w == 2 and _is_emoji_cp(ord(cluster)):
+            return _EMOJI_WIDTH
+        return w
+    if '️' in cluster:
+        return _EMOJI_WIDTH
+    if any(_is_regional_indicator(ord(c)) for c in cluster):
+        return 2   # 旗帜：多数终端渲染 2 列，保持
+    w = max(max(0, wcwidth(c)) for c in cluster)
+    if w == 2 and any(_is_emoji_cp(ord(c)) for c in cluster):
+        return _EMOJI_WIDTH
+    return w
+
 
 def _is_regional_indicator(cp: int) -> bool:
     """区域指示符（旗帜emoji组成字符）U+1F1E6 ~ U+1F1FF"""
@@ -80,17 +133,10 @@ def display_width(text: str) -> int:
     """
     total = 0
     for cluster in grapheme_clusters(text):
-        if len(cluster) == 1:
-            if cluster == '\t':
-                total = (total + 4) & ~3
-                continue
-            total += max(0, wcwidth(cluster))
-        elif '\ufe0f' in cluster:
-            total += 2
-        elif any(_is_regional_indicator(ord(c)) for c in cluster):
-            total += 2
-        else:
-            total += max(max(0, wcwidth(c)) for c in cluster)
+        if len(cluster) == 1 and cluster == '\t':
+            total = (total + 4) & ~3
+            continue
+        total += _cluster_width(cluster)
     return total
 
 
@@ -163,10 +209,8 @@ def install_prompt_toolkit_patch():
         """字素簇感知的宽度缓存（保持与原版相同的长字符串轮换策略）"""
 
         def __missing__(self, string: str) -> int:
-            if len(string) == 1:
-                result = max(0, wcwidth(string))
-            else:
-                result = display_width(string)
+            # 统一走 display_width（含 emoji 终端自适应宽度，v5.5.2）
+            result = display_width(string)
 
             self[string] = result
 
@@ -182,3 +226,88 @@ def install_prompt_toolkit_patch():
 
     _ptu._CHAR_SIZES_CACHE = _ClusterAwareCache()
     _ptu._cbhcli_grapheme_patched = True
+
+
+def _read_cpr(fd: int, timeout: float):
+    """读一次 CPR 响应 `\\x1b[{row};{col}R`，返回 (row, col) 或 None"""
+    import select
+    import re
+    buf = b""
+    deadline = __import__("time").monotonic() + timeout
+    while True:
+        remain = deadline - __import__("time").monotonic()
+        if remain <= 0:
+            return None
+        r, _, _ = select.select([fd], [], [], remain)
+        if not r:
+            return None
+        try:
+            chunk = __import__("os").read(fd, 64)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+        m = re.search(rb"\x1b\[(\d+);(\d+)R", buf)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        if len(buf) > 256:
+            return None
+
+
+def probe_emoji_width(timeout: float = 0.4) -> int:
+    """实测终端对 emoji 的渲染列数（CPR 光标位置差），并设置 _EMOJI_WIDTH。
+
+    在**进入全屏/交互界面之前**调用（此时 stdin 仍是普通终端）：
+    写一个 🔧，比较写入前后的光标列号 → 差值即终端实际渲染宽度。
+    xterm.js（JupyterLab/VS Code 终端）= 1；多数现代终端 = 2。
+    探测用的字符会被空格覆盖还原，不污染界面。任何异常 → 保持默认 2。
+
+    为什么不用 DA1/DA2 指纹：实测探测对任意终端都正确，无需猜测型号。
+    """
+    import sys
+    import os
+    try:
+        if not sys.stdout.isatty() or not sys.stdin.isatty():
+            return _EMOJI_WIDTH
+        fd = sys.stdin.fileno()
+        import termios
+        import tty
+        old = termios.tcgetattr(fd)
+        out = sys.stdout
+        try:
+            tty.setraw(fd)
+            # 清空可能的残留输入
+            try:
+                termios.tcflush(fd, termios.TCIFLUSH)
+            except Exception:
+                pass
+            out.write("\x1b[6n"); out.flush()
+            base = _read_cpr(fd, timeout)
+            if not base:
+                return _EMOJI_WIDTH
+            out.write("🔧"); out.flush()
+            out.write("\x1b[6n"); out.flush()
+            after = _read_cpr(fd, timeout)
+            width = _EMOJI_WIDTH
+            if after and after[0] == base[0] and after[1] > base[1]:
+                delta = after[1] - base[1]
+                if delta in (1, 2):
+                    width = delta
+            # 还原：回到基线位置写空格覆盖探测字符，再停回基线
+            out.write(f"\x1b[{base[0]};{base[1]}H")
+            out.write(" ")
+            out.write(f"\x1b[{base[0]};{base[1]}H")
+            out.flush()
+            set_emoji_width(width)
+            return width
+        finally:
+            # 清空探测期间可能残留的 CPR 响应字节，避免污染后续输入
+            # （否则 stray `...R` 会被 shell/pt 当作输入——实测 "1R2Rpython3"）
+            try:
+                termios.tcflush(fd, termios.TCIFLUSH)
+            except Exception:
+                pass
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        return _EMOJI_WIDTH

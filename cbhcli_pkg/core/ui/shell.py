@@ -52,12 +52,12 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import ConditionalProcessor, PasswordProcessor
-from prompt_toolkit.mouse_events import MouseEventType
+from prompt_toolkit.mouse_events import MouseButton, MouseEventType, MouseModifier
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.styles import Style
 
 from cbhcli_pkg.core.input_box import CHAT_INPUT_STYLE_DICT
-from cbhcli_pkg.core.text_width import display_width
+from cbhcli_pkg.core.text_width import display_width, grapheme_clusters
 from cbhcli_pkg.core.ui.ansi import style_to_pt_style
 from cbhcli_pkg.core.ui.lines import Screen
 
@@ -255,6 +255,58 @@ def _fs_debug(msg: str) -> None:
         pass
 
 
+def _extract_cols(segments, c0: int, c1: int) -> str:
+    """按显示列范围 [c0, c1) 提取视觉行文本（宽字符不拆；组合符跟随前格）"""
+    out: List[str] = []
+    col = 0
+    bucket = 0  # 0=选区前 1=选区内 2=选区后
+    for text, _style in segments:
+        for ch in grapheme_clusters(text):
+            w = display_width(ch)
+            if w <= 0:
+                if bucket == 1:
+                    out.append(ch)
+                continue
+            if col + w <= c0:
+                bucket = 0
+            elif col < c1:
+                bucket = 1
+            else:
+                bucket = 2
+            if bucket == 1:
+                out.append(ch)
+            col += w
+    return "".join(out)
+
+
+def _split_select(text: str, style: str, c0: int, c1: int):
+    """把一个渲染片段按选区列范围拆分，选中部分加 reverse（高亮）"""
+    buckets: List[List[str]] = [[], [], []]
+    col = 0
+    bucket = 0
+    for ch in grapheme_clusters(text):
+        w = display_width(ch)
+        if w <= 0:
+            buckets[bucket].append(ch)
+            continue
+        if col + w <= c0:
+            bucket = 0
+        elif col < c1:
+            bucket = 1
+        else:
+            bucket = 2
+        buckets[bucket].append(ch)
+        col += w
+    out = []
+    if buckets[0]:
+        out.append((style, "".join(buckets[0])))
+    if buckets[1]:
+        out.append((style + " reverse", "".join(buckets[1])))
+    if buckets[2]:
+        out.append((style, "".join(buckets[2])))
+    return out
+
+
 #: 「运行中」动画帧（braille，宽度恒为 1；终端字体覆盖稳定）
 _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPIN_INTERVAL = 0.1      # 每帧间隔（秒）
@@ -269,19 +321,25 @@ _MOUSE_QUIET_SEC = 0.6
 #: 按住左键（可能在拖选）时最长静默时间（秒）——超过后恢复重绘，避免输出卡死
 _MOUSE_QUIET_MAX = 3.0
 
-#: 用户手动滚动后，长时间无操作自动回到底部的秒数（v5.5.1）
-_IDLE_SCROLL_RESET_SEC = 25.0
+#: 用户手动滚动后，长时间无操作自动回到底部的秒数（v5.5.1 迭代：25s→2min）
+#: 计时会被**任何用户交互**重置（按键/鼠标点击/拖动/滚轮/滚动条），
+#: 而不是只看第一次滚动——修复"正在阅读历史时到点被拽回最新"的问题。
+_IDLE_SCROLL_RESET_SEC = 120.0
 
-#: 关 any-motion（1003）+ 关 urxvt 编码（1015）→ 重发 1000（点击/滚轮）+ 1006（SGR 编码）
+#: 滚轮每格滚动的行数（v5.5.1 迭代：3→6，提高灵敏度）
+_WHEEL_LINES = 6
+
+#: 关 any-motion（1003）+ 关 urxvt 编码（1015）→ 重发 1000（点击/滚轮）
+#: + 1002（按住拖动上报，应用内拖选需要）+ 1006（SGR 编码）
 #: ⚠️ xterm.js 的 DECRST 1003 会把整个鼠标协议置为 NONE，所以必须随后重发
-_MOUSE_RESTRICT_SEQ = "\033[?1003l\033[?1015l\033[?1000h\033[?1006h"
+_MOUSE_RESTRICT_SEQ = "\033[?1003l\033[?1015l\033[?1000h\033[?1002h\033[?1006h"
 
 
 class _WheelWindow(Window):
-    """可滚轮滚动的窗口（主区 / 输入区）
+    """可滚轮滚动的窗口（输入区）
 
     响应鼠标滚轮 -> 主区历史滚动；其余事件返回 NotImplemented，
-    交给终端/prompt_toolkit 默认处理（选中由终端原生完成：按住 Shift 拖动）。
+    交给 prompt_toolkit 默认处理（输入区点击定位光标等）。
     """
 
     def __init__(self, content=None, *, scroll_cb=None, enabled_cb=None,
@@ -304,14 +362,35 @@ class _WheelWindow(Window):
         et = mouse_event.event_type
         if et == MouseEventType.SCROLL_UP:
             if self._scroll_cb is not None:
-                self._scroll_cb(3)
+                self._scroll_cb(_WHEEL_LINES)
                 return None
             return NotImplemented
         if et == MouseEventType.SCROLL_DOWN:
             if self._scroll_cb is not None:
-                self._scroll_cb(-3)
+                self._scroll_cb(-_WHEEL_LINES)
                 return None
             return NotImplemented
+        return NotImplemented
+
+
+class _CallbackWindow(Window):
+    """把全部鼠标事件交给单一回调的窗口（主区 / 滚动条，v5.5.1 迭代）
+
+    回调返回 None=已处理；NotImplemented=交还默认。坐标为**屏幕绝对坐标**
+    （prompt_toolkit 的 Window 级 handler 不做局部化）；主区/滚动条都位于
+    布局左上区域，主区 local==absolute，滚动条只需减去自身 x 偏移。
+    """
+
+    def __init__(self, content=None, *, mouse_cb=None, **kwargs):
+        super().__init__(content, **kwargs)
+        self._mouse_cb = mouse_cb
+
+    def _mouse_handler(self, mouse_event):
+        if self._mouse_cb is not None:
+            try:
+                return self._mouse_cb(mouse_event)
+            except Exception:
+                return NotImplemented
         return NotImplemented
 
 
@@ -357,11 +436,26 @@ class FullScreenUI:
         self._mouse_down_ts = 0.0    # 左键按下的时刻（拖选静默期上限）
         self._mouse_ts = 0.0         # 最近一次鼠标事件时间
         self._defer_timer = None     # 静默期内推迟重绘的定时器（去重）
+        # 应用内拖选（v5.5.1 迭代）：鼠标直接拖动选中，Ctrl+C 复制
+        self._sel = None             # {"a": (vidx,col), "b": (vidx,col), "width": int}
+        self._sel_dragging = False   # 左键拖动中
+        self._sel_moved = False      # 拖动是否发生过位移（单击=取消选中）
+        # 滚动条（v5.5.1 迭代）
+        self._sb_drag = None         # 拖动 thumb 时的抓取偏移（None=未拖动）
+        # 状态栏临时提示（复制结果等；必须放第一行，见 v5.5.0 教训）
+        self._notice = ""
+        self._notice_until = 0.0
+        # 空闲回底计时（代际号修复跨线程 cancel/schedule 竞态）
+        self._idle_gen = 0
 
         self._status_provider = status_provider or (lambda: [])
         _style_dict = dict(style_dict or CHAT_INPUT_STYLE_DICT)
         # 「运行中」标识（请求/命令执行期间显示在状态栏最左侧）
         _style_dict.setdefault("running", "bold #5fd7ff")
+        # 滚动条 / 状态栏临时提示（v5.5.1 迭代）
+        _style_dict.setdefault("scrollbar.thumb", "#5fd7ff")
+        _style_dict.setdefault("scrollbar.track", "#3a3f4b")
+        _style_dict.setdefault("notice", "bold #ffd75f")
         self.style = Style.from_dict(_style_dict)
 
         # 输入缓冲（与 PromptSession 同款参数）
@@ -383,13 +477,17 @@ class FullScreenUI:
             else self._own_bindings
         )
 
-        self._main_window = _WheelWindow(
+        self._main_window = _CallbackWindow(
             FormattedTextControl(self._main_fragments),
             height=Dimension(weight=1),
             wrap_lines=False,
-            scroll_cb=self._scroll,
-            enabled_cb=lambda: self._mouse_enabled,
-            on_any_mouse=self._on_mouse_activity,
+            mouse_cb=self._on_main_mouse,
+        )
+        # 滚动条（v5.5.1 迭代）：主区右侧 1 列，可拖拽 thumb / 点击轨道 / 滚轮
+        self._scrollbar_window = _CallbackWindow(
+            FormattedTextControl(self._scrollbar_fragments),
+            width=1,
+            mouse_cb=self._on_scrollbar_mouse,
         )
         self._input_control = BufferControl(buffer=self.buffer)
         self._input_window = _WheelWindow(
@@ -399,6 +497,7 @@ class FullScreenUI:
             wrap_lines=True,
             scroll_cb=self._scroll,
             enabled_cb=lambda: self._mouse_enabled,
+            on_any_mouse=self._on_mouse_activity,
         )
         self._status_window = Window(
             FormattedTextControl(self._status_fragments),
@@ -451,7 +550,7 @@ class FullScreenUI:
 
         body = FloatContainer(
             HSplit([
-                self._main_window,
+                VSplit([self._main_window, self._scrollbar_window]),
                 ConditionalContainer(self._input_window, ~Condition(lambda: self._modal_active)),
                 ConditionalContainer(modal_body, Condition(lambda: self._modal_active)),
                 self._status_window,
@@ -471,12 +570,12 @@ class FullScreenUI:
             ],
         )
 
-        # 最右预留 2 列：任何行都不写终端最后一格（宽字符占 2 列，
-        # 只留 1 列时"最后一个内容格是宽字符"仍会压到最后一列 → 终端自动换行/滚屏）。
-        # 否则宽字符（CJK/emoji）裁切或恰好写满最后一行时会触发终端自动换行，
-        # 在最底部（状态栏）换行 -> 整屏上滚 1 行 -> 输入框错位/退格残留
-        # （用户实测：第二轮输入时"最前面有一位退格退不掉"）。
-        self._layout_root = VSplit([body, Window(width=2)])
+        # 最右预留 1 列 + 滚动条占 1 列（v5.5.1 迭代前为预留 2 列）：
+        # 主区文字宽度仍为 cols-2（text_width() 不变）；滚动条字符（█/│）
+        # 恒宽 1，占据 cols-2 列；终端最后一列（cols-1）永远留空——
+        # 任何行都不写终端最后一格，宽字符不会触发自动换行/整屏上滚
+        # （T-21：否则输入框错位/行首残格退格删不掉，用户实测）。
+        self._layout_root = VSplit([body, Window(width=1)])
 
         self.app: Application = Application(
             layout=Layout(self._layout_root),
@@ -484,11 +583,20 @@ class FullScreenUI:
             key_bindings=merged,
             full_screen=True,
             # v5.5.0：开启鼠标事件（滚轮滚动历史）。这是**唯一模式**：
-            # 已取消 F2 开关与"不捕获"模式（用户要求），选中文本用 Shift+拖动。
+            # 已取消 F2 开关与"不捕获"模式（用户要求）。
+            # v5.5.1 迭代：补发 ?1002h（拖动上报）→ 应用内直接拖选，
+            # Ctrl+C 有选区复制 / 无选区中断（不再依赖终端 Shift+拖动）。
             mouse_support=True,
             color_depth=ColorDepth.DEPTH_8_BIT,
             after_render=self._after_render,
         )
+
+        # 任何按键都重置"空闲自动回底"计时（v5.5.1 迭代：用户正在阅读时
+        # 打字/翻页不应被拽回最新）。after_key_press 是 pt KeyProcessor 的信号。
+        try:
+            self.app.key_processor.after_key_press += self._note_user_activity
+        except Exception:
+            pass
 
         self._real_stdout = None
         self._sink: Optional[ScreenSink] = None
@@ -584,10 +692,25 @@ class FullScreenUI:
     #  应用内模态（P5b）：替代 SUSPEND 的旧 PromptSession
     # ------------------------------------------------------------------
     def _format_prompt(self, prompt: str):
+        """提示文本 → formatted text（**单行**前缀）
+
+        ⚠️ 必须先折叠控制字符：模态提示是放进 `get_line_prefix` / 单行
+        `Window` 渲染的，prompt_toolkit 会把控制字符转成 caret 形式
+        （`\\n` → `^J`、`\\t` → `^I`）——用户实测 ask_user 的提示显示成
+        "^J请选择: "（ask_user 传的 prompt 带前导 `\\n`）。
+        提示语本来就是单行，换行没有意义，直接剥掉首尾换行、中间换成空格。
+        """
         try:
-            if "\033[" in prompt or "\x1b[" in prompt:
-                return to_formatted_text(ANSI(prompt))
-            return [("class:prompt", prompt)]
+            text = prompt or ""
+            if text:
+                text = text.replace("\r\n", "\n").replace("\r", "\n")
+                text = text.strip("\n")
+                text = text.replace("\n", " ").replace("\t", " ")
+            if not text:
+                return []
+            if "\033[" in text or "\x1b[" in text:
+                return to_formatted_text(ANSI(text))
+            return [("class:prompt", text)]
         except Exception:
             return [("class:prompt", prompt)]
 
@@ -702,6 +825,9 @@ class FullScreenUI:
         finally:
             app._running_in_terminal = False
             try:
+                # pt 的 reset 会重新开启 1003(any-motion)/1015——
+                # 允许下一次 after_render 重发限制序列（v5.5.1 迭代）
+                self._mouse_modes_fixed = False
                 app.renderer.reset()
                 app._request_absolute_cursor_position()
                 app._redraw()
@@ -751,6 +877,8 @@ class FullScreenUI:
             et = mouse_event.event_type
         except Exception:
             return
+        # 任何鼠标交互都重置"空闲自动回底"计时（v5.5.1 迭代）
+        self._note_user_activity()
         if et in (MouseEventType.SCROLL_UP, MouseEventType.SCROLL_DOWN):
             # 滚轮必须「跟手」：不进入静默期（滚动后立即重绘）
             self._mouse_ts = 0.0
@@ -761,6 +889,232 @@ class FullScreenUI:
             self._mouse_down_ts = self._mouse_ts
         elif et in (MouseEventType.MOUSE_UP,):
             self._mouse_down = False
+
+    def _note_user_activity(self, *args) -> None:
+        """用户动了终端（按键/鼠标）→ 重置空闲回底计时（仅在非贴底时）
+
+        ⚠️ 必须接受可变参数：pt 的 Event.fire() 以 handler(sender) 调用
+        （after_key_press 钩子会传入 KeyProcessor），零参签名会 TypeError
+        并杀死输入回调（v5.5.1 迭代实测教训）。
+        """
+        if self._offset > 0:
+            self._arm_idle_scroll_reset()
+
+    # ------------------------------------------------------------------
+    #  应用内拖选 + 滚动条（v5.5.1 迭代）
+    # ------------------------------------------------------------------
+    def _view_info(self):
+        """与 _main_fragments 一致的视口参数 (visual, start, avail, text_cols, total)"""
+        rows, cols = self._size()
+        text_cols = max(1, cols - 2)
+        avail = self._main_height(rows, cols)
+        with self._lock:
+            visual = self._visual_lines(text_cols)
+            total = len(visual)
+            offset = max(0, min(self._offset, max(0, total - avail)))
+            end = max(0, total - offset)
+            start = max(0, end - avail)
+        return visual, start, avail, text_cols, total
+
+    def _on_main_mouse(self, ev):
+        """主区鼠标：滚轮滚动 + 左键直接拖动选中（Shift+拖动交还终端原生）
+
+        主区位于布局 (0,0)，Window 级 handler 收到的绝对坐标即局部坐标。
+        """
+        self._on_mouse_activity(ev)
+        et = ev.event_type
+        if et == MouseEventType.SCROLL_UP:
+            self._scroll(_WHEEL_LINES)
+            return None
+        if et == MouseEventType.SCROLL_DOWN:
+            self._scroll(-_WHEEL_LINES)
+            return None
+        try:
+            if MouseModifier.SHIFT in (ev.modifiers or ()):
+                return NotImplemented   # 终端原生选区，应用不介入
+        except Exception:
+            pass
+        if ev.button not in (MouseButton.LEFT, MouseButton.NONE,
+                             MouseButton.UNKNOWN):
+            return NotImplemented
+        y, x = ev.position.y, ev.position.x
+        if et == MouseEventType.MOUSE_DOWN:
+            self._sel_begin(y, x)
+            return None
+        if et == MouseEventType.MOUSE_MOVE:
+            if self._sel_dragging:
+                self._sel_update(y, x)
+                return None
+            return NotImplemented
+        if et == MouseEventType.MOUSE_UP:
+            if self._sel_dragging:
+                self._sel_end(y, x)
+                return None
+            return NotImplemented
+        return NotImplemented
+
+    def _sel_pos(self, y: int, x: int):
+        """鼠标坐标 → (绝对视觉行号, 列, 折行宽度)"""
+        _visual, start, _avail, text_cols, total = self._view_info()
+        vidx = max(0, min(total - 1, start + max(0, y)))
+        col = max(0, min(x, text_cols))
+        return vidx, col, text_cols
+
+    def _sel_begin(self, y: int, x: int) -> None:
+        vidx, col, text_cols = self._sel_pos(y, x)
+        self._sel = {"a": (vidx, col), "b": (vidx, col), "width": text_cols}
+        self._sel_dragging = True
+        self._sel_moved = False
+        self.invalidate(force=True)
+
+    def _sel_update(self, y: int, x: int) -> None:
+        if not self._sel:
+            return
+        vidx, col, _ = self._sel_pos(y, x)
+        if (vidx, col) != self._sel["b"]:
+            self._sel["b"] = (vidx, col)
+            if (vidx, col) != self._sel["a"]:
+                self._sel_moved = True
+            self.invalidate(force=True)
+
+    def _sel_end(self, y: int, x: int) -> None:
+        self._sel_update(y, x)
+        self._sel_dragging = False
+        if not self._sel_moved:
+            self._sel = None    # 单击（未拖动）= 取消选中
+        self.invalidate(force=True)
+
+    def _sel_range(self):
+        """归一化选区 ((la,ca),(lb,cb))，ca/cb 为列号（cb 含端点）；空选区 None"""
+        if not self._sel:
+            return None
+        a, b = self._sel["a"], self._sel["b"]
+        if (b[0], b[1]) < (a[0], a[1]):
+            a, b = b, a
+        if a == b:
+            return None
+        return a, b
+
+    def _selection_text(self) -> str:
+        """选区纯文本（复制用）：逐行按列提取，去行尾空白"""
+        sel = self._sel_range()
+        if not sel:
+            return ""
+        (la, ca), (lb, cb) = sel
+        with self._lock:
+            visual = self._visual_lines(self._sel["width"])
+        if la >= len(visual):
+            return ""
+        parts = []
+        for idx in range(la, min(lb, len(visual) - 1) + 1):
+            c0 = ca if idx == la else 0
+            c1 = (cb + 1) if idx == lb else 10 ** 9
+            parts.append(_extract_cols(visual[idx], c0, c1).rstrip())
+        return "\n".join(parts).strip("\n")
+
+    def _copy_selection(self, text: str) -> None:
+        try:
+            from cbhcli_pkg.core.ui.clipboard import copy_text
+            channel = copy_text(text, real_stdout=self._real_stdout)
+            msg = f"已复制 {len(text)} 字符"
+            if channel:
+                msg += f"（{channel}）"
+            self._set_notice(msg)
+        except Exception as e:
+            self._set_notice(f"复制失败: {e}")
+
+    def _set_notice(self, text: str, ttl: float = 3.0) -> None:
+        """状态栏临时提示（必须放第一行——追加末尾会被 3 行上限裁掉）"""
+        self._notice = text or ""
+        self._notice_until = time.monotonic() + ttl if text else 0.0
+        loop = getattr(self.app, "loop", None)
+        if text and loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: loop.call_later(ttl + 0.05, self.invalidate))
+            except Exception:
+                pass
+        self.invalidate(force=True)
+
+    # --- 滚动条 ---------------------------------------------------------
+    def _sb_geometry(self):
+        """滚动条几何；内容不足一屏时返回 None（不显示）"""
+        rows, cols = self._size()
+        track_h = self._main_height(rows, cols)
+        if track_h <= 0:
+            return None
+        text_cols = max(1, cols - 2)
+        with self._lock:
+            total = len(self._visual_lines(text_cols))
+        if total <= track_h:
+            return None
+        scrollable = total - track_h
+        offset = max(0, min(self._offset, scrollable))
+        thumb_h = max(1, min(track_h, int(track_h * track_h / total + 0.5)))
+        span = track_h - thumb_h
+        top = scrollable - offset
+        thumb_y = int(round(top * span / scrollable)) if span > 0 else 0
+        return {"track_h": track_h, "total": total, "scrollable": scrollable,
+                "thumb_h": thumb_h, "thumb_y": thumb_y}
+
+    def _sb_set_top(self, thumb_top: int) -> None:
+        """按 thumb 顶行位置反推滚动 offset（拖拽/点击轨道共用）"""
+        g = self._sb_geometry()
+        if not g:
+            return
+        span = g["track_h"] - g["thumb_h"]
+        ty = max(0, min(span, int(thumb_top)))
+        top = int(round(ty * g["scrollable"] / span)) if span > 0 else 0
+        self._offset = max(0, g["scrollable"] - top)
+        self._arm_idle_scroll_reset()
+        self.invalidate(force=True)
+
+    def _on_scrollbar_mouse(self, ev):
+        """滚动条鼠标：拖拽 thumb / 点击轨道跳转 / 滚轮（位于主区首行，y 即局部）"""
+        self._on_mouse_activity(ev)
+        et = ev.event_type
+        if et == MouseEventType.SCROLL_UP:
+            self._scroll(_WHEEL_LINES)
+            return None
+        if et == MouseEventType.SCROLL_DOWN:
+            self._scroll(-_WHEEL_LINES)
+            return None
+        g = self._sb_geometry()
+        if g is None:
+            return NotImplemented
+        y = ev.position.y
+        if et == MouseEventType.MOUSE_DOWN:
+            if g["thumb_y"] <= y < g["thumb_y"] + g["thumb_h"]:
+                self._sb_drag = y - g["thumb_y"]
+            else:
+                # 点击轨道：thumb 中心移到点击处
+                self._sb_drag = g["thumb_h"] // 2
+                self._sb_set_top(y - self._sb_drag)
+            return None
+        if et == MouseEventType.MOUSE_MOVE:
+            if self._sb_drag is not None:
+                self._sb_set_top(y - self._sb_drag)
+                return None
+            return NotImplemented
+        if et == MouseEventType.MOUSE_UP:
+            self._sb_drag = None
+            return None
+        return NotImplemented
+
+    def _scrollbar_fragments(self):
+        g = self._sb_geometry()
+        if g is None:
+            return []
+        frags = []
+        ty, th = g["thumb_y"], g["thumb_h"]
+        for y in range(g["track_h"]):
+            if y:
+                frags.append(("", "\n"))
+            if ty <= y < ty + th:
+                frags.append(("class:scrollbar.thumb", "█"))
+            else:
+                frags.append(("class:scrollbar.track", "│"))
+        return frags
 
     # --- 选区保护：鼠标操作后短暂"重绘静默"（v5.5.0）-----------------
     def _mouse_quiet_delay(self) -> float:
@@ -849,13 +1203,16 @@ class FullScreenUI:
         except Exception as e:
             _fs_debug(f"input[{tag}] err={e!r}")
 
-    def invalidate(self) -> None:
+    def invalidate(self, force: bool = False) -> None:
         # v5.5.0：鼠标操作后的静默期内不重绘——终端收到输出会清掉原生选区，
         # 这正是"选中后鼠标稍微动一下就没了"的原因。静默结束后统一补一次。
-        d = self._mouse_quiet_delay()
-        if d > 0:
-            self._defer_invalidate(d)
-            return
+        # v5.5.1 迭代：force=True 绕过静默期——应用内拖选高亮/滚动条拖动
+        # 必须跟手（选区由应用自己维护，不怕终端清选区）。
+        if not force:
+            d = self._mouse_quiet_delay()
+            if d > 0:
+                self._defer_invalidate(d)
+                return
         app = getattr(self, "app", None)
         if app is None:
             return
@@ -1049,6 +1406,9 @@ class FullScreenUI:
             self.screen = Screen(max_lines=self.screen.max_lines)
             self._vlines_cache = None
             self._offset = 0
+        self._sel = None
+        self._sel_dragging = False
+        self._sb_drag = None
         self.invalidate()
 
     # ------------------------------------------------------------------
@@ -1167,6 +1527,13 @@ class FullScreenUI:
                 frame = _SPIN_FRAMES[0]
             frags = [("class:running", f"{frame} 运行中"),
                      ("class:bottom-toolbar.sep", " │ ")] + frags
+        # 临时提示（复制结果等）：放最左侧第一行（v5.5.0 教训：追加末尾会被裁掉）
+        if self._notice:
+            if time.monotonic() < self._notice_until:
+                frags = [("class:notice", self._notice),
+                         ("class:bottom-toolbar.sep", " │ ")] + frags
+            else:
+                self._notice = ""
         # 最底部这一行绝不能写满终端最后一列（宽字符会触发自动换行→整屏上滚→
         # 输入行错位/残格）。按显示宽度截断到 cols-4，宽字符安全。
         try:
@@ -1198,17 +1565,36 @@ class FullScreenUI:
                                    self._offset + (total - prev_total))
             self._last_total = total
             self._last_total_cols = text_cols
+            # 选区失效：宽度变化（重折行）或内容收缩（5000 行裁剪/清屏）
+            # → 旧视觉行坐标不再可靠，直接清除（v5.5.1 迭代）
+            if self._sel is not None:
+                if self._sel.get("width") != text_cols or (
+                        prev_total is not None and total < prev_total):
+                    self._sel = None
+                    self._sel_dragging = False
             offset = max(0, min(self._offset, max(0, total - avail)))
             end = max(0, total - offset)
             start = max(0, end - avail)
             lines = visual[start:end]
 
+        sel = self._sel_range()
         out: List[Tuple[str, str]] = []
         for i, line in enumerate(lines):
             if i:
                 out.append(("", "\n"))
+            c0 = c1 = None
+            if sel is not None:
+                (la, ca), (lb, cb) = sel
+                abs_idx = start + i
+                if la <= abs_idx <= lb:
+                    c0 = ca if abs_idx == la else 0
+                    c1 = (cb + 1) if abs_idx == lb else 10 ** 9
             for text, style in line:
-                out.append((style_to_pt_style(style), text))
+                pt_style = style_to_pt_style(style)
+                if c0 is None:
+                    out.append((pt_style, text))
+                else:
+                    out.extend(_split_select(text, pt_style, c0, c1))
         return out
 
     def _line_prefix(self, line_number: int, wrap_count: int):
@@ -1277,6 +1663,15 @@ class FullScreenUI:
             if self._modal_active:
                 self._cancel_modal()
                 return
+            # v5.5.1 迭代：有应用内选区 → Ctrl+C 复制（不中断）；
+            # 无选区 → 原有中断语义（工具/AI请求/命令/空闲输入）
+            try:
+                text = self._selection_text()
+            except Exception:
+                text = ""
+            if text:
+                self._copy_selection(text)
+                return
             if self.on_interrupt is not None:
                 self.on_interrupt()
             else:
@@ -1338,10 +1733,18 @@ class FullScreenUI:
         self.invalidate()
 
     def _arm_idle_scroll_reset(self) -> None:
-        """用户滚动后，若长时间无操作则自动回到底部（v5.5.1）
+        """用户交互后，若长时间无操作则自动回到底部（v5.5.1 迭代：2 分钟）
 
         需求：手动滚动时保持用户位置（方便浏览）；但长时间不操作应回到
-        最新，避免"发完消息看不到新内容"。
+        最新，避免"发完消息看不到新内容"。**任何交互**（按键/鼠标/滚轮/
+        滚动条）都会重置计时，而不是只记第一次滚动。
+
+        竞态修复（代际号）：旧实现在调用线程 cancel 定时器、再经
+        call_soon_threadsafe 到事件循环线程 schedule——两次快速滚动时，
+        第二次的 cancel 可能发生在第一次的 _schedule 尚未执行之前，
+        导致两个定时器并存、第一个（更早的）先到点 → 表现为"只按第一次
+        滚动计时"。现在每次 arm 递增 _idle_gen，_schedule/_fire 都校验
+        代际号，过期的一律丢弃。
         """
         if self._offset <= 0:
             # 已经贴底，不需要计时
@@ -1356,19 +1759,26 @@ class FullScreenUI:
         loop = getattr(app, "loop", None) if app is not None else None
         if loop is None or not loop.is_running():
             return
+        self._idle_gen += 1
+        gen = self._idle_gen
         if self._idle_scroll_timer is not None:
             try:
                 self._idle_scroll_timer.cancel()
             except Exception:
                 pass
+            self._idle_scroll_timer = None
 
         def _fire():
             self._idle_scroll_timer = None
+            if gen != self._idle_gen:
+                return
             if self._offset > 0:
                 self._offset = 0
                 self.invalidate()
 
         def _schedule():
+            if gen != self._idle_gen:
+                return
             try:
                 self._idle_scroll_timer = loop.call_later(
                     _IDLE_SCROLL_RESET_SEC, _fire)

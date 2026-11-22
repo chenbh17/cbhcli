@@ -649,7 +649,8 @@ class CBHCLIApp:
                 # v5.3.1+（问题7）：记录会话工作空间（当前目录），
                 # Web 侧边栏按工作空间分类展示
                 self.session_history.save_session(
-                    ctx_msgs, self.session.id, workspace=os.getcwd())
+                    ctx_msgs, self.session.id, workspace=os.getcwd(),
+                    display_messages=self.session.get_display_messages())
             except Exception:
                 pass
         
@@ -895,6 +896,17 @@ class CBHCLIApp:
         """
         from cbhcli_pkg.core.ui.sink import install, ui_mode, uninstall
 
+        # v5.5.2：进入界面前实测终端 emoji 渲染宽度（xterm.js=1，多数终端=2），
+        # 使 prompt_toolkit 差分重绘的光标跟踪与终端实际一致——否则行内失配
+        # 会导致滚动条多重残影/双轨道/文字尾巴错乱（用户实测 JupyterLab 终端）。
+        try:
+            import sys as _sys
+            if _sys.stdout.isatty() and _sys.stdin.isatty():
+                from cbhcli_pkg.core.text_width import probe_emoji_width
+                probe_emoji_width()
+        except Exception:
+            pass
+
         mode = ui_mode()
         if mode == "fullscreen":
             # H-07：非 TTY / TERM=dumb 自动回退内联模式
@@ -1077,8 +1089,8 @@ class CBHCLIApp:
             except Exception:
                 pass
             self._show_welcome()
-            print(f"{C_DIM}提示: 鼠标滚轮滚动历史；选中文本请按住 Shift 拖动"
-                  f"（先松左键再松 Shift）{C_RESET}")
+            print(f"{C_DIM}提示: 滚轮/右侧滚动条滚动历史；鼠标直接拖动选中，Ctrl+C 复制"
+                  f"（无选中时 Ctrl+C 为中断）{C_RESET}")
             await self._fs_session_loop(ui, loop)
         finally:
             ui.close_input()
@@ -1177,7 +1189,8 @@ class CBHCLIApp:
                 # v5.3.1+（问题7）：记录工作空间（当前目录），供 Web 按路径分类
                 saved_path = self.session_history.save_session(
                     self.session.get_context_messages(), self.session.id,
-                    workspace=os.getcwd())
+                    workspace=os.getcwd(),
+                    display_messages=self.session.get_display_messages())
                 # v5.4.0：审计快照上报（读刚落盘的文件；reporter 内部去重+异步）
                 if saved_path:
                     try:

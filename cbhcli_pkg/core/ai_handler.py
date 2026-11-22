@@ -276,10 +276,18 @@ class AIHandler:
             最终的AI响应
         """
         # 添加用户消息
+        # v5.5.2：解析附件（[图片:]/[文件:] 引用 + 粘贴的裸文件路径）→
+        # 图片进 multimodal images，文件保留引用文本（对齐 Web 上传逻辑）
+        try:
+            from cbhcli_pkg.core.attachments import parse_attachments
+            _content, _images = parse_attachments(user_input)
+        except Exception:
+            _content, _images = user_input, []
         user_msg = Message(
             role="user",
-            content=user_input,
-            token_count=self.token_counter.count_tokens(user_input),
+            content=_content,
+            token_count=self.token_counter.count_tokens(_content),
+            images=_images or None,
         )
         self.session.messages.append(user_msg)
 

@@ -2,7 +2,37 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+import base64
 import uuid
+
+
+def _image_data_uri(b64: str) -> str:
+    """裸 base64 → data URI，按魔数嗅探真实 MIME（不再硬编码 jpeg）。
+
+    v5.5.2：PNG/GIF/WebP 等若被标成 image/jpeg，部分 API 会报
+    "image format is illegal"。这里解码头部字节判断真实格式。
+    兼容已带 data URI 前缀的输入（直接透传，避免二次包裹）。
+    """
+    if not b64:
+        return b64
+    if b64.startswith("data:"):
+        return b64
+    mime = "jpeg"
+    try:
+        head = base64.b64decode(b64[:32], validate=False)
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "png"
+        elif head.startswith(b"\xff\xd8\xff"):
+            mime = "jpeg"
+        elif head.startswith((b"GIF87a", b"GIF89a")):
+            mime = "gif"
+        elif head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            mime = "webp"
+        elif head.startswith(b"BM"):
+            mime = "bmp"
+    except Exception:
+        pass
+    return f"data:image/{mime};base64,{b64}"
 
 
 @dataclass
@@ -32,7 +62,7 @@ class Message:
             for img_data in self.images:
                 content_parts.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_data}"}
+                    "image_url": {"url": _image_data_uri(img_data)}
                 })
             msg["content"] = content_parts
         else:
@@ -49,6 +79,36 @@ class Message:
         return msg
 
 
+class _DisplayMirrorList(list):
+    """messages 列表：append/insert/extend 同步镜像到 display_messages。
+
+    v5.5.1 迭代（压缩后显示不消失）的关键收口：CLI ai_handler 等处直接
+    `session.messages.append(...)`（不走 add_message），用镜像列表保证
+    **任何追加入口**都同步进显示层。整表替换（压缩 replace_messages /
+    截断）只换上下文，不把新表内容复制进显示层——显示层保留压缩前对话。
+    """
+
+    def __init__(self, iterable=(), display=None):
+        super().__init__(iterable)
+        self._display = display
+
+    def append(self, item):
+        super().append(item)
+        if self._display is not None:
+            self._display.append(item)
+
+    def insert(self, index, item):
+        super().insert(index, item)
+        if self._display is not None:
+            self._display.insert(index, item)
+
+    def extend(self, items):
+        items = list(items)
+        super().extend(items)
+        if self._display is not None:
+            self._display.extend(items)
+
+
 class Session:
     """会话管理"""
     
@@ -61,10 +121,40 @@ class Session:
         """
         self.id = str(uuid.uuid4())
         self.agent_name = agent_name
-        self.messages: list[Message] = []
+        # 显示层消息（v5.5.1 迭代）：与 messages 同步追加，但**压缩不动它**。
+        # 上下文压缩只替换 messages（发给模型的真实上下文）；界面/回显/
+        # Web 恢复一律用 display_messages —— 压缩后对话显示不消失。
+        self.display_messages = []
+        self.messages = []
         self.tool_call_count: int = 0
         self.created_at = datetime.now()
         self.is_active = True
+
+    # --- messages / display_messages 属性（镜像收口，见 _DisplayMirrorList）---
+    @property
+    def messages(self) -> list:
+        return self._messages
+
+    @messages.setter
+    def messages(self, value):
+        if isinstance(value, _DisplayMirrorList) \
+                and value._display is self.display_messages:
+            self._messages = value
+        else:
+            # 整表替换：初始内容**不**复制进显示层（压缩语义）
+            self._messages = _DisplayMirrorList(value, self.display_messages)
+
+    @property
+    def display_messages(self) -> list:
+        return self._display_messages
+
+    @display_messages.setter
+    def display_messages(self, value):
+        self._display_messages = value
+        # 重新绑定镜像列表的显示引用（防止 reset/resume 重绑后引用孤儿列表）
+        m = getattr(self, "_messages", None)
+        if isinstance(m, _DisplayMirrorList):
+            m._display = value
     
     def add_message(self, role: str, content: str, token_count: int = 0, 
                     metadata: Optional[dict] = None, 
@@ -97,8 +187,34 @@ class Session:
             reasoning_content=reasoning_content,
             images=images
         )
-        self.messages.append(msg)
+        self.messages.append(msg)   # 镜像列表同步追加到 display_messages
         return msg
+
+    def get_display_messages(self) -> list[dict]:
+        """显示层消息（API 格式）：供保存/回显/Web 渲染，压缩后仍是完整对话"""
+        return [msg.to_dict() for msg in self.display_messages]
+
+    def set_display_messages(self, messages: list) -> None:
+        """恢复会话时用落盘的显示层历史覆盖（dict 列表或 Message 列表）"""
+        out: list[Message] = []
+        for m in messages or []:
+            if isinstance(m, Message):
+                out.append(m)
+            elif isinstance(m, dict):
+                content = m.get("content") or ""
+                if isinstance(content, list):
+                    # 多模态格式兜底：取文本部分
+                    content = " ".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text")
+                out.append(Message(
+                    role=m.get("role", ""),
+                    content=content,
+                    tool_call_id=m.get("tool_call_id"),
+                    tool_calls=m.get("tool_calls"),
+                    reasoning_content=m.get("reasoning_content"),
+                ))
+        self.display_messages = out
     
     def get_context_messages(self) -> list[dict]:
         """
@@ -129,6 +245,8 @@ class Session:
         """清空会话,保留system消息"""
         system_messages = [msg for msg in self.messages if msg.role == "system"]
         self.messages = system_messages
+        # 新会话语义：显示层一并清空（system 消息本来就不展示）
+        self.display_messages = []
         self.tool_call_count = 0
     
     def remove_messages_from(self, index: int) -> None:
@@ -140,6 +258,7 @@ class Session:
         """
         if 0 <= index < len(self.messages):
             self.messages = self.messages[:index]
+        # 显示层不回退：已经展示给用户的内容保留（v5.5.1 迭代）
     
     def replace_messages(self, messages: list[Message]) -> None:
         """
@@ -147,6 +266,9 @@ class Session:
         
         Args:
             messages: 新的消息列表
+
+        注意（v5.5.1 迭代）：**只替换发给模型的真实上下文 messages，
+        display_messages 保持不动**——压缩后界面仍显示压缩前的完整对话。
         """
         self.messages = messages
 

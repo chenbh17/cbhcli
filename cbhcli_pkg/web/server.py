@@ -98,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.5.1")
+app = FastAPI(title="CBHCLI Web", version="5.5.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -834,6 +834,7 @@ class WebChatSession:
         self.run_seq = 0                               # 会话内单调递增事件序号（跨运行不重置）
         self.run_min_seq = 0                           # 日志裁剪后仍可回放的最小 seq-1
         self.run_start_msg_count = 0                   # 本次运行首条用户消息的下标（运行中导出消息截断到此）
+        self.run_start_display_count = 0               # 显示层同语义下标（v5.5.1：导出用 display_messages）
         self.subscribers: list = []                    # 订阅者队列（asyncio.Queue，每个 WebSocket 一个）
         self.respond_waiting = False                   # 是否正等待前端应答（工具确认/ask_user）
         self.last_active_ts: float = 0.0               # 最近一次运行时间戳（空闲会话驱逐排序用）
@@ -1169,12 +1170,15 @@ class WebChatSession:
     def export_messages(self, limit: Optional[int] = None) -> list[dict]:
         """导出为前端可恢复的展示结构（assistant 消息聚合 tool 结果）。
 
-        limit（v5.2.9）：会话正在后台运行时传 run_start_msg_count，
+        limit（v5.2.9）：会话正在后台运行时传 run_start_display_count，
         截断掉本次运行中已产生的消息--这部分由 WebSocket 事件日志回放
         渲染（含正在流式输出的内容），避免双份展示。
+
+        v5.5.1 迭代：导出**显示层** display_messages（压缩后仍是压缩前
+        的完整对话）——上下文压缩只影响发给模型的 messages，界面不消失。
         """
         result = []
-        messages = self.session.messages
+        messages = self.session.display_messages or self.session.messages
         if limit is not None and limit >= 0:
             messages = messages[:limit]
         for m in messages:
@@ -2615,12 +2619,16 @@ def _broadcast_global(payload: dict) -> None:
 
 
 def _live_export_limit(cs: 'WebChatSession') -> Optional[int]:
-    """会话运行中导出消息时的截断下标（当前运行的消息由事件回放渲染）。"""
+    """会话运行中导出消息时的截断下标（当前运行的消息由事件回放渲染）。
+
+    v5.5.1 迭代：导出改用显示层 display_messages，截断下标也必须是
+    显示层的 run_start_display_count（压缩后两层长度不同，不能混用）。
+    """
     if cs is not None and getattr(cs, "run_active", False):
-        # v5.2.9 修复：第一轮运行时 run_start_msg_count=0，旧写法
+        # v5.2.9 修复：第一轮运行时 run_start=0，旧写法
         # `n or None` 把"截断到 0 条"错误变成"不截断"——全量导出含本轮
         # user 消息，与 WS 回放的 run_start 事件双份渲染。0 也是有效截断。
-        return max(0, int(getattr(cs, "run_start_msg_count", 0) or 0))
+        return max(0, int(getattr(cs, "run_start_display_count", 0) or 0))
     return None
 
 
@@ -2652,6 +2660,9 @@ def _start_background_run(cs: 'WebChatSession', user_message: str) -> None:
     # 本次运行首条用户消息是最后一条消息：导出历史时截断到它之前，
     # 该消息及后续由事件日志回放渲染（保证多浏览器一致）
     cs.run_start_msg_count = max(0, len(cs.session.messages) - 1)
+    # 显示层同语义下标（v5.5.1：压缩后两层长度不同，导出截断用这个）
+    cs.run_start_display_count = max(
+        0, len(cs.session.display_messages or cs.session.messages) - 1)
     _publish_event(cs, {
         "type": "run_start",
         "session_id": cs.session.id,
@@ -3133,7 +3144,8 @@ def _autosave_web_session(cs: "WebChatSession") -> None:
                 _saved = SessionHistoryManager(cfg.workspace_path).save_session(
                     cs.session.get_context_messages(), cs.session.id,
                     workspace=getattr(cs, "workspace", "") or "",
-                    title=getattr(cs, "custom_title", "") or "")
+                    title=getattr(cs, "custom_title", "") or "",
+                    display_messages=cs.session.get_display_messages())
                 # v5.4.0：审计快照上报（读刚落盘的文件；reporter 内部去重+异步）
                 if _saved:
                     try:
@@ -4378,6 +4390,14 @@ def _load_session_core(agent_name: str, model_name: str, filename: str):
             tool_calls=msg.get("tool_calls"),
             reasoning_content=msg.get("reasoning_content"),
         )
+    # 显示层历史（v5.5.1 迭代）：优先用落盘的 display_messages（压缩前
+    # 完整对话）；旧文件无该字段时保持上面加载循环同步镜像的显示层
+    _disp = data.get("display_messages")
+    if _disp:
+        try:
+            cs.session.set_display_messages(_disp)
+        except Exception:
+            pass
     _chat_sessions[key] = cs
     _register_session(cs)
     import time as _time
@@ -4954,7 +4974,8 @@ async def session_rename(req: Request):
         if cfg:
             SessionHistoryManager(cfg.workspace_path).save_session(
                 live.session.get_context_messages(), live.session.id,
-                workspace=getattr(live, "workspace", "") or "", title=title)
+                workspace=getattr(live, "workspace", "") or "", title=title,
+                display_messages=live.session.get_display_messages())
     _broadcast_global({"type": "sessions_changed"})
     return {"message": "已重命名"}
 
@@ -5021,7 +5042,8 @@ async def session_copy(req: Request):
         history_mgr.save_session(
             live.session.get_context_messages(), new_id,
             workspace=getattr(live, "workspace", "") or "",
-            title=getattr(live, "custom_title", "") or "")
+            title=getattr(live, "custom_title", "") or "",
+            display_messages=live.session.get_display_messages())
         return {"message": "已复制", "new_id": new_id}
     if not filename:
         raise HTTPException(400, "缺少 filename")
@@ -5032,7 +5054,8 @@ async def session_copy(req: Request):
     history_mgr.save_session(
         data.get("messages", []), new_id,
         workspace=data.get("workspace", "") or "",
-        title=data.get("title", "") or "")
+        title=data.get("title", "") or "",
+        display_messages=data.get("display_messages"))
     return {"message": "已复制", "new_id": new_id}
 
 

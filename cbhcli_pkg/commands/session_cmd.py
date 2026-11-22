@@ -255,14 +255,25 @@ def register_session_commands(parser, app):
 
         if messages is None:
             return f"❌ 加载会话失败: {filename}"
-        
+
+        # 显示层历史（v5.5.1 迭代）：优先用落盘的 display_messages——
+        # 即便会话压缩过，回显/界面仍是压缩前的完整对话（上下文照常压缩）
+        display = None
+        try:
+            _full = app.session_history.load_session_full(filename)
+            if _full:
+                display = _full.get("display_messages")
+        except Exception:
+            display = None
+
         # 保存当前会话到 history
         if app.session and len(app.session.messages) > 1:
             try:
                 import os as _os
                 ctx_msgs = app.session.get_context_messages()
                 app.session_history.save_session(
-                    ctx_msgs, app.session.id, workspace=_os.getcwd())
+                    ctx_msgs, app.session.id, workspace=_os.getcwd(),
+                    display_messages=app.session.get_display_messages())
             except Exception:
                 pass
         
@@ -274,6 +285,7 @@ def register_session_commands(parser, app):
             app.session.messages = [app.session.messages[0]]
         else:
             app.session.messages = []
+        app.session.display_messages = []
         app.session.tool_call_count = 0
 
         # 重新加载历史消息：跳过 system 消息（旧主系统提示用新建的），
@@ -297,6 +309,14 @@ def register_session_commands(parser, app):
         # 统计恢复的消息
         user_count = sum(1 for m in messages if m.get("role") == "user")
 
+        # 显示层恢复（v5.5.1 迭代）：用落盘的完整显示历史覆盖
+        # （旧会话文件无 display_messages 时回退为上下文消息）
+        try:
+            app.session.set_display_messages(
+                display if display is not None else messages)
+        except Exception:
+            pass
+
         # v5.3.3：恢复后在终端回显历史对话（对齐 Web 端"恢复会话后显示历史消息"）
         try:
             _title = ""
@@ -304,7 +324,8 @@ def register_session_commands(parser, app):
                 if _s.get("filename") == filename:
                     _title = _s.get("title") or ""
                     break
-            _print_resumed_history(messages, title=_title)
+            _print_resumed_history(
+                display if display is not None else messages, title=_title)
         except Exception:
             pass     # 回显失败不影响会话恢复本身
 

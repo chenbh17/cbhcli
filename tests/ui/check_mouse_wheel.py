@@ -8,7 +8,7 @@
     1. 子进程启动真实 `FullScreenUI`（full_screen=True，mouse_support=True）
     2. 主区写入 200 行标记 LINE-000..LINE-199（超过一屏）
     3. 父进程（pty 驱动）依次发送：
-         - SGR 滚轮向上 ×5（每次 3 行）→ 应看到更早的行
+         - SGR 滚轮向上 ×5（v5.5.1 迭代：每次 6 行）→ 应看到更早的行
          - SGR 滚轮向下 ×6 → 应回到贴底
          - 按 F2（已取消该开关）→ 鼠标模式不变，滚轮仍有效
     4. 断言：
@@ -155,7 +155,10 @@ def main() -> int:
         pump(0.5)
         return visible_lines(bytes(buf))
 
-    up_rows = wheel(WHEEL_UP, 5)
+    # v5.5.1 迭代：滚轮灵敏度 6 行/格——先滚 1 格验证幅度
+    one_rows = wheel(WHEEL_UP, 1)
+    one_num = next_line_num(one_rows)
+    up_rows = wheel(WHEEL_UP, 4)   # 再滚 4 格（合计 5 格 = 30 行）
     up_num = next_line_num(up_rows)
     up_has_last = any("LINE-199" in r for r in up_rows)
 
@@ -207,6 +210,7 @@ def main() -> int:
     check("鼠标上报已开启（\\033[?1000h）", mouse_on)
     check("关 1003 后重发 1000h（xterm.js 兼容）", reenabled)
     check("初始贴底（可见 LINE-199）", initial_num == 199)
+    check("滚轮灵敏度 6 行/格（1 格后可见 LINE-194）", one_num == 194)
     check("上滚看到更早内容（max < 199 且明显上移）",
           up_num != -1 and up_num < 199 and not up_has_last)
     check("上滚幅度合理（max <= 186）", up_num != -1 and up_num <= 186)
