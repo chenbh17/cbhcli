@@ -284,6 +284,20 @@ class ChatInputBox:
             """Alt+Enter 换行"""
             event.current_buffer.insert_text('\n')
 
+        # Ctrl+Z 撤销 / Ctrl+Y 重做（v5.5.3，与全屏 TUI 行为一致）
+        # Buffer 内置 undo/redo 栈，粒度 = 一次文本变更。
+        # ⚠️ save_before=False 必不可少：否则键位处理器在 handler 前会
+        # save_to_undo_stack(clear_redo_stack=True) 清空 redo 栈 → 重做失效。
+        @self._bindings.add('c-z', save_before=lambda e: False)
+        def _undo(event):
+            """Ctrl+Z 撤销输入"""
+            event.current_buffer.undo()
+
+        @self._bindings.add('c-y', save_before=lambda e: False)
+        def _redo(event):
+            """Ctrl+Y 重做输入（覆盖默认 emacs yank 粘贴）"""
+            event.current_buffer.redo()
+
         @self._bindings.add('c-r')
         def _toggle_verbose(event):
             """Ctrl+R 切换工具显示详细/简洁模式"""

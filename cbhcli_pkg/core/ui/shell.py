@@ -1653,6 +1653,25 @@ class FullScreenUI:
                 return
             event.current_buffer.insert_text("\n")
 
+        # Ctrl+Z 撤销 / Ctrl+Y 重做（v5.5.3，聊天输入框）
+        # 用 prompt_toolkit Buffer 内置 undo/redo 栈：KeyProcessor 在每个
+        # 键位 handler 执行前自动 save_to_undo_stack()（快照 text+光标），
+        # 粒度 = 一次文本变更（逐键入 / 整段粘贴 / Ctrl+U 剪切各算一步）。
+        # ⚠️ save_before=False 必不可少：否则 handler 执行前会先
+        # save_to_undo_stack(clear_redo_stack=True) 把 redo 栈清空 →
+        # Ctrl+Y 永远无效（默认 emacs 的 c-_ undo 绑定同样如此处理）。
+        # 仅聊天输入框聚焦时生效；模态期间不拦截（保持模态原有行为）。
+        @kb.add("c-z", filter=Condition(lambda: has_focus(buf)()),
+                save_before=lambda e: False)
+        def _undo(event):
+            event.current_buffer.undo()
+
+        @kb.add("c-y", filter=Condition(lambda: has_focus(buf)()),
+                save_before=lambda e: False)
+        def _redo(event):
+            # 覆盖默认 emacs 的 c-y=yank（kill-ring 粘贴）
+            event.current_buffer.redo()
+
         @kb.add("escape", filter=Condition(lambda: self._modal_active))
         def _modal_cancel(event):
             self._cancel_modal()

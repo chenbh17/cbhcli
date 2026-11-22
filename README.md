@@ -1,4 +1,4 @@
-# CBHCLI v5.5.2 - AI驱动的终端助手
+# CBHCLI v5.5.3 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -18,6 +18,8 @@
   - **鼠标直接拖选 + Ctrl+C 复制**：左键拖动即应用内选中（reverse 高亮，流式输出期间不丢失），Ctrl+C 有选区复制 / 无选区中断；剪贴板多通道（JupyterLab 插件桥 / OSC 52 / wl-copy/xclip/xsel / 文件兜底）；
   - **空闲回底计时修复**：25s → **2 分钟**，且**任何按键/鼠标操作都重置计时**（修复"只按第一次滚动计时、阅读中途被拽回最新"）；
   - **压缩后显示保留**：上下文照常压缩，但 CLI 回显 / Web 会话恢复显示**压缩前的完整对话**（新增 `display_messages` 显示层，与发给模型的上下文解耦；旧会话文件向后兼容）。
+- **v5.5.3（2026-11-22）**：
+  - **聊天输入框撤销/重做**：`Ctrl+Z` 撤销、`Ctrl+Y` 重做（全屏 TUI 与 legacy 内联界面均支持）。基于 prompt_toolkit Buffer 内置撤销栈，粒度为一次文本变更（逐键入 / 整段粘贴 / `Ctrl+U` 剪切各算一步），光标位置随文本一起恢复；撤销后输入新内容自动清空重做栈；提交后撤销历史重置。`Ctrl+Y` 由默认 emacs yank（粘贴）改为重做。
 - **多Agent管理** - 创建和管理多个AI助手Agent，每个Agent有独立的工作空间和人格配置
 - **工具调用系统** - 基于 OpenAI Function Calling 协议，AI自动调用工具执行任务
 - **MCP协议支持** - 连接外部工具服务器，扩展AI的工具能力
@@ -213,7 +215,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.5.2-py3-none-any.whl
+pip install dist/cbhcli-5.5.3-py3-none-any.whl
 ```
 
 ### 可选依赖
@@ -632,6 +634,8 @@ MCP (Model Context Protocol) 是一个开放协议，允许 AI 通过 HTTP 调�
 | `Enter` | 发送消息 / 执行命令 |
 | `Alt+Enter` | 输入框换行 |
 | `Ctrl+J` | 输入框换行 |
+| `Ctrl+Z` | 输入框撤销（v5.5.3） |
+| `Ctrl+Y` | 输入框重做（v5.5.3） |
 | `Ctrl+R` | 切换工具显示详细/简洁模式 |
 | `Tab` | 补全菜单选择下一项 |
 | `↑` / `↓` | 补全菜单上下选择 |
