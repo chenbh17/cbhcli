@@ -1,4 +1,4 @@
-# CBHCLI v5.5.3 - AI驱动的终端助手
+# CBHCLI v5.5.4 - AI驱动的终端助手
 
 一个功能强大的AI驱动终端助手，支持多Agent管理、工具调用、知识库和会话管理。
 
@@ -20,6 +20,8 @@
   - **压缩后显示保留**：上下文照常压缩，但 CLI 回显 / Web 会话恢复显示**压缩前的完整对话**（新增 `display_messages` 显示层，与发给模型的上下文解耦；旧会话文件向后兼容）。
 - **v5.5.3（2026-11-22）**：
   - **聊天输入框撤销/重做**：`Ctrl+Z` 撤销、`Ctrl+Y` 重做（全屏 TUI 与 legacy 内联界面均支持）。基于 prompt_toolkit Buffer 内置撤销栈，粒度为一次文本变更（逐键入 / 整段粘贴 / `Ctrl+U` 剪切各算一步），光标位置随文本一起恢复；撤销后输入新内容自动清空重做栈；提交后撤销历史重置。`Ctrl+Y` 由默认 emacs yank（粘贴）改为重做。
+- **v5.5.4（2026-11-23）**：
+  - **选区高亮重复/错位修复**：多样式片段行（如欢迎面板）拖选时高亮曾从每个片段开头重新套用 → 行尾补白空格多出白色高亮块、行内高亮重复；现逐片段累计列偏移（`_highlight_line`），高亮恰好落在选区列（复制内容原本正确，本次修显示）。新增门禁 `check_selection_highlight`（单元 + pty/pyte 列精确断言）。
 - **多Agent管理** - 创建和管理多个AI助手Agent，每个Agent有独立的工作空间和人格配置
 - **工具调用系统** - 基于 OpenAI Function Calling 协议，AI自动调用工具执行任务
 - **MCP协议支持** - 连接外部工具服务器，扩展AI的工具能力
@@ -215,7 +217,7 @@ pip install .
 
 ### 从Wheel安装
 ```bash
-pip install dist/cbhcli-5.5.3-py3-none-any.whl
+pip install dist/cbhcli-5.5.4-py3-none-any.whl
 ```
 
 ### 可选依赖

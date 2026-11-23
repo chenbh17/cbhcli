@@ -57,6 +57,12 @@ def main() -> int:
     check("mode1 混合行", tw.display_width("🔧 LINE-001 ✅") == 1 + 1 + 8 + 1 + 1)
     check("mode1 VS16 簇=1", tw.display_width("❤️") == 1)
     check("mode1 旗帜仍 2", tw.display_width("🇨🇳") == 2)
+    # v5.5.3：xterm.js 不做字素簇合并，组合簇按码点求和（CDP CPR 实测值）
+    check("mode1 ZWJ 👨‍💻=2", tw.display_width("👨‍💻") == 2)
+    check("mode1 肤色 👍🏻=2", tw.display_width("👍🏻") == 2)
+    check("mode1 家庭 👨‍👩‍👧‍👦=4", tw.display_width("👨‍👩‍👧‍👦") == 4)
+    check("mode1 keycap 1️⃣=1", tw.display_width("1️⃣") == 1)
+    check("mode1 彩虹旗 🏳️‍🌈=2", tw.display_width("🏳️‍🌈") == 2)
 
     # pt 缓存一致
     try:

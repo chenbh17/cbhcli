@@ -307,6 +307,33 @@ def _split_select(text: str, style: str, c0: int, c1: int):
     return out
 
 
+def _highlight_line(line, c0, c1):
+    """给一个视觉行（[(文本, 样式)] 片段列表）应用选区高亮。
+
+    c0/c1 是**整行**的显示列范围（c0=None 表示该行无选区）。
+    ⚠️ _split_select 内部 col 从 0 起算，只能接受**片段局部**列范围：
+    必须逐片段累计列偏移 base 再换算（c0-base, c1-base）。直接把整行
+    范围传给每个片段会让选区从每个片段开头重新套用一遍——高亮重复 +
+    错位到行尾补白空格上（v5.5.3 用户实测：欢迎面板多片段行选中
+    v5.5.3 后行尾多出白色高亮块；复制路径 _extract_cols 跨片段累计
+    列号故复制正确，仅显示错）。
+    """
+    out: List[Tuple[str, str]] = []
+    base = 0
+    for text, style in line:
+        pt_style = style_to_pt_style(style)
+        if c0 is None:
+            out.append((pt_style, text))
+            continue
+        w = display_width(text)
+        if base >= c1 or base + w <= c0:
+            out.append((pt_style, text))   # 片段完全在选区外，原样保留
+        else:
+            out.extend(_split_select(text, pt_style, c0 - base, c1 - base))
+        base += w
+    return out
+
+
 #: 「运行中」动画帧（braille，宽度恒为 1；终端字体覆盖稳定）
 _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPIN_INTERVAL = 0.1      # 每帧间隔（秒）
@@ -1589,12 +1616,7 @@ class FullScreenUI:
                 if la <= abs_idx <= lb:
                     c0 = ca if abs_idx == la else 0
                     c1 = (cb + 1) if abs_idx == lb else 10 ** 9
-            for text, style in line:
-                pt_style = style_to_pt_style(style)
-                if c0 is None:
-                    out.append((pt_style, text))
-                else:
-                    out.extend(_split_select(text, pt_style, c0, c1))
+            out.extend(_highlight_line(line, c0, c1))
         return out
 
     def _line_prefix(self, line_number: int, wrap_count: int):

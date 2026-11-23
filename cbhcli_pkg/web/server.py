@@ -98,7 +98,7 @@ def _fix_unicode_escapes(obj):
 #  FastAPI App
 # ===================================================================
 
-app = FastAPI(title="CBHCLI Web", version="5.5.3")
+app = FastAPI(title="CBHCLI Web", version="5.5.4")
 
 app.add_middleware(
     CORSMiddleware,

@@ -51,8 +51,26 @@ def set_emoji_width(width: int) -> None:
         pass
 
 
+def _cp_width_narrow(cp: int) -> int:
+    """mode1（xterm.js 类终端）单个码点的渲染宽度。
+
+    xterm.js **不做字素簇合并**，按码点逐个渲染求和：emoji/肤色/区域指示符
+    各占 1 列，ZWJ/变体选择符/组合符占 0 列。实测（CDP CPR）：
+    🔧=1、✅=1、❤️(VS16)=1、👨‍💻(ZWJ)=2、👍🏻(肤色)=2、🇨🇳(旗帜)=2、
+    👨‍👩‍👧‍👦(家庭)=4、1️⃣(keycap)=1、🏳️‍🌈=2。
+    """
+    if cp == 0x200D or 0xFE00 <= cp <= 0xFE0F or _is_combining(cp):
+        return 0
+    if _is_emoji_cp(cp):
+        return 1
+    return max(0, wcwidth(chr(cp)))
+
+
 def _cluster_width(cluster: str) -> int:
     """单个字素簇的显示宽度（emoji 类按 _EMOJI_WIDTH 自适应）"""
+    if _EMOJI_WIDTH == 1:
+        # xterm.js 类终端：逐码点求和（不合并字素簇），见 _cp_width_narrow
+        return sum(_cp_width_narrow(ord(c)) for c in cluster)
     if len(cluster) == 1:
         w = max(0, wcwidth(cluster))
         if w == 2 and _is_emoji_cp(ord(cluster)):
@@ -255,7 +273,78 @@ def _read_cpr(fd: int, timeout: float):
             return None
 
 
-def probe_emoji_width(timeout: float = 0.4) -> int:
+def _width_debug(msg: str) -> None:
+    """CBHCLI_WIDTH_DEBUG=1 时把探测过程写日志（排查宽度失配用）"""
+    import os
+    if not os.environ.get("CBHCLI_WIDTH_DEBUG"):
+        return
+    try:
+        import time
+        with open("/tmp/cbhcli_width_probe.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _query_cpr(fd: int, out, timeout: float):
+    out.write("\x1b[6n"); out.flush()
+    return _read_cpr(fd, timeout)
+
+
+def _drain_cpr(fd: int, silence: float = 0.1) -> None:
+    """读尽 stdin 直到静默，排空**在途的陈旧 CPR 响应**。
+
+    ⚠️ v5.5.3 修复根因：启动时 readline/前序程序可能已发出光标查询，其响应
+    仍在 pty/websocket 管道里（tcflush 只清内核缓冲，清不掉在途字节）。旧实现
+    把第一个读到的 CPR 当基线——若那是陈旧响应，base/after 同为旧位置 →
+    delta=0 → 探测失败保持默认 2 → xterm.js 下 emoji 宽度失配 → 滚动条残影。
+
+    必须"读到静默"而非"发查询凑对"：后者自己发的查询响应仍会留在管道里，
+    污染后续 after 读数（实测连续探测时好时坏）。读尽后再单查询单读，收发平衡。
+    """
+    import os
+    import select
+    import time
+    deadline = time.monotonic() + silence
+    while True:
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            return
+        r, _, _ = select.select([fd], [], [], remain)
+        if not r:
+            return
+        try:
+            if not os.read(fd, 4096):
+                return
+        except OSError:
+            return
+        deadline = time.monotonic() + silence  # 有数据就续窗，直到静默
+
+
+def _measure_emoji(fd: int, out, timeout: float):
+    """在当前光标处写 🔧 测宽，返回 1/2 或 None（失败/换行）。测后空格还原。"""
+    _drain_cpr(fd)                       # 先排空在途陈旧响应
+    base = _query_cpr(fd, out, timeout)  # 单查询单读，收发平衡
+    _width_debug(f"base={base}")
+    if not base:
+        return None
+    out.write("🔧"); out.flush()
+    after = _query_cpr(fd, out, timeout)
+    _width_debug(f"after={after}")
+    width = None
+    if after and after[0] == base[0] and after[1] > base[1]:
+        delta = after[1] - base[1]
+        if delta in (1, 2):
+            width = delta
+    # 还原：回基线写空格覆盖探测字符（宽 2 终端占 2 列，写 2 空格），停回基线
+    out.write(f"\x1b[{base[0]};{base[1]}H")
+    out.write("  ")
+    out.write(f"\x1b[{base[0]};{base[1]}H")
+    out.flush()
+    return width
+
+
+def probe_emoji_width(timeout: float = 0.6) -> int:
     """实测终端对 emoji 的渲染列数（CPR 光标位置差），并设置 _EMOJI_WIDTH。
 
     在**进入全屏/交互界面之前**调用（此时 stdin 仍是普通终端）：
@@ -263,7 +352,10 @@ def probe_emoji_width(timeout: float = 0.4) -> int:
     xterm.js（JupyterLab/VS Code 终端）= 1；多数现代终端 = 2。
     探测用的字符会被空格覆盖还原，不污染界面。任何异常 → 保持默认 2。
 
-    为什么不用 DA1/DA2 指纹：实测探测对任意终端都正确，无需猜测型号。
+    v5.5.3 鲁棒性增强：
+    - 排空陈旧 CPR 响应取稳定基线（修复启动竞态导致的探测失败）；
+    - 当前位置测量失败（换行/无响应）→ 回到行首重试一次；
+    - 超时 0.4s → 0.6s（websocket 终端 CPR 往返更慢）。
     """
     import sys
     import os
@@ -277,28 +369,19 @@ def probe_emoji_width(timeout: float = 0.4) -> int:
         out = sys.stdout
         try:
             tty.setraw(fd)
-            # 清空可能的残留输入
             try:
                 termios.tcflush(fd, termios.TCIFLUSH)
             except Exception:
                 pass
-            out.write("\x1b[6n"); out.flush()
-            base = _read_cpr(fd, timeout)
-            if not base:
+            width = _measure_emoji(fd, out, timeout)
+            if width is None:
+                # 当前位置可能靠右边缘导致换行 → 回行首重试
+                out.write("\r"); out.flush()
+                width = _measure_emoji(fd, out, timeout)
+            if width is None:
+                _width_debug("probe failed, keep default")
                 return _EMOJI_WIDTH
-            out.write("🔧"); out.flush()
-            out.write("\x1b[6n"); out.flush()
-            after = _read_cpr(fd, timeout)
-            width = _EMOJI_WIDTH
-            if after and after[0] == base[0] and after[1] > base[1]:
-                delta = after[1] - base[1]
-                if delta in (1, 2):
-                    width = delta
-            # 还原：回到基线位置写空格覆盖探测字符，再停回基线
-            out.write(f"\x1b[{base[0]};{base[1]}H")
-            out.write(" ")
-            out.write(f"\x1b[{base[0]};{base[1]}H")
-            out.flush()
+            _width_debug(f"probe width={width}")
             set_emoji_width(width)
             return width
         finally:
