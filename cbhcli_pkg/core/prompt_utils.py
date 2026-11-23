@@ -11,7 +11,7 @@ Python 内置 input() 使用 readline 或终端规范模式（canonical mode）�
 from __future__ import annotations
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
@@ -35,13 +35,14 @@ def _(event):
 _session = PromptSession(
     style=Style.from_dict({
         'prompt': 'bold #00d7ff',
+        # 待选择动画/提示行：黄色（v5.5.4 迭代，用户要求）
+        'spin': 'bold #ffd75f',
+        'await': 'bold #ffd75f',
     }),
     key_bindings=_esc_bindings,
 )
 
-
-# 全屏 UI 的 SUSPEND 钩子（P4）：由 CBHCLIApp 在进入全屏模式时注入。
-# 作用：全屏 TUI 运行时，交互式提问需要临时让出 alt screen 才能用旧 PromptSession。
+# 全屏 UI 的 SUSPEND 钩子（P4）：由 CBHCLIApp 在进入全屏模式时注入。# 作用：全屏 TUI 运行时，交互式提问需要临时让出 alt screen 才能用旧 PromptSession。
 # 签名: (fn) -> fn 的返回值；fn 无参，内部执行真正的提问。
 _suspend_hook = None
 
@@ -133,21 +134,74 @@ def ask_secret(prompt: str = "") -> str:
     return _prompt_via_hook(prompt).strip()
 
 
-def ask_text_or_none(prompt: str = "") -> "str | None":
+def _prompt_animated(prompt: str) -> str:
+    """legacy 确认提示：braille「待选择」动画 + 提示行下方留一空行
+
+    - 动画：prompt 用 callable，后台线程每 0.1s 推进帧并 invalidate()
+      PromptSession（pt 的 invalidate 线程安全）→ 提示前 spinner 转动；
+      整行（spinner + 提示）黄色 class:await/spin
+    - 下方空两行：先写 "\\n\\n\\033[2A"（下移两行再回移），提示画在原行、
+      下方留出两空行；提交后光标落在第一空行，调用方 print() 两次即保留
+    - 非 TTY：回退普通提问（不动光标、无动画）
+    """
+    import sys
+    import threading
+    if not sys.stdout.isatty():
+        return _prompt_via_hook(prompt)
+    try:
+        sys.stdout.write("\n\n\033[2A")
+        sys.stdout.flush()
+    except Exception:
+        pass
+    stop = threading.Event()
+    idx = [0]
+
+    def _frame_prompt():
+        # 帧串懒加载自全屏 UI（避免两处手写 braille 字面量不一致）
+        from cbhcli_pkg.core.ui.shell import _SPIN_FRAMES
+        f = _SPIN_FRAMES[idx[0] % len(_SPIN_FRAMES)]
+        return ([("class:spin", f + " ")]
+                + [("class:await", t)
+                   for _, t in to_formatted_text(_to_formatted(prompt))])
+
+    def _tick():
+        while not stop.wait(0.1):
+            idx[0] += 1
+            app = getattr(_session, "app", None)
+            if app is None:
+                continue
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_tick, daemon=True)
+    t.start()
+    try:
+        return _session.prompt(_frame_prompt)
+    finally:
+        stop.set()
+
+
+def ask_text_or_none(prompt: str = "", animate: bool = False) -> "str | None":
     """统一的单行文本输入（取消时返回 None，用于确认类场景）
 
     Args:
         prompt: 提示文本，可为空；支持内嵌 ANSI 颜色码（自动解析）
+        animate: 待选择动画（提示前 braille spinner）；全屏走模态
+                 animate 参数，legacy 走动态 prompt（v5.5.4 迭代）
 
     Returns:
         用户输入（已 strip，可能为空字符串）；EOF/Ctrl+C 取消时返回 None
     """
     try:
         if _modal_hook is not None:
-            raw = _modal_hook(prompt, False)
+            raw = _modal_hook(prompt, False, animate)
             if raw is None:
                 return None
             return raw.strip()
+        if animate:
+            return _prompt_animated(prompt).strip()
         return _prompt_via_hook(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         return None

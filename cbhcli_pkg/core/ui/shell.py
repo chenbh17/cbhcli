@@ -483,6 +483,8 @@ class FullScreenUI:
         _style_dict.setdefault("scrollbar.thumb", "#5fd7ff")
         _style_dict.setdefault("scrollbar.track", "#3a3f4b")
         _style_dict.setdefault("notice", "bold #ffd75f")
+        # 待选择提示行（spinner + 提示）：黄色（v5.5.4 迭代，用户要求）
+        _style_dict.setdefault("await", "bold #ffd75f")
         self.style = Style.from_dict(_style_dict)
 
         # 输入缓冲（与 PromptSession 同款参数）
@@ -536,6 +538,8 @@ class FullScreenUI:
         # 应用内模态（P5b）：替换输入区显示"提示行 + 单行输入"
         self._modal_active = False
         self._modal_password = False
+        # 待输入动画（v5.5.4 迭代）：确认类模态在提示前显示 braille spinner
+        self._modal_animate = False
         self._modal_future: Optional[asyncio.Future] = None
         self._modal_prompt_frags = []
         self._modal_buffer = Buffer(
@@ -580,6 +584,11 @@ class FullScreenUI:
                 VSplit([self._main_window, self._scrollbar_window]),
                 ConditionalContainer(self._input_window, ~Condition(lambda: self._modal_active)),
                 ConditionalContainer(modal_body, Condition(lambda: self._modal_active)),
+                # v5.5.4 迭代：确认类模态输入行下方留空行（与状态栏隔开；
+                # 用户反馈一轮"下方空一行"→二轮"下方空两行"）
+                ConditionalContainer(
+                    Window(height=Dimension(min=2, max=2)),
+                    Condition(lambda: self._modal_animate)),
                 self._status_window,
             ]),
             floats=[
@@ -742,10 +751,16 @@ class FullScreenUI:
             return [("class:prompt", prompt)]
 
     def _modal_prompt_fragments(self):
+        # 待选择动画（v5.5.4 迭代）：提示前加 braille spinner（宽度恒 1），
+        # 整行（spinner + 提示）黄色 class:await（用户要求）
+        if self._modal_animate:
+            frame = _SPIN_FRAMES[self._spin_idx % len(_SPIN_FRAMES)]
+            return ([("class:await", f"{frame} ")]
+                    + [("class:await", t) for _, t in self._modal_prompt_frags])
         return self._modal_prompt_frags
 
     def _modal_prompt_width(self) -> int:
-        text = "".join(t for _, t in self._modal_prompt_frags)
+        text = "".join(t for _, t in self._modal_prompt_fragments())
         return _pt_width(text)
 
     def _modal_inline_prompt(self) -> bool:
@@ -761,7 +776,7 @@ class FullScreenUI:
         if not self._modal_inline_prompt():
             return []
         if line_number == 0 and wrap_count == 0:
-            return self._modal_prompt_frags
+            return self._modal_prompt_fragments()
         width = self._modal_prompt_width()
         return [("class:prompt", " " * width)] if width else []
 
@@ -781,16 +796,20 @@ class FullScreenUI:
             except Exception:
                 pass
 
-    async def _ask_modal(self, prompt: str, password: bool):
+    async def _ask_modal(self, prompt: str, password: bool,
+                         animate: bool = False):
         if not self.app.is_running:
             return None
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._modal_future = fut
         self._modal_password = password
+        self._modal_animate = bool(animate)
         self._modal_prompt_frags = self._format_prompt(prompt)
         self._modal_buffer.reset()
         self._modal_active = True
+        if self._modal_animate:
+            self._start_spinner()  # 待选择动画（与「运行中」共用 spinner 线程）
         try:
             self.app.layout.focus(self._modal_window)
         except Exception:
@@ -801,6 +820,9 @@ class FullScreenUI:
         finally:
             self._modal_active = False
             self._modal_password = False
+            self._modal_animate = False
+            if not self._busy:
+                self._stop_spinner()
             self._modal_future = None
             self._modal_buffer.reset()
             try:
@@ -809,8 +831,12 @@ class FullScreenUI:
                 pass
             self.invalidate()
 
-    def ask_text_sync(self, prompt: str, password: bool = False):
-        """供工作线程调用：弹出应用内模态并阻塞等待（取消返回 None）"""
+    def ask_text_sync(self, prompt: str, password: bool = False,
+                      animate: bool = False):
+        """供工作线程调用：弹出应用内模态并阻塞等待（取消返回 None）
+
+        animate=True：提示前显示 braille「待输入」动画（确认类场景）。
+        """
         if not self.app.is_running:
             return None
         try:
@@ -823,7 +849,7 @@ class FullScreenUI:
         if loop is None or not loop.is_running():
             return None
         fut = asyncio.run_coroutine_threadsafe(
-            self._ask_modal(prompt, password), loop)
+            self._ask_modal(prompt, password, animate), loop)
         return fut.result()
 
     # ------------------------------------------------------------------
@@ -1419,8 +1445,9 @@ class FullScreenUI:
         while not stop.wait(_SPIN_INTERVAL):
             with self._lock:
                 self._spin_idx = (self._spin_idx + 1) % len(_SPIN_FRAMES)
-            # 模态提问期间隐藏动画，不必每 100ms 重绘
-            if not self._modal_active:
+            # 模态提问期间隐藏「运行中」动画，不必每 100ms 重绘；
+            # 但确认类模态自带「待选择」spinner，需要持续重绘（v5.5.4 迭代）
+            if not self._modal_active or self._modal_animate:
                 self.invalidate()
 
     @property
@@ -1473,7 +1500,11 @@ class FullScreenUI:
         return max(lower, min(upper, n))
 
     def _main_height(self, rows: int, cols: int) -> int:
-        return max(1, rows - self._status_line_count() - self._input_height(rows, cols))
+        # v5.5.4 迭代：确认类模态下方 spacer 占 2 行，主区高度须同步扣除，
+        # 否则切片按旧高度多算 → 选项块末行（always）被模态行盖掉
+        spacer = 2 if self._modal_animate else 0
+        return max(1, rows - self._status_line_count()
+                   - self._input_height(rows, cols) - spacer)
 
     def _input_dimension(self) -> Dimension:
         """输入区高度（min=补全预留 8，max=1/3 屏；随内容增长）"""
@@ -1579,6 +1610,10 @@ class FullScreenUI:
         avail = self._main_height(size.rows, size.columns)
         with self._lock:
             visual = self._visual_lines(text_cols)
+            # v5.5.4 迭代：确认类模态期间去掉主区末尾的待写空行——
+            # 选项块最后一行（always）紧贴模态输入行，"上方不空行"
+            if self._modal_animate and visual and not visual[-1]:
+                visual = visual[:-1]
             total = len(visual)
             # v5.5.1：滚动跟随
             #  - 贴底（offset==0）：新内容自动跟随（天然，end 始终在末尾）

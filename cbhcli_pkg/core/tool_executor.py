@@ -785,8 +785,24 @@ class ToolExecutor:
 
         from cbhcli_pkg.core.prompt_utils import ask_text_or_none
         print()  # 与预览内容间隔一行
-        confirm = ask_text_or_none(
-            f"确认执行 {tool_name}? [Y/n/all/always]: ")
+        # v5.5.4 迭代：选项按行输出到主区（每行一个选项 + 说明）。
+        # 旧版把 [Y/n/all/always] 全挤在底部输入行的一行提示里，与底部
+        # 状态栏/输入区之间没有空行、不明显（用户反馈）。现在选项说明
+        # 进入主区可滚动内容；提示行**上方不空行**（紧贴选项块）、
+        # **下方空一行**、提示前带 braille「待选择」动画（二轮反馈）。
+        print(f"{C_BOLD}确认执行 {tool_name}?{C_RESET} 请选择:")
+        for _key, _color, _desc in (
+            ("y", C_TOOL_GREEN, "本次放行（仅这一次执行）"),
+            ("n", C_ERROR, "本次拒绝（不执行该工具）"),
+            ("all", C_TOOL_CMD, "本会话内不再确认（deny 红线仍拦截）"),
+            ("always", C_YELLOW,
+             "本次放行，并提炼一条 allow 规则永久生效（写入 permissions.json）"),
+        ):
+            print(f"  {_color}{_key:<6}{C_RESET}  {_desc}")
+        # 提示行上方不空行（紧贴选项块）；下方空两行 + 黄色待选择动画
+        confirm = ask_text_or_none("选择 [y/n/all/always]: ", animate=True)
+        print()  # 提示行下方空两行（与后续输出隔开；全屏等待期由 spacer 提供）
+        print()
         if confirm is None:
             return False  # EOF / Ctrl+C 视为取消
 
